@@ -50,7 +50,9 @@ async def build_runtime() -> tuple[RuntimeController, bool]:
         trading_settings=state["trading_settings"],
         enabled_strategies=state["enabled_strategies"],
         repository=database,
+        last_market_update_at=state.get("last_price_observed_at", {}),
     )
+    engine.record_database_success()
     engine.trade_manager.restore_state(
         state["trades"], state["balance_usdt"], state["last_prices"]
     )

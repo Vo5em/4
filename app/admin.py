@@ -1,9 +1,11 @@
 import os
+from datetime import timezone
 from html import escape
 from dataclasses import replace
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart, Filter, StateFilter
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -46,6 +48,7 @@ class SettingsInput(StatesGroup):
     waiting_for_pair = State()
     waiting_for_new_pair = State()
     waiting_for_strategy = State()
+    waiting_for_pair_statistics = State()
 
 
 class Admin(Filter):
@@ -86,6 +89,115 @@ def _feed_label(value: str) -> str:
     }.get(value, value)
 
 
+def edit_markup_key(markup) -> tuple:
+    if markup is None:
+        return ()
+    return tuple(
+        tuple((button.text, button.callback_data, button.url) for button in row)
+        for row in markup.inline_keyboard
+    )
+
+
+async def edit_message_if_changed(message, text: str, reply_markup=None) -> bool:
+    """Avoid Telegram's message-is-not-modified error on repeated panel refreshes."""
+    current_markup = getattr(message, "reply_markup", None)
+    if (
+        getattr(message, "text", None) == text
+        and edit_markup_key(current_markup) == edit_markup_key(reply_markup)
+    ):
+        return False
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return False
+        raise
+    return True
+
+
+def _date_label(value) -> str:
+    if value is None:
+        return "нет данных"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if value.tzinfo else value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _algorithm_label(value: str) -> str:
+    return {
+        "working": "работает",
+        "waiting": "ожидает данные",
+        "stopped": "остановлен",
+        "error": "ошибка",
+    }.get(value, "нет данных")
+
+
+def _database_label(status: str) -> str:
+    return {
+        "connected": "последняя операция успешна",
+        "unknown": "состояние неизвестно",
+        "error": "ошибка",
+        "not_configured": "не настроена",
+    }.get(status, "нет данных")
+
+
+def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
+    symbol = symbol.strip().upper()
+    settings = runtime.engine.pair_settings.get(symbol)
+    if settings is None:
+        available = ", ".join(runtime.engine.pair_settings) or "нет настроенных пар"
+        return f"Неизвестная пара. Доступные пары: {available}"
+    engine = runtime.engine
+    status = engine.get_status()
+    stats = engine.trade_manager.get_pair_statistics(symbol)
+    metric = status["market_analysis"].get(symbol, {})
+    strategies = ", ".join(sorted(engine.get_enabled_strategy_ids(symbol))) or "нет"
+    feed_error = status["feed_errors"].get(symbol)
+    strategy_errors = status["strategy_errors"].get(symbol, {})
+    db_error = status.get("database_last_error")
+    latest_error = feed_error or db_error or (next(iter(strategy_errors.values()), None))
+    error_line = (
+        f"Последняя ошибка: {escape(str(latest_error.get('type', 'Error')))}: "
+        f"{escape(str(latest_error.get('message', '')))}"
+        if latest_error else "Последняя ошибка: нет"
+    )
+    price = engine.trade_manager.last_prices.get(symbol)
+    potential = metric.get("potential_wall_count")
+    stable = metric.get("stable_wall_count")
+    win_rate = (
+        f"{stats['win_rate_percent']:.1f}%"
+        if stats["win_rate_percent"] is not None else "нет данных"
+    )
+    return (
+        f"<b>Статистика пары · {symbol}</b>\n\n"
+        f"Состояние: {'включена' if settings.enabled else 'выключена'}\n"
+        f"Стратегии: {escape(strategies)}\n"
+        f"Стена: {settings.min_wall_ratio:g}× от среднего; минимум "
+        f"{settings.min_wall_notional_usdt:g} USDT\n"
+        f"Дистанция поиска: {settings.max_wall_distance_bps:g} б.п.\n"
+        f"Условие входа: подтверждённая устойчивая стена, затем касание цены "
+        f"на расстоянии {settings.entry_distance_bps:g} б.п. от стены\n"
+        f"Стоп за стеной: {settings.stop_distance_bps:g} б.п.\n"
+        f"Время устойчивости: {settings.min_wall_age_seconds:g} с\n"
+        f"Порог потребления: {settings.consumed_ratio:.0%}\n"
+        f"Лимит сделок пары: {settings.max_open_trades}\n"
+        f"Потенциальные стены: {potential if potential is not None else 'нет данных'}; "
+        f"подтверждённые: {stable if stable is not None else 'нет данных'}\n"
+        f"Сделки: открыто {stats['open_trades']}, ожидают входа "
+        f"{stats['pending_trades']}, закрыто {stats['closed_trades']}\n"
+        f"Прибыль: {stats['total_profit_usdt']:+.2f} USDT; за 7 дней "
+        f"{stats['weekly_profit_usdt']:+.2f} USDT; плавающая "
+        f"{stats['unrealized_profit_usdt'] if stats['unrealized_profit_usdt'] is not None else 'нет данных'}"
+        f"{' USDT' if stats['unrealized_profit_usdt'] is not None else ''}\n"
+        f"Победы / убытки: {stats['wins']} / {stats['losses']}; "
+        f"доля прибыльных: {win_rate}; K/D {_format_ratio(stats['kd_ratio'], stats['wins'])}\n"
+        f"Цена: {f'{price:g}' if price is not None else 'нет данных'}; обновлено "
+        f"{_date_label(status['last_market_update_at'].get(symbol))}\n"
+        f"Статус алгоритма: {_algorithm_label(status['algorithm_status'])}; "
+        f"поток: {_feed_label(status['feed_status'].get(symbol, 'нет данных'))}\n"
+        f"Причина отсутствия входа: {escape(engine.get_entry_block_reason(symbol))}\n"
+        f"{error_line}"
+    )
+
+
 def dashboard_text(runtime: RuntimeController) -> str:
     status = runtime.engine.get_status()
     pairs = ", ".join(status["enabled_pairs"]) or "нет активных пар"
@@ -102,11 +214,47 @@ def dashboard_text(runtime: RuntimeController) -> str:
     strategy_error_line = (
         f"\nОшибки стратегий: {escape(error_text)}" if error_text else ""
     )
+    feed_errors = status.get("feed_errors", {})
+    feed_error_text = " | ".join(
+        f"{symbol}: {escape(str(error['type']))}: {escape(str(error['message']))} "
+        f"({_date_label(error.get('at'))})"
+        for symbol, error in feed_errors.items() if error
+    ) or "нет"
+    analysis_active = [
+        symbol for symbol, metric in status.get("market_analysis", {}).items()
+        if metric.get("updated_at") is not None
+    ]
+    analysis_status = (
+        "анализирует " + ", ".join(analysis_active)
+        if analysis_active and status["algorithm_status"] == "working"
+        else "ожидает обработку рынка" if status["algorithm_status"] == "waiting"
+        else "остановлен" if status["algorithm_status"] == "stopped"
+        else "ошибка"
+    )
+    timestamps = list(status.get("last_market_update_at", {}).values())
+    last_update = max(
+        timestamps,
+        key=lambda value: value.timestamp() if value.tzinfo else value.replace(tzinfo=timezone.utc).timestamp(),
+        default=None,
+    )
+    db_error = status.get("database_last_error")
+    db_error_line = (
+        f"Ошибка БД: {escape(str(db_error.get('type')))}: "
+        f"{escape(str(db_error.get('message')))} ({_date_label(db_error.get('at'))})\n"
+        if db_error else "Ошибка БД: нет\n"
+    )
     return (
         "<b>Админ-панель · виртуальная торговля</b>\n\n"
         f"Состояние: {_mode_label(status['mode'])}\n"
+        f"Алгоритм: {_algorithm_label(status['algorithm_status'])}\n"
         f"Пары: {pairs}\n"
         f"Рыночные данные: {feeds}\n"
+        f"Поиск и анализ стен: {analysis_status}\n"
+        f"Последнее обновление данных: {_date_label(last_update)}\n"
+        f"Ошибки потока: {feed_error_text}\n"
+        f"PostgreSQL: {_database_label(status['database_status'])}; "
+        f"последний успех {_date_label(status['database_last_success_at'])}; "
+        f"отложено записей: {status['persistence_pending']}\n"
         f"Виртуальный баланс: {status['balance_usdt']:.2f} USDT\n"
         f"Плавающий P/L: {status['unrealized_profit_usdt']:+.2f} USDT · "
         f"оценка баланса: {status['equity_usdt']:.2f} USDT\n"
@@ -122,8 +270,8 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"K/D за 7 дней {_format_ratio(status['weekly_kd_ratio'], status['weekly_wins'])}\n"
         f"Сделки: открыто {status['open_trades']}, ожидают входа {status['pending_trades']}, "
         f"закрыто {status['closed_trades']}\n"
-        f"Ожидают сохранения в БД: {status['persistence_pending']}"
-        f"{strategy_error_line}"
+        f"Ожидают сохранения в БД: {status['persistence_pending']}\n"
+        f"{db_error_line}{strategy_error_line}"
     )
 
 
@@ -166,7 +314,7 @@ async def cancel_input(
 ) -> None:
     await state.clear()
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer("Ввод отменён")
 
 
@@ -177,7 +325,8 @@ async def show_settings(
     await state.clear()
     pair_text = pair_settings_text(runtime)
     if callback.message is not None:
-        await callback.message.edit_text(
+        await edit_message_if_changed(
+            callback.message,
             "<b>Настройки виртуальной торговли</b>\n\n"
             f"Ставка на сделку: {runtime.engine.trading_settings.stake_usdt:.2f} USDT\n"
             f"Общий лимит одновременных сделок: {runtime.engine.trading_settings.max_open_trades}\n"
@@ -416,7 +565,8 @@ async def show_statistics(
     await state.clear()
     stats = runtime.engine.get_status()
     if callback.message is not None:
-        await callback.message.edit_text(
+        await edit_message_if_changed(
+            callback.message,
             "<b>Статистика виртуальных сделок</b>\n\n"
             f"Закрыто сделок: {stats['closed_trades']}\n"
             f"Прибыль: {stats['total_profit_usdt']:.2f} USDT\n"
@@ -435,6 +585,37 @@ async def show_statistics(
     await callback.answer()
 
 
+@admin.callback_query(Admin(), F.data == "pair_statistics")
+async def request_pair_statistics(
+    callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
+) -> None:
+    await state.set_state(SettingsInput.waiting_for_pair_statistics)
+    pairs = ", ".join(runtime.engine.pair_settings) or "нет настроенных пар"
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"<b>Статистика пар</b>\n\nДоступные пары: {pairs}\n"
+            "Отправьте символ пары, например <code>BTCUSDT</code>.",
+            reply_markup=kb.cancel_input,
+        )
+    await callback.answer()
+
+
+@admin.message(Admin(), StateFilter(SettingsInput.waiting_for_pair_statistics))
+async def show_pair_statistics(
+    message: Message, state: FSMContext, runtime: RuntimeController
+) -> None:
+    symbol = (message.text or "").strip().upper()
+    if symbol not in runtime.engine.pair_settings:
+        pairs = ", ".join(runtime.engine.pair_settings) or "нет настроенных пар"
+        await message.answer(f"Неизвестная пара. Доступные пары: {pairs}")
+        return
+    await state.clear()
+    await message.answer(
+        pair_statistics_text(runtime, symbol), reply_markup=kb.pair_statistics
+    )
+
+
 @admin.callback_query(Admin(), F.data == "engine_start")
 async def start_engine(
     callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
@@ -448,7 +629,7 @@ async def start_engine(
     except Exception:
         message = "Не удалось запустить движок: проверьте состояние конфигурации и базы данных."
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer(message, show_alert=runtime.engine.mode == EngineMode.STOPPED)
 
 
@@ -468,7 +649,7 @@ async def pause_entries(
     except Exception:
         message = "Не удалось сохранить режим паузы в базе данных."
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer(message, show_alert=runtime.engine.mode == EngineMode.STOPPED)
 
 
@@ -485,7 +666,7 @@ async def resume_entries(
     except Exception:
         message = "Не удалось сохранить режим работы в базе данных."
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer(message, show_alert=runtime.engine.mode == EngineMode.STOPPED)
 
 
@@ -504,7 +685,7 @@ async def stop_engine(
     except Exception:
         message = "Остановка не завершена: не удалось сохранить состояние в базе данных."
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer(message, show_alert=runtime.engine.mode != EngineMode.STOPPED)
 
 
@@ -522,7 +703,7 @@ async def close_open_trades(
     except Exception:
         message = "Сделки не закрыты: не удалось сохранить состояние в базе данных."
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer(message, show_alert="не закрыты" in message)
 
 
@@ -532,5 +713,5 @@ async def show_dashboard(
 ) -> None:
     await state.clear()
     if callback.message is not None:
-        await callback.message.edit_text(dashboard_text(runtime), reply_markup=kb.main)
+        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
     await callback.answer()

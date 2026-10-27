@@ -2,6 +2,7 @@ import os
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
+from datetime import timedelta
 from math import nan
 from unittest.mock import patch
 from aiogram.types import Chat, Message, User
@@ -33,6 +34,8 @@ from app.admin import (
     dashboard_text,
     dayid,
     pair_settings_text,
+    pair_statistics_text,
+    edit_message_if_changed,
 )
 from run import _symbols_from_environment, build_runtime
 
@@ -489,6 +492,75 @@ class AdminAuthorizationTests(unittest.TestCase):
         self.assertIn("прибыльных сделок: 0.0%", text)
         self.assertIn("Доступно для новых сделок: 1000.00 USDT", text)
 
+    def test_dashboard_shows_algorithm_feed_analysis_and_database_status(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        runtime = RuntimeController(engine)
+        text = dashboard_text(runtime)
+        self.assertIn("Алгоритм: остановлен", text)
+        self.assertIn("Поиск и анализ стен: остановлен", text)
+        self.assertIn("Последнее обновление данных: нет данных", text)
+        self.assertIn("PostgreSQL: не настроена", text)
+
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        engine.last_market_update_at["BTCUSDT"] = engine._utc_now() - timedelta(seconds=5)
+        self.assertEqual(engine.get_status()["algorithm_status"], "waiting")
+        engine._record_market_analysis("BTCUSDT", [], [])
+        engine.last_market_update_at["BTCUSDT"] = engine._utc_now()
+        engine.last_algorithm_update_at["BTCUSDT"] = engine._utc_now()
+        self.assertEqual(engine.get_status()["algorithm_status"], "working")
+
+        engine.set_feed_status("BTCUSDT", "reconnecting", OSError("socket closed"))
+        status = engine.get_status()
+        self.assertEqual(status["algorithm_status"], "error")
+        self.assertEqual(status["feed_errors"]["BTCUSDT"]["message"], "socket closed")
+
+    def test_pair_statistics_card_uses_pair_settings_and_marks_missing_metrics(self):
+        settings = replace(
+            PairSettings("BTCUSDT"),
+            min_wall_ratio=12.5,
+            min_wall_notional_usdt=2500,
+            max_wall_distance_bps=80,
+        )
+        runtime = RuntimeController(TradingEngine({"BTCUSDT": settings}))
+        text = pair_statistics_text(runtime, "  btcusdt ")
+        self.assertIn("BTCUSDT", text)
+        self.assertIn("12.5×", text)
+        self.assertIn("2500 USDT", text)
+        self.assertIn("80 б.п.", text)
+        self.assertIn("Потенциальные стены: нет данных", text)
+        self.assertIn("Цена: нет данных", text)
+        self.assertIn("Причина отсутствия входа:", text)
+
+    def test_unknown_pair_reports_configured_pairs(self):
+        runtime = RuntimeController(
+            TradingEngine({"BTCUSDT": PairSettings("BTCUSDT"), "ETCUSDT": PairSettings("ETCUSDT")})
+        )
+        text = pair_statistics_text(runtime, " unknown ")
+        self.assertIn("BTCUSDT, ETCUSDT", text)
+
+    def test_pair_metrics_count_candidates_separately_from_stable_walls(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        candidates = [{"side": "buy", "price": 100.0}, {"side": "sell", "price": 101.0}]
+        engine._record_market_analysis("BTCUSDT", [candidates[0]], candidates)
+        metrics = engine.get_status()["market_analysis"]["BTCUSDT"]
+        self.assertEqual(metrics["potential_wall_count"], 2)
+        self.assertEqual(metrics["stable_wall_count"], 1)
+        self.assertIsNotNone(metrics["updated_at"])
+
+    def test_unchanged_telegram_panel_is_not_edited(self):
+        class FakeMessage:
+            text = "same"
+            reply_markup = None
+            edits = 0
+
+            async def edit_text(self, text, reply_markup=None):
+                self.edits += 1
+
+        message = FakeMessage()
+        self.assertFalse(run_immediate(edit_message_if_changed(message, "same")))
+        self.assertEqual(message.edits, 0)
+
     def test_pair_settings_screen_displays_consumption_threshold_and_strategy(self):
         runtime = RuntimeController(
             TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
@@ -865,6 +937,24 @@ class EngineControlTests(unittest.TestCase):
         self.assertEqual(created_names, ["market-data-ethusdt"])
         self.assertIn(task, engine._workers)
         self.assertIs(runtime._workers_by_symbol["ETHUSDT"], task)
+
+    def test_repeated_worker_sync_does_not_duplicate_market_subscription(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        engine.start()
+        runtime = RuntimeController(engine)
+        task = FakeTask()
+        created = []
+
+        def fake_create_task(coroutine, *, name):
+            coroutine.close()
+            created.append(name)
+            return task
+
+        with patch("app.runtime.asyncio.create_task", side_effect=fake_create_task):
+            run_immediate(runtime._sync_workers())
+            run_immediate(runtime._sync_workers())
+
+        self.assertEqual(created, ["market-data-btcusdt"])
 
     def test_add_pair_rejects_invalid_and_duplicate_symbols(self):
         runtime = RuntimeController(TradingEngine({}))

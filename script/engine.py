@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from enum import Enum
 from time import monotonic
 
@@ -31,6 +32,7 @@ class TradingEngine:
         enabled_strategies: dict[str, set[str]] | None = None,
         trade_manager: ExecutionBackend | None = None,
         repository=None,
+        last_market_update_at: dict[str, datetime] | None = None,
     ) -> None:
         self.pair_settings = {key.upper(): value for key, value in pair_settings.items()}
         self.trading_settings = trading_settings or TradingSettings()
@@ -63,6 +65,27 @@ class TradingEngine:
         self.mode = EngineMode.STOPPED
         self._workers: set[asyncio.Task] = set()
         self.feed_status = {symbol: "stopped" for symbol in self.pair_settings}
+        self.feed_errors: dict[str, dict | None] = {
+            symbol: None for symbol in self.pair_settings
+        }
+        self.last_market_update_at = {
+            symbol.upper(): timestamp
+            for symbol, timestamp in (last_market_update_at or {}).items()
+        }
+        # Runtime-only heartbeat: restored prices must not make a newly started
+        # algorithm look active before it processes a fresh market update.
+        self.last_algorithm_update_at: dict[str, datetime] = {}
+        self.market_analysis = {
+            symbol: {
+                "potential_wall_count": None,
+                "stable_wall_count": None,
+                "updated_at": None,
+            }
+            for symbol in self.pair_settings
+        }
+        self.database_status = "unknown" if repository is not None else "not_configured"
+        self.database_last_success_at: datetime | None = None
+        self.database_last_error: dict | None = None
 
     def start(self) -> None:
         if self.mode == EngineMode.STOPPING:
@@ -74,6 +97,55 @@ class TradingEngine:
             raise RuntimeError("Workers can only be registered while the engine is active")
         self._workers.add(task)
         task.add_done_callback(self._workers.discard)
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def set_feed_status(self, symbol: str, status: str, error: Exception | None = None) -> None:
+        symbol = symbol.upper()
+        self.feed_status[symbol] = status
+        if error is not None:
+            self.feed_errors[symbol] = {
+                "message": str(error),
+                "type": type(error).__name__,
+                "at": self._utc_now(),
+            }
+        elif status == "connected":
+            self.feed_errors[symbol] = None
+
+    def record_database_success(self) -> None:
+        if self.repository is None:
+            return
+        self.database_status = "connected"
+        self.database_last_success_at = self._utc_now()
+        self.database_last_error = None
+
+    def record_database_error(self, error: Exception) -> None:
+        if self.repository is None:
+            return
+        self.database_status = "error"
+        self.database_last_error = {
+            "message": str(error),
+            "type": type(error).__name__,
+            "at": self._utc_now(),
+        }
+
+    def _record_market_analysis(
+        self,
+        symbol: str,
+        stable_walls: list[dict] | tuple[dict, ...],
+        wall_candidates: list[dict] | tuple[dict, ...] | None,
+    ) -> None:
+        symbol = symbol.upper()
+        metrics = self.market_analysis.setdefault(
+            symbol,
+            {"potential_wall_count": None, "stable_wall_count": None, "updated_at": None},
+        )
+        if wall_candidates is not None:
+            metrics["potential_wall_count"] = len(wall_candidates)
+            metrics["stable_wall_count"] = len(stable_walls)
+            metrics["updated_at"] = self._utc_now()
 
     def restore_trade_state(
         self,
@@ -187,8 +259,10 @@ class TradingEngine:
                     engine_mode=self.mode.value,
                 )
             except Exception as error:
+                self.record_database_error(error)
                 print(f"Database trade save failed: {type(error).__name__}")
                 return False
+            self.record_database_success()
             for signal_id, trade_ref in snapshot_refs.items():
                 if self._pending_persistence.get(signal_id) is trade_ref:
                     self._pending_persistence.pop(signal_id, None)
@@ -198,12 +272,17 @@ class TradingEngine:
         if self.repository is None:
             return
         async with self._persistence_lock:
-            await self.repository.save_runtime_state(
-                engine_mode=self.mode.value,
-                balance_usdt=self.trade_manager.balance_usdt,
-                trading_settings=self.trading_settings,
-                initialized=True,
-            )
+            try:
+                await self.repository.save_runtime_state(
+                    engine_mode=self.mode.value,
+                    balance_usdt=self.trade_manager.balance_usdt,
+                    trading_settings=self.trading_settings,
+                    initialized=True,
+                )
+            except Exception as error:
+                self.record_database_error(error)
+                raise
+            self.record_database_success()
 
     async def persist_pair_settings(
         self, settings: PairSettings, events: list[dict]
@@ -227,8 +306,10 @@ class TradingEngine:
                     self.mode.value,
                 )
             except Exception as error:
+                self.record_database_error(error)
                 print(f"Database pair update failed: {type(error).__name__}")
                 return False
+            self.record_database_success()
             for signal_id, trade_ref in snapshot_refs.items():
                 if self._pending_persistence.get(signal_id) is trade_ref:
                     self._pending_persistence.pop(signal_id, None)
@@ -257,8 +338,10 @@ class TradingEngine:
                     self.mode.value,
                 )
             except Exception as error:
+                self.record_database_error(error)
                 print(f"Database strategy update failed: {type(error).__name__}")
                 return False
+            self.record_database_success()
             for signal_id, trade_ref in snapshot_refs.items():
                 if self._pending_persistence.get(signal_id) is trade_ref:
                     self._pending_persistence.pop(signal_id, None)
@@ -280,7 +363,9 @@ class TradingEngine:
         self._last_market_price_save[symbol] = now
         try:
             await self.repository.save_market_price(symbol, price)
+            self.record_database_success()
         except Exception as error:
+            self.record_database_error(error)
             print(f"Database market price save failed: {type(error).__name__}")
 
     async def process_market_update(
@@ -293,9 +378,14 @@ class TradingEngine:
     ) -> list[dict]:
         """Serialize a market-state transition and its persistence as one unit."""
         async with self.state_lock:
+            symbol = symbol.upper()
             events = self.on_market_update(
                 symbol, last_price, stable_walls, wall_events, wall_candidates
             )
+            now = self._utc_now()
+            self.last_market_update_at[symbol] = now
+            self.last_algorithm_update_at[symbol] = now
+            self._record_market_analysis(symbol, stable_walls, wall_candidates)
             await self.persist_events(events)
             await self.persist_market_price(symbol, last_price)
             return events
@@ -396,6 +486,23 @@ class TradingEngine:
         return {
             "mode": self.mode.value,
             "feed_status": dict(self.feed_status),
+            "feed_errors": {
+                symbol: dict(error) if error is not None else None
+                for symbol, error in self.feed_errors.items()
+            },
+            "last_market_update_at": dict(self.last_market_update_at),
+            "market_analysis": {
+                symbol: dict(metrics)
+                for symbol, metrics in self.market_analysis.items()
+            },
+            "algorithm_status": self.get_algorithm_status(),
+            "database_status": self.database_status,
+            "database_last_success_at": self.database_last_success_at,
+            "database_last_error": (
+                dict(self.database_last_error)
+                if self.database_last_error is not None
+                else None
+            ),
             "strategy_errors": {
                 symbol: dict(errors)
                 for symbol, errors in self.strategy_errors.items()
@@ -406,6 +513,84 @@ class TradingEngine:
             ],
             **stats,
         }
+
+    def get_algorithm_status(self) -> str:
+        if self.mode in {EngineMode.STOPPED, EngineMode.STOPPING}:
+            return "stopped"
+        required = [
+            symbol
+            for symbol in self.pair_settings
+            if self.should_run_market_feed(symbol)
+        ]
+        if not required:
+            return "stopped"
+        if any(self.feed_errors.get(symbol) for symbol in required):
+            return "error"
+        if any(
+            strategy_errors
+            for symbol, strategy_errors in self.strategy_errors.items()
+            if symbol in required
+        ):
+            return "error"
+        now = self._utc_now()
+        if any(
+            self.feed_status.get(symbol) == "connected"
+            and self.last_algorithm_update_at.get(symbol) is not None
+            and (now - self.last_algorithm_update_at[symbol]).total_seconds() <= 30
+            for symbol in required
+        ):
+            return "working"
+        if any(self.feed_status.get(symbol) == "reconnecting" for symbol in required):
+            return "error"
+        return "waiting"
+
+    def get_entry_block_reason(self, symbol: str) -> str:
+        symbol = symbol.upper()
+        settings = self.pair_settings.get(symbol)
+        if settings is None:
+            return "Пара не настроена."
+        if self.mode == EngineMode.STOPPED or self.mode == EngineMode.STOPPING:
+            return "Движок остановлен."
+        if self.mode == EngineMode.ENTRIES_PAUSED:
+            return "Новые входы на паузе."
+        if not settings.enabled:
+            return "Пара выключена."
+        if not self.get_enabled_strategy_ids(symbol):
+            return "Для пары не выбраны стратегии."
+        if self.feed_status.get(symbol) != "connected":
+            error = self.feed_errors.get(symbol)
+            return (
+                f"Рыночные данные: {error['message']}"
+                if error
+                else "Ожидание рыночных данных."
+            )
+        if not self.last_market_update_at.get(symbol):
+            return "Рынок ещё не обработан алгоритмом."
+        if self.repository is not None and self._pending_persistence:
+            return "Ожидается сохранение состояния сделок в PostgreSQL."
+        analysis = self.market_analysis.get(symbol, {})
+        potential = analysis.get("potential_wall_count")
+        stable = analysis.get("stable_wall_count")
+        if potential is None:
+            return "Нет данных анализа стен."
+        if potential == 0:
+            return "Нет потенциальных стен, прошедших текущие фильтры."
+        if stable == 0:
+            return "Потенциальные стены ещё не подтвердили устойчивость."
+        active = [
+            trade for trade in self.trade_manager.trades
+            if trade["symbol"] == symbol and trade["status"] in {"pending", "open"}
+        ]
+        if len(active) >= settings.max_open_trades:
+            return "Достигнут лимит сделок этой пары."
+        stats = self.trade_manager.get_statistics()
+        if stats["open_trades"] + stats["pending_trades"] >= self.trading_settings.max_open_trades:
+            return "Достигнут общий лимит сделок."
+        if stats["available_balance_usdt"] < self.trading_settings.stake_usdt:
+            return "Недостаточно свободного виртуального баланса для ставки."
+        if symbol in self.strategy_errors:
+            return "Ошибка оценки одной или нескольких стратегий."
+        return "Текущая стратегия ещё не сформировала новый сигнал."
 
     def get_enabled_strategy_ids(self, symbol: str) -> set[str]:
         return set(

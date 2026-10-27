@@ -88,6 +88,9 @@ async def initialize_database(
             "last_prices": {
                 row.symbol: row.last_price for row in market_price_rows
             },
+            "last_price_observed_at": {
+                row.symbol: row.observed_at for row in market_price_rows
+            },
         }
 
 

@@ -404,3 +404,44 @@ class TradeManager:
             ),
             "win_rate_percent": wins / len(closed) * 100 if closed else 0.0,
         }
+
+    def get_pair_statistics(self, symbol: str, now: datetime | None = None) -> dict:
+        """Return realized and open virtual-trade statistics for one symbol."""
+        symbol = symbol.upper()
+        now = now or datetime.now(timezone.utc)
+        week_start = now - timedelta(days=7)
+        pair_trades = [trade for trade in self.trades if trade["symbol"] == symbol]
+        closed = [trade for trade in pair_trades if trade["status"] == "closed"]
+        weekly = []
+        for trade in closed:
+            closed_at = trade.get("closed_at")
+            if closed_at is not None:
+                if closed_at.tzinfo is None:
+                    closed_at = closed_at.replace(tzinfo=timezone.utc)
+                if closed_at >= week_start:
+                    weekly.append(trade)
+        wins = sum(trade["profit_usdt"] > 0 for trade in closed)
+        losses = sum(trade["profit_usdt"] < 0 for trade in closed)
+        price = self.last_prices.get(symbol)
+        open_trades = [trade for trade in pair_trades if trade["status"] == "open"]
+        unrealized = 0.0
+        if price is not None:
+            unrealized = sum(
+                (price - trade["entry_price"])
+                / trade["entry_price"]
+                * trade["stake_usdt"]
+                * (1 if trade["side"] == "long" else -1)
+                for trade in open_trades
+            )
+        return {
+            "closed_trades": len(closed),
+            "open_trades": len(open_trades),
+            "pending_trades": sum(trade["status"] == "pending" for trade in pair_trades),
+            "total_profit_usdt": sum(trade["profit_usdt"] for trade in closed),
+            "weekly_profit_usdt": sum(trade["profit_usdt"] for trade in weekly),
+            "unrealized_profit_usdt": unrealized if price is not None else None,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_percent": wins / len(closed) * 100 if closed else None,
+            "kd_ratio": wins / losses if losses else (float("inf") if wins else None),
+        }

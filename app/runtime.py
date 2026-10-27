@@ -149,7 +149,12 @@ class RuntimeController:
                 max_open_trades=self.engine.trading_settings.max_open_trades,
             )
             if self.engine.repository is not None:
-                await self.engine.repository.save_trading_settings(settings)
+                try:
+                    await self.engine.repository.save_trading_settings(settings)
+                except Exception as error:
+                    self.engine.record_database_error(error)
+                    raise
+                self.engine.record_database_success()
             self.engine.trading_settings = settings
             self.engine.trade_manager.trading_settings = settings
 
@@ -161,7 +166,12 @@ class RuntimeController:
                 max_open_trades=maximum,
             )
             if self.engine.repository is not None:
-                await self.engine.repository.save_trading_settings(settings)
+                try:
+                    await self.engine.repository.save_trading_settings(settings)
+                except Exception as error:
+                    self.engine.record_database_error(error)
+                    raise
+                self.engine.record_database_success()
             self.engine.trading_settings = settings
             self.engine.trade_manager.trading_settings = settings
 
@@ -239,9 +249,15 @@ class RuntimeController:
                 raise ValueError(f"Pair {symbol} is already configured")
             settings = PairSettings(symbol=symbol)
             if self.engine.repository is not None:
-                await self.engine.repository.save_pair_settings(settings)
+                try:
+                    await self.engine.repository.save_pair_settings(settings)
+                except Exception as error:
+                    self.engine.record_database_error(error)
+                    raise
+                self.engine.record_database_success()
             self.engine.pair_settings[symbol] = settings
             self.engine.feed_status[symbol] = "stopped"
+            self.engine.feed_errors[symbol] = None
             await self._sync_workers()
             return settings
 

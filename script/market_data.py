@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+from time import monotonic
 
 import aiohttp
 import websockets
@@ -16,6 +18,7 @@ BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_REST_URL = "https://api.bybit.com/v5/market/orderbook"
 DEFAULT_SYMBOL = "BTCUSDT"
 CATEGORY = "linear"
+logger = logging.getLogger(__name__)
 
 
 async def get_orderbook_snapshot(symbol: str) -> dict:
@@ -175,7 +178,7 @@ async def _run_connection(
             apply_orderbook_delta(orderbook, delta)
 
         flow = trade_flow.get_flow()
-        engine.feed_status[symbol] = "connected"
+        engine.set_feed_status(symbol, "connected")
         while (
             engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
             and engine.should_run_market_feed(symbol)
@@ -255,29 +258,38 @@ async def market_data_worker(
     pair_settings: PairSettings,
 ) -> None:
     delay = 1.0
+    last_log_at = 0.0
     while (
         engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
         and engine.should_run_market_feed(symbol)
     ):
-        engine.feed_status[symbol] = "connecting"
+        engine.set_feed_status(symbol, "connecting")
         try:
             await _run_connection(symbol, engine, pair_settings)
             delay = 1.0
             if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
-                engine.feed_status[symbol] = "stopped"
+                engine.set_feed_status(symbol, "stopped")
             elif not engine.pair_settings.get(symbol, pair_settings).enabled:
-                engine.feed_status[symbol] = "stopped"
+                engine.set_feed_status(symbol, "stopped")
         except asyncio.CancelledError:
-            engine.feed_status[symbol] = "stopped"
+            engine.set_feed_status(symbol, "stopped")
             raise
         except Exception as error:
-            engine.feed_status[symbol] = "reconnecting"
-            print(f"Market feed {symbol} disconnected: {type(error).__name__}: {error}")
+            engine.set_feed_status(symbol, "reconnecting", error)
+            now = monotonic()
+            if now - last_log_at >= 30:
+                logger.warning(
+                    "Market feed %s disconnected; reconnecting in %.1fs",
+                    symbol,
+                    delay,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                last_log_at = now
             if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
                 break
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
-    engine.feed_status[symbol] = "stopped"
+    engine.set_feed_status(symbol, "stopped")
 
 
 async def main() -> None:
