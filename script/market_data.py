@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from time import monotonic
 
 import aiohttp
@@ -19,6 +20,7 @@ BYBIT_REST_URL = "https://api.bybit.com/v5/market/orderbook"
 DEFAULT_SYMBOL = "BTCUSDT"
 CATEGORY = "linear"
 logger = logging.getLogger(__name__)
+_last_snapshot_log_at: dict[str, float] = {}
 
 
 async def get_orderbook_snapshot(symbol: str) -> dict:
@@ -61,41 +63,73 @@ def find_first_delta_after_snapshot(snapshot: dict, buffer: list[dict]) -> int |
     return None
 
 
-def buffer_orderbook_delta(buffer: list[dict], delta: dict) -> str:
+def buffer_orderbook_delta(
+    buffer: list[dict], delta: dict, counters: dict | None = None
+) -> str:
     """Keep a contiguous Bybit `u` segment, dropping stale `seq` updates.
 
     Returns ``appended``, ``ignored`` or ``reset``. Bybit's `seq` is a
     cross-sequence and may skip values; only `u` must be consecutive.
     """
     if buffer and delta["seq"] < buffer[-1]["seq"]:
+        if counters is not None:
+            counters["discarded"] += 1
         return "ignored"
     if delta["u"] == 1:
+        if counters is not None:
+            counters["discarded"] += len(buffer)
+            counters["resets"] += 1
+            counters["accepted"] += 1
         buffer.clear()
         buffer.append(delta)
         return "reset"
     if buffer:
         previous_u = buffer[-1]["u"]
         if delta["u"] <= previous_u:
+            if counters is not None:
+                counters["discarded"] += 1
             return "ignored"
         if delta["u"] != previous_u + 1:
+            if counters is not None:
+                counters["discarded"] += len(buffer)
+                counters["resets"] += 1
+                counters["accepted"] += 1
             buffer.clear()
             buffer.append(delta)
             return "reset"
     buffer.append(delta)
+    if counters is not None:
+        counters["accepted"] += 1
     return "appended"
 
 
 def apply_orderbook_delta(orderbook: LocalOrderBook, delta: dict) -> None:
     """Apply the next full-depth update, ignoring stale data and rejecting gaps."""
     if delta["u"] == 1:
+        orderbook.invalidate()
         raise RuntimeError("Orderbook update ID reset; resynchronization required")
     if delta["seq"] < orderbook.sequence or delta["u"] < orderbook.update_id:
         return
     if delta["u"] == orderbook.update_id:
         return
     if delta["u"] != orderbook.update_id + 1:
+        orderbook.invalidate()
         raise RuntimeError("Orderbook update ID gap; resynchronization required")
     orderbook.apply_delta(delta)
+
+
+def build_synchronized_orderbook(snapshot: dict, buffered_deltas: list[dict]):
+    """Build a local book only when REST and buffered WS updates align."""
+    first_index = find_first_delta_after_snapshot(snapshot, buffered_deltas)
+    if first_index is None:
+        raise SnapshotRetryRequired("WebSocket stream has not reached the REST snapshot")
+    orderbook = LocalOrderBook()
+    orderbook.load_snapshot(snapshot)
+    for delta in buffered_deltas[first_index:]:
+        apply_orderbook_delta(orderbook, delta)
+    if not orderbook.synchronized:
+        raise RuntimeError("Orderbook lost synchronization while applying buffered deltas")
+    return orderbook, first_index
 
 
 def _update_flow(trade_flow: TradeFlow, payload: dict) -> float | None:
@@ -110,13 +144,98 @@ def _update_flow(trade_flow: TradeFlow, payload: dict) -> float | None:
     return last_price
 
 
+def analyze_synced_orderbook(
+    orderbook: LocalOrderBook,
+    last_price: float,
+    flow: dict,
+    pair_settings: PairSettings,
+    wall_tracker: WallTracker,
+) -> dict:
+    """Run wall scanning only against a successfully synchronized local book."""
+    if not orderbook.synchronized:
+        raise RuntimeError("Cannot analyze an unsynchronized orderbook")
+    nearby = find_nearby_levels(
+        orderbook, last_price, pair_settings.max_wall_distance_bps
+    )
+    filter_counts = {}
+    candidates = find_walls(
+        nearby,
+        flow,
+        min_wall_ratio=pair_settings.min_wall_ratio,
+        min_wall_notional=pair_settings.min_wall_notional_usdt,
+        diagnostics=filter_counts,
+    )
+    wall_events = wall_tracker.update(candidates, orderbook, flow)
+    stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
+    return {
+        "nearby_levels": nearby,
+        "candidates": candidates,
+        "filter_counts": filter_counts,
+        "wall_events": wall_events,
+        "stable_walls": stable_walls,
+    }
+
+
+def _log_analysis_if_due(
+    symbol: str,
+    orderbook: LocalOrderBook,
+    last_price: float,
+    result: dict,
+    last_log_at: float,
+) -> float:
+    now = monotonic()
+    if now - last_log_at >= 30:
+        rejected = {
+            key: value for key, value in result["filter_counts"].items()
+            if key not in {"input_levels", "candidates"} and value
+        }
+        if not result["nearby_levels"]:
+            rejected["no_levels_within_search_distance"] = 1
+        logger.info(
+            "%s wall analysis complete at %s: price=%s depth(bid=%d,ask=%d) "
+            "nearby=%d candidates=%d stable=%d rejected=%s",
+            symbol,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            last_price,
+            len(orderbook.bids),
+            len(orderbook.asks),
+            len(result["nearby_levels"]),
+            len(result["candidates"]),
+            len(result["stable_walls"]),
+            rejected,
+        )
+        return now
+    return last_log_at
+
+
+def _log_snapshot_if_due(symbol: str, snapshot: dict, buffered_count: int) -> None:
+    now = monotonic()
+    last = _last_snapshot_log_at.get(symbol, 0.0)
+    if now - last < 30:
+        return
+    logger.info(
+        "%s REST orderbook snapshot received at %s: seq=%s u=%s bids=%d asks=%d "
+        "buffered=%d",
+        symbol,
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        snapshot.get("seq"),
+        snapshot.get("u"),
+        len(snapshot.get("b", [])),
+        len(snapshot.get("a", [])),
+        buffered_count,
+    )
+    _last_snapshot_log_at[symbol] = now
+
+
 async def _fetch_snapshot_while_buffering(
     websocket,
     symbol: str,
     trade_flow: TradeFlow,
     buffered_deltas: list[dict],
+    sync_counters: dict | None = None,
 ) -> tuple[dict, float | None]:
     last_price = None
+    last_wait_log_at = 0.0
     # Bybit full-depth has no initial WS snapshot. Start the REST request only
     # after the first delta is buffered, so a fast REST response cannot race
     # ahead of the stream and make the first buffered update appear newer.
@@ -124,32 +243,56 @@ async def _fetch_snapshot_while_buffering(
         try:
             message = await asyncio.wait_for(websocket.recv(), timeout=0.5)
         except asyncio.TimeoutError:
+            now = monotonic()
+            if now - last_wait_log_at >= 30:
+                logger.warning(
+                    "%s waiting for the first full-depth WebSocket delta; "
+                    "REST snapshot has not been requested",
+                    symbol,
+                )
+                last_wait_log_at = now
             continue
         payload = json.loads(message)
         _check_subscription(payload)
         topic = payload.get("topic")
         if topic == f"orderbook.full.{symbol}":
-            buffer_orderbook_delta(buffered_deltas, payload["data"])
+            buffer_orderbook_delta(buffered_deltas, payload["data"], sync_counters)
         elif topic == f"publicTrade.{symbol}":
             last_price = _update_flow(trade_flow, payload) or last_price
 
     snapshot_task = asyncio.create_task(get_orderbook_snapshot(symbol))
+    logger.debug("%s REST orderbook snapshot requested after WS delta", symbol)
+    last_rest_wait_log_at = 0.0
     try:
         while not snapshot_task.done():
             try:
                 message = await asyncio.wait_for(websocket.recv(), timeout=0.5)
             except asyncio.TimeoutError:
+                now = monotonic()
+                if now - last_rest_wait_log_at >= 30:
+                    first = buffered_deltas[0] if buffered_deltas else {}
+                    logger.warning(
+                        "%s waiting for REST snapshot; first buffered update seq=%s u=%s",
+                        symbol,
+                        first.get("seq"),
+                        first.get("u"),
+                    )
+                    last_rest_wait_log_at = now
                 continue
             payload = json.loads(message)
             _check_subscription(payload)
             topic = payload.get("topic")
             if topic == f"orderbook.full.{symbol}":
-                buffer_orderbook_delta(buffered_deltas, payload["data"])
+                buffer_orderbook_delta(
+                    buffered_deltas, payload["data"], sync_counters
+                )
                 if len(buffered_deltas) > 10000:
                     raise RuntimeError("Too many buffered deltas during snapshot sync")
             elif topic == f"publicTrade.{symbol}":
                 last_price = _update_flow(trade_flow, payload) or last_price
-        return await snapshot_task, last_price
+        snapshot = await snapshot_task
+        _log_snapshot_if_due(symbol, snapshot, len(buffered_deltas))
+        return snapshot, last_price
     finally:
         if not snapshot_task.done():
             snapshot_task.cancel()
@@ -170,6 +313,10 @@ async def _run_connection(
     last_price = None
     stable_walls = []
     pending_reconciled = False
+    sync_counters = {"accepted": 0, "discarded": 0, "resets": 0}
+    last_analysis_log_at = 0.0
+    last_alignment_warning_at = 0.0
+    last_alignment_wait_log_at = 0.0
 
     async with websockets.connect(
         BYBIT_WS_URL,
@@ -177,20 +324,37 @@ async def _run_connection(
         ping_timeout=20,
         close_timeout=5,
     ) as websocket:
+        logger.info("%s WebSocket connected", symbol)
         await websocket.send(json.dumps({"op": "subscribe", "args": topics}))
+        logger.info("%s WebSocket subscription requested: %s", symbol, ",".join(topics))
         buffered_deltas = []
         snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
-            websocket, symbol, trade_flow, buffered_deltas
+            websocket, symbol, trade_flow, buffered_deltas, sync_counters
         )
         last_price = snapshot_last_price or last_price
         while True:
             try:
                 first_index = find_first_delta_after_snapshot(snapshot, buffered_deltas)
-            except SnapshotRetryRequired:
+            except SnapshotRetryRequired as error:
                 # The REST response can lag the earliest buffered update. Keep
                 # buffering and request a newer snapshot as prescribed by V5.
+                now = monotonic()
+                if now - last_alignment_warning_at >= 30:
+                    first = buffered_deltas[0] if buffered_deltas else {}
+                    logger.warning(
+                        "%s orderbook alignment retry: %s; snapshot(seq=%s,u=%s), "
+                        "first_buffered(seq=%s,u=%s), buffered=%d",
+                        symbol,
+                        error,
+                        snapshot.get("seq"),
+                        snapshot.get("u"),
+                        first.get("seq"),
+                        first.get("u"),
+                        len(buffered_deltas),
+                    )
+                    last_alignment_warning_at = now
                 snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
-                    websocket, symbol, trade_flow, buffered_deltas
+                    websocket, symbol, trade_flow, buffered_deltas, sync_counters
                 )
                 last_price = snapshot_last_price or last_price
                 continue
@@ -199,6 +363,19 @@ async def _run_connection(
             try:
                 message = await asyncio.wait_for(websocket.recv(), timeout=0.5)
             except asyncio.TimeoutError:
+                now = monotonic()
+                if now - last_alignment_wait_log_at >= 30:
+                    latest = buffered_deltas[-1] if buffered_deltas else {}
+                    logger.warning(
+                        "%s waiting for a WS update aligned with REST snapshot "
+                        "seq=%s u=%s; latest buffered seq=%s u=%s",
+                        symbol,
+                        snapshot.get("seq"),
+                        snapshot.get("u"),
+                        latest.get("seq"),
+                        latest.get("u"),
+                    )
+                    last_alignment_wait_log_at = now
                 continue
             payload = json.loads(message)
             _check_subscription(payload)
@@ -207,20 +384,30 @@ async def _run_connection(
                 last_price = _update_flow(trade_flow, payload) or last_price
             elif topic == f"orderbook.full.{symbol}":
                 buffer_result = buffer_orderbook_delta(
-                    buffered_deltas, payload["data"]
+                    buffered_deltas, payload["data"], sync_counters
                 )
                 if len(buffered_deltas) > 10000:
                     raise RuntimeError("Too many buffered deltas during snapshot sync")
                 if buffer_result == "reset":
                     snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
-                        websocket, symbol, trade_flow, buffered_deltas
+                        websocket, symbol, trade_flow, buffered_deltas, sync_counters
                     )
                     last_price = snapshot_last_price or last_price
 
-        orderbook = LocalOrderBook()
-        orderbook.load_snapshot(snapshot)
-        for delta in buffered_deltas[first_index:]:
-            apply_orderbook_delta(orderbook, delta)
+        orderbook, first_index = build_synchronized_orderbook(
+            snapshot, buffered_deltas
+        )
+        sync_counters["discarded"] += max(0, first_index - 1)
+
+        logger.info(
+            "%s orderbook synchronized at %s: snapshot(seq=%s,u=%s), current(seq=%s,u=%s), "
+            "buffer accepted=%d discarded=%d resets=%d, depth bids=%d asks=%d",
+            symbol,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            snapshot["seq"], snapshot["u"], orderbook.sequence, orderbook.update_id,
+            sync_counters["accepted"], sync_counters["discarded"],
+            sync_counters["resets"], len(orderbook.bids), len(orderbook.asks),
+        )
 
         flow = trade_flow.get_flow()
         engine.set_feed_status(symbol, "connected")
@@ -240,17 +427,15 @@ async def _run_connection(
                     wall_events = ()
                     if not pending_reconciled:
                         pair_settings = engine.pair_settings.get(symbol, pair_settings)
-                        nearby = find_nearby_levels(
-                            orderbook, last_price, pair_settings.max_wall_distance_bps
+                        result = analyze_synced_orderbook(
+                            orderbook, last_price, flow, pair_settings, wall_tracker
                         )
-                        candidates = find_walls(
-                            nearby,
-                            flow,
-                            min_wall_ratio=pair_settings.min_wall_ratio,
-                            min_wall_notional=pair_settings.min_wall_notional_usdt,
+                        candidates = result["candidates"]
+                        wall_events = result["wall_events"]
+                        stable_walls = result["stable_walls"]
+                        last_analysis_log_at = _log_analysis_if_due(
+                            symbol, orderbook, last_price, result, last_analysis_log_at
                         )
-                        wall_events = wall_tracker.update(candidates, orderbook, flow)
-                        stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
                         pending_reconciled = True
                     events = await engine.process_market_update(
                         symbol, last_price, stable_walls, wall_events, candidates
@@ -277,17 +462,15 @@ async def _run_connection(
             # not try to calculate price-relative wall distance with None.
             if last_price is None:
                 continue
-            nearby = find_nearby_levels(
-                orderbook, last_price, pair_settings.max_wall_distance_bps
+            result = analyze_synced_orderbook(
+                orderbook, last_price, flow, pair_settings, wall_tracker
             )
-            walls = find_walls(
-                nearby,
-                flow,
-                min_wall_ratio=pair_settings.min_wall_ratio,
-                min_wall_notional=pair_settings.min_wall_notional_usdt,
+            walls = result["candidates"]
+            wall_events = result["wall_events"]
+            stable_walls = result["stable_walls"]
+            last_analysis_log_at = _log_analysis_if_due(
+                symbol, orderbook, last_price, result, last_analysis_log_at
             )
-            wall_events = wall_tracker.update(walls, orderbook, flow)
-            stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
             if last_price is not None:
                 pending_reconciled = True
                 events = await engine.process_market_update(

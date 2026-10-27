@@ -19,8 +19,10 @@ from script.formulas import (
 from script.market_data import (
     SnapshotRetryRequired,
     _fetch_snapshot_while_buffering,
+    analyze_synced_orderbook,
     apply_orderbook_delta,
     buffer_orderbook_delta,
+    build_synchronized_orderbook,
     find_first_delta_after_snapshot,
     market_data_worker,
 )
@@ -188,6 +190,20 @@ class BybitOrderbookSyncTests(unittest.TestCase):
         ]
         self.assertEqual(find_first_delta_after_snapshot(snapshot, buffered), 3)
 
+    def test_snapshot_and_buffer_build_a_current_local_book(self):
+        snapshot = {"seq": 20, "u": 50, "b": [[100, 1]], "a": [[101, 2]]}
+        buffered = [
+            {"seq": 18, "u": 48, "b": [[99, 1]], "a": []},
+            {"seq": 19, "u": 49, "b": [], "a": []},
+            {"seq": 20, "u": 50, "b": [], "a": []},
+            {"seq": 27, "u": 51, "b": [[100, 3]], "a": [[101, 0]]},
+        ]
+        book, _ = build_synchronized_orderbook(snapshot, buffered)
+        self.assertTrue(book.synchronized)
+        self.assertEqual(book.update_id, 51)
+        self.assertEqual(book.bids, {100.0: 3.0})
+        self.assertEqual(book.asks, {})
+
     def test_snapshot_waits_until_stream_reaches_snapshot_sequence(self):
         result = find_first_delta_after_snapshot(
             {"seq": 30, "u": 80}, [{"seq": 28, "u": 78}]
@@ -258,7 +274,77 @@ class BybitOrderbookSyncTests(unittest.TestCase):
         book.load_snapshot({"u": 50, "seq": 500, "b": [[100, 1]], "a": []})
         with self.assertRaisesRegex(RuntimeError, "gap"):
             apply_orderbook_delta(book, {"u": 52, "seq": 503, "b": [], "a": []})
+        self.assertFalse(book.synchronized)
         self.assertEqual(book.bids, {100.0: 1.0})
+
+    def test_stale_snapshot_alignment_does_not_build_book(self):
+        with self.assertRaises(SnapshotRetryRequired):
+            build_synchronized_orderbook(
+                {"seq": 20, "u": 50, "b": [], "a": []},
+                [{"seq": 21, "u": 51, "b": [], "a": []}],
+            )
+
+    def test_wall_analyzer_rejects_an_unsynchronized_book(self):
+        with self.assertRaisesRegex(RuntimeError, "unsynchronized"):
+            analyze_synced_orderbook(
+                LocalOrderBook(),
+                100,
+                {},
+                PairSettings("BTCUSDT"),
+                WallTracker(),
+            )
+
+    def test_synchronized_book_is_transferred_to_wall_analyzer(self):
+        settings = PairSettings(
+            "BTCUSDT", min_wall_ratio=50, max_wall_distance_bps=100,
+            min_wall_age_seconds=0,
+        )
+        snapshot = {
+            "seq": 100, "u": 10,
+            "b": [[100, 1], [99.9, 1], [99.8, 1], [99.7, 1], [99.6, 100]],
+            "a": [],
+        }
+        book, _ = build_synchronized_orderbook(
+            snapshot, [{"seq": 100, "u": 10, "b": [], "a": []}]
+        )
+        flow = {
+            "buy_volume_per_second": 0,
+            "sell_volume_per_second": 0,
+            "buy_volume_by_price_total": {},
+            "sell_volume_by_price_total": {},
+        }
+        result = analyze_synced_orderbook(
+            book, 100, flow, settings, WallTracker(min_age_seconds=0)
+        )
+        self.assertGreater(len(result["nearby_levels"]), 0)
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(result["candidates"][0]["price"], 99.6)
+        engine = TradingEngine({"BTCUSDT": settings})
+        engine.start()
+        events = engine.on_market_update(
+            "BTCUSDT", 100, result["stable_walls"],
+            result["wall_events"], result["candidates"],
+        )
+        self.assertIn("TRADE_CREATED", [event["event"] for event in events])
+
+    def test_valid_book_with_no_matching_walls_is_successful_analysis(self):
+        settings = PairSettings("BTCUSDT", min_wall_ratio=888)
+        book, _ = build_synchronized_orderbook(
+            {"seq": 100, "u": 10, "b": [[100, 1], [99.9, 1]], "a": []},
+            [{"seq": 100, "u": 10, "b": [], "a": []}],
+        )
+        flow = {
+            "buy_volume_per_second": 0,
+            "sell_volume_per_second": 0,
+            "buy_volume_by_price_total": {},
+            "sell_volume_by_price_total": {},
+        }
+        result = analyze_synced_orderbook(
+            book, 100, flow, settings, WallTracker()
+        )
+        self.assertTrue(book.synchronized)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["filter_counts"]["below_min_wall_ratio"], 2)
 
 
 class MarketDataSnapshotHandshakeTests(unittest.TestCase):

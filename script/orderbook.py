@@ -5,6 +5,7 @@ class LocalOrderBook:
 
         self.update_id = None
         self.sequence = None
+        self.synchronized = False
 
     def load_snapshot(self, snapshot):
         self.bids = {
@@ -21,13 +22,19 @@ class LocalOrderBook:
 
         self.update_id = snapshot["u"]
         self.sequence = snapshot["seq"]
+        self.synchronized = True
 
     def apply_delta(self, delta):
+        if not self.synchronized:
+            raise RuntimeError("Cannot apply a delta to an unsynchronized orderbook")
         self._update_side(self.bids, delta["b"])
         self._update_side(self.asks, delta["a"])
 
         self.update_id = delta["u"]
         self.sequence = delta["seq"]
+
+    def invalidate(self):
+        self.synchronized = False
 
     @staticmethod
     def _update_side(book_side, updates):

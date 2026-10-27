@@ -34,7 +34,22 @@ def find_nearby_levels(orderbook, last_price, max_distance_bps=100):
     return levels
 
 
-def find_walls(levels, flow, min_wall_ratio=888, min_wall_notional=0):
+def find_walls(
+    levels,
+    flow,
+    min_wall_ratio=888,
+    min_wall_notional=0,
+    diagnostics=None,
+):
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update({
+            "input_levels": len(levels),
+            "below_min_notional": 0,
+            "no_side_median": 0,
+            "below_min_wall_ratio": 0,
+            "candidates": 0,
+        })
     buy_levels = [
         level for level in levels
         if level["side"] == "buy"
@@ -63,6 +78,8 @@ def find_walls(levels, flow, min_wall_ratio=888, min_wall_notional=0):
             level["quantity"]
         )
         if notional < min_wall_notional:
+            if diagnostics is not None:
+                diagnostics["below_min_notional"] += 1
             continue
 
         if level["side"] == "buy":
@@ -74,11 +91,15 @@ def find_walls(levels, flow, min_wall_ratio=888, min_wall_notional=0):
             opposing_flow = flow["buy_volume_per_second"]
 
         if side_median is None or side_median == 0:
+            if diagnostics is not None:
+                diagnostics["no_side_median"] += 1
             continue
 
         wall_ratio = notional / side_median
 
         if wall_ratio < min_wall_ratio:
+            if diagnostics is not None:
+                diagnostics["below_min_wall_ratio"] += 1
             continue
 
         if opposing_flow > 0:
@@ -97,4 +118,6 @@ def find_walls(levels, flow, min_wall_ratio=888, min_wall_notional=0):
             "estimated_consumption_time": estimated_consumption_time,
         })
 
+    if diagnostics is not None:
+        diagnostics["candidates"] = len(walls)
     return walls
