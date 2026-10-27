@@ -3,7 +3,7 @@ from html import escape
 from dataclasses import replace
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart, Filter, StateFilter, Command
+from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -23,22 +23,17 @@ def _load_admin_user_ids() -> set[int]:
             "Set ADMIN_USER_ID to comma-separated Telegram admin user IDs."
         )
 
-    try:
-        user_ids = {
-            int(value.strip())
-            for value in raw_value.split(",")
-            if value.strip()
-        }
-    except ValueError as error:
-        raise RuntimeError(
-            "ADMIN_USER_ID must contain positive integers separated by commas."
-        ) from error
-
-    if not user_ids or any(user_id <= 0 for user_id in user_ids):
+    values = [value.strip() for value in raw_value.split(",")]
+    if any(not value.isascii() or not value.isdigit() for value in values):
         raise RuntimeError(
             "ADMIN_USER_ID must contain positive integers separated by commas."
         )
 
+    user_ids = {int(value) for value in values}
+    if any(user_id <= 0 for user_id in user_ids):
+        raise RuntimeError(
+            "ADMIN_USER_ID must contain positive integers separated by commas."
+        )
     return user_ids
 
 
@@ -152,10 +147,10 @@ def pair_settings_text(runtime: RuntimeController) -> str:
     return "\n".join(pairs) or "Торговые пары не настроены."
 
 
-@admin.message(Command('id'))
+@admin.message(F.chat.type == "private", Command("id"))
 async def dayid(message: Message):
     tg_id = message.from_user.id
-    await message.answer(f'{tg_id}')
+    await message.answer(f"{tg_id}")
 
 @admin.message(Admin(), CommandStart())
 async def cmd_start(

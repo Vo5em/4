@@ -31,6 +31,7 @@ from app.admin import (
     _load_admin_user_ids,
     cancel_input,
     dashboard_text,
+    dayid,
     pair_settings_text,
 )
 from run import _symbols_from_environment, build_runtime
@@ -498,15 +499,22 @@ class AdminAuthorizationTests(unittest.TestCase):
         self.assertIn("порог потребления 90%", text)
         self.assertIn("стратегии stable_wall_v1", text)
 
-    def test_admin_id_must_be_explicit_and_valid(self):
+    def test_admin_ids_load_one_or_many_with_whitespace_and_deduplication(self):
         with patch.dict(os.environ, {"ADMIN_USER_ID": "7319"}):
-            self.assertEqual(_load_admin_user_ids(), 7319)
+            self.assertEqual(_load_admin_user_ids(), {7319})
+        with patch.dict(os.environ, {"ADMIN_USER_ID": " 7319, 8420,7319, 9650 "}):
+            self.assertEqual(_load_admin_user_ids(), {7319, 8420, 9650})
+
+    def test_empty_or_invalid_admin_id_configuration_fails_closed(self):
         with patch.dict(os.environ, {"ADMIN_USER_ID": ""}):
             with self.assertRaisesRegex(RuntimeError, "Set ADMIN_USER_ID"):
                 _load_admin_user_ids()
-        with patch.dict(os.environ, {"ADMIN_USER_ID": "not-a-number"}):
-            with self.assertRaisesRegex(RuntimeError, "positive integer"):
-                _load_admin_user_ids()
+        for value in ("not-a-number", "7319,,8420", "7319,", "0", "-7319"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"ADMIN_USER_ID": value}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "positive integers"):
+                    _load_admin_user_ids()
 
     @staticmethod
     def make_message(user_id, chat_id, chat_type):
@@ -519,14 +527,32 @@ class AdminAuthorizationTests(unittest.TestCase):
 
     def test_only_configured_admin_in_private_chat_passes_filter(self):
         admin_filter = Admin()
-        private_admin = self.make_message(4242, 4242, "private")
-        private_other_user = self.make_message(4243, 4243, "private")
-        admin_in_group = self.make_message(4242, -10042, "supergroup")
+        first_admin = self.make_message(7319, 7319, "private")
+        second_admin = self.make_message(8420, 8420, "private")
+        non_admin = self.make_message(4243, 4243, "private")
+        admin_in_group = self.make_message(7319, -10042, "supergroup")
 
-        with patch("app.admin.ADMIN_USER_ID", 4242):
-            self.assertTrue(run_immediate(admin_filter(private_admin)))
-            self.assertFalse(run_immediate(admin_filter(private_other_user)))
+        with patch("app.admin.ADMIN_USER_IDS", {7319, 8420}):
+            self.assertTrue(run_immediate(admin_filter(first_admin)))
+            self.assertTrue(run_immediate(admin_filter(second_admin)))
+            self.assertFalse(run_immediate(admin_filter(non_admin)))
             self.assertFalse(run_immediate(admin_filter(admin_in_group)))
+
+    def test_id_command_works_for_non_admin_without_granting_admin_access(self):
+        user_id = 4243
+        admin_filter = Admin()
+        answers = []
+        message = self.make_message(user_id, user_id, "private")
+
+        async def answer(_message, text):
+            answers.append(text)
+
+        with patch("app.admin.ADMIN_USER_IDS", {7319, 8420}), patch.object(
+            Message, "answer", answer
+        ):
+            run_immediate(dayid(message))
+            self.assertEqual(answers, [str(user_id)])
+            self.assertFalse(run_immediate(admin_filter(message)))
 
 
 class PairSymbolValidationTests(unittest.TestCase):
