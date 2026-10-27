@@ -1,5 +1,6 @@
 import asyncio
 import json
+import itertools
 import logging
 from datetime import datetime, timezone
 from time import monotonic
@@ -16,15 +17,18 @@ from .wall_tracker import WallTracker
 
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
-BYBIT_REST_URL = "https://api.bybit.com/v5/market/orderbook"
+# `orderbook.full` requires the matching full-depth REST stream; the regular
+# `/orderbook` endpoint's `u` belongs to the 1000-level orderbook feed.
+BYBIT_REST_URL = "https://api.bybit.com/v5/market/full_orderbook"
 DEFAULT_SYMBOL = "BTCUSDT"
 CATEGORY = "linear"
 logger = logging.getLogger(__name__)
 _last_snapshot_log_at: dict[str, float] = {}
+_connection_generations = itertools.count(1)
 
 
 async def get_orderbook_snapshot(symbol: str) -> dict:
-    params = {"category": CATEGORY, "symbol": symbol, "limit": 1000}
+    params = {"category": CATEGORY, "symbol": symbol}
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(BYBIT_REST_URL, params=params) as response:
@@ -41,14 +45,45 @@ def _check_subscription(payload: dict) -> None:
 
 
 class SnapshotRetryRequired(RuntimeError):
-    """The REST snapshot is older than the buffered delta stream."""
+    """The REST snapshot and buffered full-depth updates do not yet align."""
+
+
+class OrderbookDeltaBuffer:
+    """One WebSocket connection's delta generation and continuity cursor."""
+
+    def __init__(self, generation: int) -> None:
+        self.generation = generation
+        self.updates: list[dict] = []
+        self.last_u: int | None = None
+        self.last_seq: int | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.updates)
+
+    def __len__(self) -> int:
+        return len(self.updates)
+
+    def __getitem__(self, index):
+        return self.updates[index]
+
+    def __iter__(self):
+        return iter(self.updates)
+
+    def discard_included_by_snapshot(self, snapshot_seq: int) -> int:
+        """Discard deltas already covered by REST, retaining the u cursor."""
+        count = 0
+        while self.updates and self.updates[0]["seq"] < snapshot_seq:
+            self.updates.pop(0)
+            count += 1
+        return count
 
 
 def find_first_delta_after_snapshot(snapshot: dict, buffer: list[dict]) -> int | None:
     """Find the matching Bybit update; seq is ordered but not consecutive."""
-    if buffer and snapshot["seq"] < buffer[0]["seq"]:
+    updates = buffer.updates if isinstance(buffer, OrderbookDeltaBuffer) else buffer
+    if updates and snapshot["seq"] < updates[0]["seq"]:
         raise SnapshotRetryRequired("REST snapshot is older than the first buffered delta")
-    for index, delta in enumerate(buffer):
+    for index, delta in enumerate(updates):
         if delta["seq"] < snapshot["seq"]:
             continue
         if delta["seq"] == snapshot["seq"]:
@@ -63,41 +98,67 @@ def find_first_delta_after_snapshot(snapshot: dict, buffer: list[dict]) -> int |
     return None
 
 
+def discard_deltas_included_by_snapshot(snapshot: dict, buffer) -> int:
+    """Drop old deltas while preserving the connection's continuity cursor."""
+    if isinstance(buffer, OrderbookDeltaBuffer):
+        return buffer.discard_included_by_snapshot(snapshot["seq"])
+    first_not_included = next(
+        (index for index, delta in enumerate(buffer) if delta["seq"] >= snapshot["seq"]),
+        len(buffer),
+    )
+    del buffer[:first_not_included]
+    return first_not_included
+
+
 def buffer_orderbook_delta(
-    buffer: list[dict], delta: dict, counters: dict | None = None
+    buffer, delta: dict, counters: dict | None = None
 ) -> str:
     """Keep a contiguous Bybit `u` segment, dropping stale `seq` updates.
 
     Returns ``appended``, ``ignored`` or ``reset``. Bybit's `seq` is a
     cross-sequence and may skip values; only `u` must be consecutive.
     """
-    if buffer and delta["seq"] < buffer[-1]["seq"]:
+    updates = buffer.updates if isinstance(buffer, OrderbookDeltaBuffer) else buffer
+    previous_seq = (
+        buffer.last_seq if isinstance(buffer, OrderbookDeltaBuffer)
+        else updates[-1]["seq"] if updates else None
+    )
+    previous_u = (
+        buffer.last_u if isinstance(buffer, OrderbookDeltaBuffer)
+        else updates[-1]["u"] if updates else None
+    )
+    if previous_seq is not None and delta["seq"] < previous_seq:
         if counters is not None:
             counters["discarded"] += 1
         return "ignored"
     if delta["u"] == 1:
         if counters is not None:
-            counters["discarded"] += len(buffer)
+            counters["discarded"] += len(updates)
             counters["resets"] += 1
             counters["accepted"] += 1
-        buffer.clear()
-        buffer.append(delta)
+        updates.clear()
+        updates.append(delta)
+        if isinstance(buffer, OrderbookDeltaBuffer):
+            buffer.last_u, buffer.last_seq = delta["u"], delta["seq"]
         return "reset"
-    if buffer:
-        previous_u = buffer[-1]["u"]
+    if previous_u is not None:
         if delta["u"] <= previous_u:
             if counters is not None:
                 counters["discarded"] += 1
             return "ignored"
         if delta["u"] != previous_u + 1:
             if counters is not None:
-                counters["discarded"] += len(buffer)
+                counters["discarded"] += len(updates)
                 counters["resets"] += 1
                 counters["accepted"] += 1
-            buffer.clear()
-            buffer.append(delta)
+            updates.clear()
+            updates.append(delta)
+            if isinstance(buffer, OrderbookDeltaBuffer):
+                buffer.last_u, buffer.last_seq = delta["u"], delta["seq"]
             return "reset"
-    buffer.append(delta)
+    updates.append(delta)
+    if isinstance(buffer, OrderbookDeltaBuffer):
+        buffer.last_u, buffer.last_seq = delta["u"], delta["seq"]
     if counters is not None:
         counters["accepted"] += 1
     return "appended"
@@ -120,6 +181,7 @@ def apply_orderbook_delta(orderbook: LocalOrderBook, delta: dict) -> None:
 
 def build_synchronized_orderbook(snapshot: dict, buffered_deltas: list[dict]):
     """Build a local book only when REST and buffered WS updates align."""
+    discard_deltas_included_by_snapshot(snapshot, buffered_deltas)
     first_index = find_first_delta_after_snapshot(snapshot, buffered_deltas)
     if first_index is None:
         raise SnapshotRetryRequired("WebSocket stream has not reached the REST snapshot")
@@ -261,7 +323,11 @@ async def _fetch_snapshot_while_buffering(
             last_price = _update_flow(trade_flow, payload) or last_price
 
     snapshot_task = asyncio.create_task(get_orderbook_snapshot(symbol))
-    logger.debug("%s REST orderbook snapshot requested after WS delta", symbol)
+    logger.debug(
+        "%s generation=%s REST snapshot requested after WS delta",
+        symbol,
+        getattr(buffered_deltas, "generation", "unknown"),
+    )
     last_rest_wait_log_at = 0.0
     try:
         while not snapshot_task.done():
@@ -327,12 +393,15 @@ async def _run_connection(
         logger.info("%s WebSocket connected", symbol)
         await websocket.send(json.dumps({"op": "subscribe", "args": topics}))
         logger.info("%s WebSocket subscription requested: %s", symbol, ",".join(topics))
-        buffered_deltas = []
+        buffered_deltas = OrderbookDeltaBuffer(next(_connection_generations))
+        logger.info("%s orderbook buffer generation=%d started", symbol, buffered_deltas.generation)
         snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
             websocket, symbol, trade_flow, buffered_deltas, sync_counters
         )
         last_price = snapshot_last_price or last_price
         while True:
+            dropped = discard_deltas_included_by_snapshot(snapshot, buffered_deltas)
+            sync_counters["discarded"] += dropped
             try:
                 first_index = find_first_delta_after_snapshot(snapshot, buffered_deltas)
             except SnapshotRetryRequired as error:
@@ -342,9 +411,10 @@ async def _run_connection(
                 if now - last_alignment_warning_at >= 30:
                     first = buffered_deltas[0] if buffered_deltas else {}
                     logger.warning(
-                        "%s orderbook alignment retry: %s; snapshot(seq=%s,u=%s), "
+                        "%s generation=%d orderbook alignment retry: %s; snapshot(seq=%s,u=%s), "
                         "first_buffered(seq=%s,u=%s), buffered=%d",
                         symbol,
+                        buffered_deltas.generation,
                         error,
                         snapshot.get("seq"),
                         snapshot.get("u"),
@@ -394,15 +464,15 @@ async def _run_connection(
                     )
                     last_price = snapshot_last_price or last_price
 
-        orderbook, first_index = build_synchronized_orderbook(
+        orderbook, _ = build_synchronized_orderbook(
             snapshot, buffered_deltas
         )
-        sync_counters["discarded"] += max(0, first_index - 1)
 
         logger.info(
-            "%s orderbook synchronized at %s: snapshot(seq=%s,u=%s), current(seq=%s,u=%s), "
+            "%s generation=%d orderbook synchronized at %s: snapshot(seq=%s,u=%s), current(seq=%s,u=%s), "
             "buffer accepted=%d discarded=%d resets=%d, depth bids=%d asks=%d",
             symbol,
+            buffered_deltas.generation,
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
             snapshot["seq"], snapshot["u"], orderbook.sequence, orderbook.update_id,
             sync_counters["accepted"], sync_counters["discarded"],

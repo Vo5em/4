@@ -17,13 +17,17 @@ from script.formulas import (
     calculate_x2_price,
 )
 from script.market_data import (
+    BYBIT_REST_URL,
+    OrderbookDeltaBuffer,
     SnapshotRetryRequired,
     _fetch_snapshot_while_buffering,
     analyze_synced_orderbook,
     apply_orderbook_delta,
     buffer_orderbook_delta,
     build_synchronized_orderbook,
+    discard_deltas_included_by_snapshot,
     find_first_delta_after_snapshot,
+    get_orderbook_snapshot,
     market_data_worker,
 )
 from script.orderbook import LocalOrderBook
@@ -189,6 +193,92 @@ class BybitOrderbookSyncTests(unittest.TestCase):
             {"seq": 27, "u": 51},
         ]
         self.assertEqual(find_first_delta_after_snapshot(snapshot, buffered), 3)
+
+    def test_snapshot_caught_between_buffered_seq_values_prunes_included_updates(self):
+        buffer = OrderbookDeltaBuffer(generation=1)
+        for delta in (
+            {"seq": 100, "u": 10},
+            {"seq": 200, "u": 11},
+            {"seq": 300, "u": 12},
+        ):
+            buffer_orderbook_delta(buffer, delta)
+
+        dropped = discard_deltas_included_by_snapshot({"seq": 250}, buffer)
+
+        self.assertEqual(dropped, 2)
+        self.assertEqual(buffer.updates, [{"seq": 300, "u": 12}])
+        with self.assertRaisesRegex(SnapshotRetryRequired, "older than the first"):
+            find_first_delta_after_snapshot({"seq": 250}, buffer)
+
+    def test_repeated_alignment_retries_do_not_accumulate_old_deltas(self):
+        buffer = OrderbookDeltaBuffer(generation=7)
+        for index in range(760):
+            delta = {"seq": (index + 1) * 100, "u": index + 1}
+            buffer_orderbook_delta(buffer, delta)
+            snapshot = {"seq": delta["seq"] - 1, "u": delta["u"] - 1}
+            discard_deltas_included_by_snapshot(snapshot, buffer)
+            with self.assertRaises(SnapshotRetryRequired):
+                find_first_delta_after_snapshot(snapshot, buffer)
+            self.assertLessEqual(len(buffer), 1)
+
+    def test_pruning_snapshot_covered_deltas_keeps_update_id_gap_detection(self):
+        buffer = OrderbookDeltaBuffer(generation=5)
+        buffer_orderbook_delta(buffer, {"seq": 100, "u": 40})
+        buffer_orderbook_delta(buffer, {"seq": 200, "u": 41})
+        discard_deltas_included_by_snapshot({"seq": 150}, buffer)
+
+        self.assertEqual(buffer.updates, [{"seq": 200, "u": 41}])
+        self.assertEqual(buffer.last_u, 41)
+        self.assertEqual(
+            buffer_orderbook_delta(buffer, {"seq": 300, "u": 43}),
+            "reset",
+        )
+        self.assertEqual(buffer.updates, [{"seq": 300, "u": 43}])
+
+    def test_new_websocket_generation_has_no_previous_connection_deltas(self):
+        first = OrderbookDeltaBuffer(generation=1)
+        second = OrderbookDeltaBuffer(generation=2)
+        buffer_orderbook_delta(first, {"seq": 100, "u": 500})
+        buffer_orderbook_delta(second, {"seq": 10, "u": 1})
+
+        self.assertEqual(first.updates, [{"seq": 100, "u": 500}])
+        self.assertEqual(second.updates, [{"seq": 10, "u": 1}])
+        self.assertEqual(second.last_u, 1)
+
+    def test_rest_snapshot_uses_full_depth_endpoint_and_matching_params(self):
+        payload = {"retCode": 0, "result": {"seq": 123, "u": 45, "b": [], "a": []}}
+        calls = []
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def json(self):
+                return payload
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def get(self, url, params):
+                calls.append((url, params))
+                return FakeResponse()
+
+        with patch("script.market_data.aiohttp.ClientSession", return_value=FakeSession()):
+            snapshot = run_immediate(get_orderbook_snapshot("BTCUSDT"))
+
+        self.assertEqual(BYBIT_REST_URL, "https://api.bybit.com/v5/market/full_orderbook")
+        self.assertEqual(calls, [(BYBIT_REST_URL, {"category": "linear", "symbol": "BTCUSDT"})])
+        self.assertEqual((snapshot["seq"], snapshot["u"]), (123, 45))
 
     def test_snapshot_and_buffer_build_a_current_local_book(self):
         snapshot = {"seq": 20, "u": 50, "b": [[100, 1]], "a": [[101, 2]]}
