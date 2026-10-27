@@ -28,7 +28,7 @@ from script.wall_tracker import WallTracker
 from app.runtime import RuntimeController
 from app.admin import (
     Admin,
-    _load_admin_user_id,
+    _load_admin_user_ids,
     cancel_input,
     dashboard_text,
     pair_settings_text,
@@ -500,13 +500,13 @@ class AdminAuthorizationTests(unittest.TestCase):
 
     def test_admin_id_must_be_explicit_and_valid(self):
         with patch.dict(os.environ, {"ADMIN_USER_ID": "7319"}):
-            self.assertEqual(_load_admin_user_id(), 7319)
+            self.assertEqual(_load_admin_user_ids(), 7319)
         with patch.dict(os.environ, {"ADMIN_USER_ID": ""}):
             with self.assertRaisesRegex(RuntimeError, "Set ADMIN_USER_ID"):
-                _load_admin_user_id()
+                _load_admin_user_ids()
         with patch.dict(os.environ, {"ADMIN_USER_ID": "not-a-number"}):
             with self.assertRaisesRegex(RuntimeError, "positive integer"):
-                _load_admin_user_id()
+                _load_admin_user_ids()
 
     @staticmethod
     def make_message(user_id, chat_id, chat_type):
