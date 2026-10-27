@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timezone
 
 
 class WallTracker:
@@ -29,10 +30,7 @@ class WallTracker:
         # ---------------------------------------------
 
         current_candidates = {
-            (
-                wall["side"],
-                wall["price"],
-            )
+            (wall["side"], wall["price"]): wall
             for wall in detected_walls
         }
 
@@ -56,15 +54,19 @@ class WallTracker:
 
                 "initial_size": wall["notional"],
                 "current_size": wall["notional"],
+                "wall_ratio": wall.get("wall_ratio", 0.0),
+                "median_notional": wall.get("median_notional"),
+                "qualifies": True,
 
                 "first_seen": now,
+                "first_seen_at": datetime.now(timezone.utc).isoformat(),
                 "last_seen": now,
 
                 "aggressive_volume": 0,
                 "last_relevant_total": (
-                    trade_flow["sell_volume_total"]
+                    trade_flow.get("sell_volume_by_price_total", {}).get(wall["price"], 0)
                     if wall["side"] == "buy"
-                    else trade_flow["buy_volume_total"]
+                    else trade_flow.get("buy_volume_by_price_total", {}).get(wall["price"], 0)
                 ),
 
                 "status": "candidate",
@@ -77,13 +79,8 @@ class WallTracker:
         for key, wall in list(self.walls.items()):
 
             # -----------------------------------------
-            # Стена больше НЕ проходит 888x
+            # Сохраняем стену ниже порога, пока уровень есть в стакане.
             # -----------------------------------------
-
-            if key not in current_candidates:
-
-                del self.walls[key]
-                continue
 
             # -----------------------------------------
             # Получаем текущий размер стены
@@ -101,18 +98,18 @@ class WallTracker:
             if current_size is None:
 
                 age = now - wall["first_seen"]
+                current_relevant_total = self._relevant_total(wall, trade_flow)
+                flow_delta = self._flow_delta(
+                    current_relevant_total, wall["last_relevant_total"]
+                )
+                wall["aggressive_volume"] += flow_delta
+                wall["last_relevant_total"] = current_relevant_total
+                wall["current_size"] = 0
 
-                # Если не прожила 20 секунд —
-                # это просто исчезнувший кандидат
-                if age < self.min_age_seconds:
-                    del self.walls[key]
-                    continue
-
-                # Если прожила 20+ секунд —
-                # классифицируем исчезновение
+                # Stability controls whether a wall can signal a trade, but every
+                # tracked disappearance still has a lifecycle event.
                 event = self._classify_disappearance(
                     wall,
-                    trade_flow,
                     age,
                 )
 
@@ -126,37 +123,28 @@ class WallTracker:
             # Стена существует и всё ещё проходит 888x
             # -----------------------------------------
 
-            previous_size = wall["current_size"]
-
             wall["current_size"] = current_size
             wall["last_seen"] = now
-
-            # -----------------------------------------
-            # Отслеживаем уменьшение стены
-            # -----------------------------------------
-
-            size_change = previous_size - current_size
+            candidate = current_candidates.get(key)
+            wall["qualifies"] = candidate is not None
+            if candidate is not None:
+                wall["wall_ratio"] = candidate.get("wall_ratio", wall["wall_ratio"])
+                wall["median_notional"] = candidate.get(
+                    "median_notional", wall["median_notional"]
+                )
 
             # -----------------------------------------
             # Получаем текущий cumulative flow
             # -----------------------------------------
 
-            if wall["side"] == "buy":
-                current_relevant_total = (
-                    trade_flow["sell_volume_total"]
-                )
-            else:
-                current_relevant_total = (
-                    trade_flow["buy_volume_total"]
-                )
+            current_relevant_total = self._relevant_total(wall, trade_flow)
 
             # -----------------------------------------
             # Сколько нового aggressive flow появилось
             # -----------------------------------------
 
-            flow_delta = (
-                    current_relevant_total
-                    - wall["last_relevant_total"]
+            flow_delta = self._flow_delta(
+                current_relevant_total, wall["last_relevant_total"]
             )
 
             # Обновляем точку отсчёта
@@ -164,17 +152,11 @@ class WallTracker:
                 current_relevant_total
             )
 
-            # Защита от отрицательного значения
-            if flow_delta < 0:
-                flow_delta = 0
-
             # -----------------------------------------
-            # Если стена уменьшилась —
-            # учитываем только новый flow
-            # -----------------------------------------
-
-            if size_change > 0:
-                wall["aggressive_volume"] += flow_delta
+            # Trade and orderbook WebSocket messages can arrive in either order.
+            # Count new exact-price aggressive flow independently of the book
+            # delta so a delayed trade message is not lost.
+            wall["aggressive_volume"] += flow_delta
 
             # -----------------------------------------
             # Проверяем возраст стены
@@ -219,7 +201,6 @@ class WallTracker:
     def _classify_disappearance(
         self,
         wall,
-        trade_flow,
         age,
     ):
         remaining_size = wall["current_size"]
@@ -256,14 +237,17 @@ class WallTracker:
     # =================================================
 
     @staticmethod
-    def _get_relevant_flow(
-        side,
-        trade_flow,
-    ):
-        if side == "buy":
-            return trade_flow["sell_volume"]
+    def _relevant_total(wall, trade_flow):
+        if wall["side"] == "buy":
+            by_price = trade_flow.get("sell_volume_by_price_total")
+            return by_price.get(wall["price"], 0) if by_price is not None else trade_flow.get("sell_volume_total", trade_flow.get("sell_volume", 0))
+        by_price = trade_flow.get("buy_volume_by_price_total")
+        return by_price.get(wall["price"], 0) if by_price is not None else trade_flow.get("buy_volume_total", trade_flow.get("buy_volume", 0))
 
-        return trade_flow["buy_volume"]
+    @staticmethod
+    def _flow_delta(current_total, previous_total):
+        # Per-price totals can restart at zero after their bounded cache evicts a key.
+        return current_total - previous_total if current_total >= previous_total else current_total
 
     # =================================================
     # Получить стабильные стены
@@ -276,7 +260,7 @@ class WallTracker:
 
         for wall in self.walls.values():
 
-            if wall["status"] != "stable":
+            if wall["status"] != "stable" or not wall.get("qualifies", True):
                 continue
 
             age = now - wall["first_seen"]

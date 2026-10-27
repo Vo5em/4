@@ -1,6 +1,6 @@
 from statistics import median
 
-from formulas import calculate_notional
+from .formulas import calculate_notional
 
 
 def find_nearby_levels(orderbook, last_price, max_distance_bps=100):
@@ -34,7 +34,7 @@ def find_nearby_levels(orderbook, last_price, max_distance_bps=100):
     return levels
 
 
-def find_walls(levels, flow, min_wall_ratio=888):
+def find_walls(levels, flow, min_wall_ratio=888, min_wall_notional=0):
     buy_levels = [
         level for level in levels
         if level["side"] == "buy"
@@ -62,6 +62,8 @@ def find_walls(levels, flow, min_wall_ratio=888):
             level["price"],
             level["quantity"]
         )
+        if notional < min_wall_notional:
+            continue
 
         if level["side"] == "buy":
             side_median = buy_median

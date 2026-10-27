@@ -4,479 +4,294 @@ import json
 import aiohttp
 import websockets
 
-from orderbook import LocalOrderBook
-from scanner import find_nearby_levels, find_walls
-from trade_flow import TradeFlow
-from wall_tracker import WallTracker
+from .engine import EngineMode, TradingEngine
+from .orderbook import LocalOrderBook
+from .scanner import find_nearby_levels, find_walls
+from .settings import PairSettings
+from .trade_flow import TradeFlow
+from .wall_tracker import WallTracker
 
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_REST_URL = "https://api.bybit.com/v5/market/orderbook"
-
-SYMBOL = "BTCUSDT"
+DEFAULT_SYMBOL = "BTCUSDT"
 CATEGORY = "linear"
 
 
-async def get_orderbook_snapshot():
-    params = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "limit": 1000,
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            BYBIT_REST_URL,
-            params=params
-        ) as response:
+async def get_orderbook_snapshot(symbol: str) -> dict:
+    params = {"category": CATEGORY, "symbol": symbol, "limit": 1000}
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(BYBIT_REST_URL, params=params) as response:
+            response.raise_for_status()
             data = await response.json()
-
-    if data["retCode"] != 0:
-        raise RuntimeError(
-            f"Ошибка Bybit REST: {data}"
-        )
-
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit REST returned retCode={data.get('retCode')}")
     return data["result"]
 
 
-def find_first_delta_after_snapshot(snapshot, buffer):
-    snapshot_seq = snapshot["seq"]
+def _check_subscription(payload: dict) -> None:
+    if payload.get("op") == "subscribe" and payload.get("success") is False:
+        raise RuntimeError("Bybit rejected the WebSocket subscription")
 
-    for delta in buffer:
-        if delta["seq"] > snapshot_seq:
-            return delta
 
-        if delta["seq"] == snapshot_seq:
-            if delta["u"] == snapshot["u"]:
-                return delta
+class SnapshotRetryRequired(RuntimeError):
+    """The REST snapshot is older than the buffered delta stream."""
 
-            return None
 
+def find_first_delta_after_snapshot(snapshot: dict, buffer: list[dict]) -> int | None:
+    """Return the first delta after a matching snapshot, or request a fresh snapshot."""
+    if buffer and snapshot["seq"] < buffer[0]["seq"]:
+        raise SnapshotRetryRequired("REST snapshot is older than the first buffered delta")
+    for index, delta in enumerate(buffer):
+        if delta["seq"] < snapshot["seq"]:
+            continue
+        if delta["seq"] == snapshot["seq"]:
+            if delta["u"] != snapshot["u"]:
+                raise SnapshotRetryRequired(
+                    "Snapshot and WebSocket delta disagree at the same seq"
+                )
+            return index + 1
+        raise SnapshotRetryRequired(
+            "Buffered deltas passed the snapshot without a matching seq"
+        )
     return None
 
 
-async def main():
-    buffer = []
+def apply_orderbook_delta(orderbook: LocalOrderBook, delta: dict) -> None:
+    """Apply the next full-depth update, ignore stale updates, or request resync."""
+    if delta["u"] == 1:
+        raise RuntimeError("Orderbook update ID reset; resynchronization required")
+    if delta["u"] <= orderbook.update_id:
+        return
+    if delta["u"] != orderbook.update_id + 1:
+        raise RuntimeError("Orderbook update ID gap; resynchronization required")
+    orderbook.apply_delta(delta)
+
+
+def _update_flow(trade_flow: TradeFlow, payload: dict) -> float | None:
     last_price = None
+    for trade in payload.get("data", []):
+        last_price = float(trade["p"])
+        trade_flow.add_trade(
+            price=last_price,
+            quantity=float(trade["v"]),
+            side=trade["S"],
+        )
+    return last_price
 
-    trade_flow = TradeFlow(
-        window_seconds=10
-    )
 
+async def _fetch_snapshot_while_buffering(
+    websocket,
+    symbol: str,
+    trade_flow: TradeFlow,
+    buffered_deltas: list[dict],
+) -> tuple[dict, float | None]:
+    snapshot_task = asyncio.create_task(get_orderbook_snapshot(symbol))
+    last_price = None
+    try:
+        while not snapshot_task.done():
+            try:
+                message = await asyncio.wait_for(websocket.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            payload = json.loads(message)
+            _check_subscription(payload)
+            topic = payload.get("topic")
+            if topic == f"orderbook.full.{symbol}":
+                buffered_deltas.append(payload["data"])
+                if len(buffered_deltas) > 10000:
+                    raise RuntimeError("Too many buffered deltas during snapshot sync")
+            elif topic == f"publicTrade.{symbol}":
+                last_price = _update_flow(trade_flow, payload) or last_price
+        return await snapshot_task, last_price
+    finally:
+        if not snapshot_task.done():
+            snapshot_task.cancel()
+            await asyncio.gather(snapshot_task, return_exceptions=True)
+
+
+async def _run_connection(
+    symbol: str,
+    engine: TradingEngine,
+    pair_settings: PairSettings,
+) -> None:
+    topics = [f"orderbook.full.{symbol}", f"publicTrade.{symbol}"]
+    trade_flow = TradeFlow(window_seconds=10)
     wall_tracker = WallTracker(
-        min_age_seconds=20,
-        consumed_ratio=0.9,
+        min_age_seconds=pair_settings.min_wall_age_seconds,
+        consumed_ratio=pair_settings.consumed_ratio,
     )
-
-    # Начальное состояние потока сделок.
-    flow = trade_flow.get_flow()
+    last_price = None
+    stable_walls = []
+    pending_reconciled = False
 
     async with websockets.connect(
-        BYBIT_WS_URL
+        BYBIT_WS_URL,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=5,
     ) as websocket:
-
-        subscribe_message = {
-            "op": "subscribe",
-            "args": [
-                f"orderbook.full.{SYMBOL}",
-                f"publicTrade.{SYMBOL}"
-            ]
-        }
-
-        await websocket.send(
-            json.dumps(subscribe_message)
+        await websocket.send(json.dumps({"op": "subscribe", "args": topics}))
+        buffered_deltas = []
+        snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
+            websocket, symbol, trade_flow, buffered_deltas
         )
-
-        print(
-            f"WebSocket подключён. "
-            f"Слушаем {SYMBOL}...\n"
-        )
-
-        # -------------------------------------------------
-        # ПОЛУЧАЕМ WEBSOCKET DELTA ДО REST SNAPSHOT
-        # -------------------------------------------------
-
-        snapshot_task = asyncio.create_task(
-            get_orderbook_snapshot()
-        )
-
-        while not snapshot_task.done():
-            message = await websocket.recv()
-            data = json.loads(message)
-
-            if data.get("topic") != (
-                f"orderbook.full.{SYMBOL}"
-            ):
+        last_price = snapshot_last_price or last_price
+        snapshot_refreshes = 0
+        while True:
+            try:
+                first_index = find_first_delta_after_snapshot(snapshot, buffered_deltas)
+            except SnapshotRetryRequired:
+                snapshot_refreshes += 1
+                if snapshot_refreshes > 5:
+                    raise RuntimeError(
+                        "Could not obtain a REST snapshot aligned with the WebSocket stream"
+                    )
+                snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
+                    websocket, symbol, trade_flow, buffered_deltas
+                )
+                last_price = snapshot_last_price or last_price
                 continue
-
-            delta = data["data"]
-
-            buffer.append(delta)
-
-            print(
-                f"Buffer: {len(buffer)} | "
-                f"u={delta['u']} | "
-                f"seq={delta['seq']}"
-            )
-
-        # -------------------------------------------------
-        # REST SNAPSHOT ГОТОВ
-        # -------------------------------------------------
-
-        snapshot = await snapshot_task
-
-        print("\nREST SNAPSHOT ПОЛУЧЕН:")
-        print(
-            f"u={snapshot['u']} | "
-            f"seq={snapshot['seq']}"
-        )
-
-        print(
-            f"Накоплено delta: {len(buffer)}"
-        )
-
-        # -------------------------------------------------
-        # СИНХРОНИЗАЦИЯ SNAPSHOT + WEBSOCKET
-        # -------------------------------------------------
-
-        first_delta = find_first_delta_after_snapshot(
-            snapshot,
-            buffer
-        )
-
-        if first_delta is None:
-            raise RuntimeError(
-                "Не удалось синхронизировать "
-                "snapshot с WebSocket."
-            )
-
-        print("\nСИНХРОНИЗАЦИЯ:")
-        print(
-            f"Первый delta после snapshot: "
-            f"u={first_delta['u']} | "
-            f"seq={first_delta['seq']}"
-        )
-
-        # -------------------------------------------------
-        # СОЗДАЁМ ЛОКАЛЬНЫЙ СТАКАН
-        # -------------------------------------------------
+            if first_index is not None:
+                break
+            try:
+                message = await asyncio.wait_for(websocket.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            payload = json.loads(message)
+            _check_subscription(payload)
+            topic = payload.get("topic")
+            if topic == f"publicTrade.{symbol}":
+                last_price = _update_flow(trade_flow, payload) or last_price
+            elif topic == f"orderbook.full.{symbol}":
+                buffered_deltas.append(payload["data"])
+                if len(buffered_deltas) > 10000:
+                    raise RuntimeError("Too many buffered deltas during snapshot sync")
 
         orderbook = LocalOrderBook()
+        orderbook.load_snapshot(snapshot)
+        for delta in buffered_deltas[first_index:]:
+            apply_orderbook_delta(orderbook, delta)
 
-        orderbook.load_snapshot(
-            snapshot
-        )
+        flow = trade_flow.get_flow()
+        engine.feed_status[symbol] = "connected"
+        while (
+            engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
+            and engine.should_run_market_feed(symbol)
+        ):
+            payload = json.loads(await websocket.recv())
+            _check_subscription(payload)
+            topic = payload.get("topic")
 
-        print("\nLOCAL ORDERBOOK СОЗДАН:")
-        print(
-            f"Bids: {len(orderbook.bids)}"
-        )
-        print(
-            f"Asks: {len(orderbook.asks)}"
-        )
-        print(
-            f"u: {orderbook.update_id}"
-        )
-        print(
-            f"seq: {orderbook.sequence}"
-        )
-
-        # -------------------------------------------------
-        # ПРИМЕНЯЕМ НАКОПЛЕННЫЕ DELTA
-        # -------------------------------------------------
-
-        first_delta_index = buffer.index(
-            first_delta
-        )
-
-        for delta in buffer[first_delta_index:]:
-            orderbook.apply_delta(delta)
-
-        print("\nBUFFER ПРИМЕНЁН:")
-        print(
-            f"Bids: {len(orderbook.bids)}"
-        )
-        print(
-            f"Asks: {len(orderbook.asks)}"
-        )
-        print(
-            f"u: {orderbook.update_id}"
-        )
-        print(
-            f"seq: {orderbook.sequence}"
-        )
-
-        buffer.clear()
-
-        print("\nСТАКАН СИНХРОНИЗИРОВАН.")
-        print(
-            "Переходим в режим "
-            "реального времени...\n"
-        )
-
-        # =================================================
-        # РЕАЛЬНОЕ ВРЕМЯ
-        # =================================================
-
-        while True:
-
-            message = await websocket.recv()
-            data = json.loads(message)
-
-            topic = data.get("topic")
-
-            # =================================================
-            # ИСПОЛНЕННЫЕ СДЕЛКИ
-            # =================================================
-
-            if topic == f"publicTrade.{SYMBOL}":
-
-                for trade in data["data"]:
-
-                    price = float(
-                        trade["p"]
-                    )
-
-                    quantity = float(
-                        trade["v"]
-                    )
-
-                    side = trade["S"]
-
-                    last_price = price
-
-                    trade_flow.add_trade(
-                        price=price,
-                        quantity=quantity,
-                        side=side
-                    )
-
-                # Получаем поток
-                # за последние 10 секунд.
-
+            if topic == f"publicTrade.{symbol}":
+                last_price = _update_flow(trade_flow, payload) or last_price
                 flow = trade_flow.get_flow()
-
-                print(
-                    f"FLOW | "
-                    f"buy=${flow['buy_volume']:.0f} | "
-                    f"sell=${flow['sell_volume']:.0f} | "
-                    f"buy/s=${flow['buy_volume_per_second']:.0f} | "
-                    f"sell/s=${flow['sell_volume_per_second']:.0f}"
-                )
-
-                continue
-
-            # =================================================
-            # ИЗМЕНЕНИЯ СТАКАНА
-            # =================================================
-
-            if topic != (
-                f"orderbook.full.{SYMBOL}"
-            ):
-                continue
-
-            delta = data["data"]
-
-            expected_update_id = (
-                orderbook.update_id + 1
-            )
-
-            if delta["u"] != expected_update_id:
-
-                print(
-                    "\nОШИБКА СИНХРОНИЗАЦИИ!"
-                )
-
-                print(
-                    f"Ожидали "
-                    f"u={expected_update_id}, "
-                    f"получили "
-                    f"u={delta['u']}"
-                )
-
-                break
-
-            orderbook.apply_delta(
-                delta
-            )
-
-            # =================================================
-            # ПОИСК УРОВНЕЙ РЯДОМ С ЦЕНОЙ
-            # =================================================
-
-            nearby_levels = find_nearby_levels(
-                orderbook,
-                last_price,
-                max_distance_bps=100
-            )
-
-            # =================================================
-            # ПОИСК НОВЫХ ПОТЕНЦИАЛЬНЫХ СТЕН
-            # =================================================
-
-            walls = find_walls(
-                nearby_levels,
-                flow
-            )
-
-            # =================================================
-            # WALL TRACKER
-            # =================================================
-
-            wall_events = wall_tracker.update(
-                detected_walls=walls,
-                orderbook=orderbook,
-                trade_flow=flow,
-            )
-
-            stable_walls = (
-                wall_tracker.get_stable_walls()
-            )
-
-            nearest_walls = (
-                wall_tracker.get_nearest_stable_walls(
-                    last_price,
-                    limit=10,
-                )
-            )
-
-            # =================================================
-            # ДИАГНОСТИКА СТАКАНА
-            # =================================================
-
-            print(
-                "TOP BIDS:",
-                sorted(
-                    orderbook.bids.keys(),
-                    reverse=True
-                )[:5]
-            )
-
-            print(
-                "TOP ASKS:",
-                sorted(
-                    orderbook.asks.keys()
-                )[:5]
-            )
-
-            print(
-                "LAST:",
-                last_price
-            )
-
-            if last_price is not None:
-
-                min_price = min(
-                    min(orderbook.bids),
-                    min(orderbook.asks)
-                )
-
-                max_price = max(
-                    max(orderbook.bids),
-                    max(orderbook.asks)
-                )
-
-                print(
-                    f"Диапазон стакана: "
-                    f"{min_price} - {max_price} | "
-                    f"last={last_price}"
-                )
-
-            print(
-                f"Обновление: "
-                f"u={orderbook.update_id} | "
-                f"seq={orderbook.sequence} | "
-                f"price={last_price} | "
-                f"nearby={len(nearby_levels)} | "
-                f"walls={len(walls)} | "
-                f"stable={len(stable_walls)} | "
-                f"bids={len(orderbook.bids)} | "
-                f"asks={len(orderbook.asks)}"
-            )
-
-            # =================================================
-            # НОВЫЕ НАЙДЕННЫЕ СТЕНЫ
-            # =================================================
-
-            if walls:
-
-                print(
-                    "\nНАЙДЕНЫ СТЕНЫ:"
-                )
-
-                for wall in walls[:10]:
-
-                    consume_time = (
-                        f"{wall['estimated_consumption_time']:.1f}s"
-                        if (
-                            wall[
-                                "estimated_consumption_time"
-                            ]
-                            is not None
+                if last_price is not None:
+                    candidates = None
+                    wall_events = ()
+                    if not pending_reconciled:
+                        pair_settings = engine.pair_settings.get(symbol, pair_settings)
+                        nearby = find_nearby_levels(
+                            orderbook, last_price, pair_settings.max_wall_distance_bps
                         )
-                        else "N/A"
+                        candidates = find_walls(
+                            nearby,
+                            flow,
+                            min_wall_ratio=pair_settings.min_wall_ratio,
+                            min_wall_notional=pair_settings.min_wall_notional_usdt,
+                        )
+                        wall_events = wall_tracker.update(candidates, orderbook, flow)
+                        stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
+                        pending_reconciled = True
+                    events = await engine.process_market_update(
+                        symbol, last_price, stable_walls, wall_events, candidates
                     )
+                    for event in events:
+                        print(f"{symbol} {event['event']} {event['trade'].get('signal_id')}")
+                continue
 
-                    print(
-                        f"{wall['side'].upper()} | "
-                        f"price={wall['price']} | "
-                        f"size=${wall['notional']:.0f} | "
-                        f"ratio={wall['wall_ratio']:.1f}x | "
-                        f"flow/s="
-                        f"${wall['opposing_flow_per_second']:.0f} | "
-                        f"consume≈{consume_time}"
-                    )
+            if topic != f"orderbook.full.{symbol}":
+                continue
 
-            # =================================================
-            # СТАБИЛЬНЫЕ СТЕНЫ
-            # =================================================
-
-            if stable_walls:
-
-                print(
-                    "\nСТАБИЛЬНЫЕ СТЕНЫ:"
+            pair_settings = engine.pair_settings.get(symbol, pair_settings)
+            wall_tracker.min_age_seconds = pair_settings.min_wall_age_seconds
+            wall_tracker.consumed_ratio = pair_settings.consumed_ratio
+            delta = payload["data"]
+            try:
+                apply_orderbook_delta(orderbook, delta)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Orderbook sequence issue for {symbol}; resynchronizing"
+                ) from error
+            # The REST ticker is best-effort during initial synchronization. Until
+            # the trade stream provides a price, keep applying book deltas but do
+            # not try to calculate price-relative wall distance with None.
+            if last_price is None:
+                continue
+            nearby = find_nearby_levels(
+                orderbook, last_price, pair_settings.max_wall_distance_bps
+            )
+            walls = find_walls(
+                nearby,
+                flow,
+                min_wall_ratio=pair_settings.min_wall_ratio,
+                min_wall_notional=pair_settings.min_wall_notional_usdt,
+            )
+            wall_events = wall_tracker.update(walls, orderbook, flow)
+            stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
+            if last_price is not None:
+                pending_reconciled = True
+                events = await engine.process_market_update(
+                    symbol, last_price, stable_walls, wall_events, walls
                 )
+                for event in events:
+                    print(f"{symbol} {event['event']} {event['trade'].get('signal_id')}")
 
-                for wall in nearest_walls:
 
-                    print(
-                        f"{wall['side'].upper()} | "
-                        f"price={wall['price']} | "
-                        f"size="
-                        f"${wall['current_size']:.0f} | "
-                        f"age="
-                        f"{wall['age']:.1f}s | "
-                        f"distance="
-                        f"{wall['distance_bps']:.1f}bps"
-                    )
+async def market_data_worker(
+    symbol: str,
+    engine: TradingEngine,
+    pair_settings: PairSettings,
+) -> None:
+    delay = 1.0
+    while (
+        engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
+        and engine.should_run_market_feed(symbol)
+    ):
+        engine.feed_status[symbol] = "connecting"
+        try:
+            await _run_connection(symbol, engine, pair_settings)
+            delay = 1.0
+            if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
+                engine.feed_status[symbol] = "stopped"
+            elif not engine.pair_settings.get(symbol, pair_settings).enabled:
+                engine.feed_status[symbol] = "stopped"
+        except asyncio.CancelledError:
+            engine.feed_status[symbol] = "stopped"
+            raise
+        except Exception as error:
+            engine.feed_status[symbol] = "reconnecting"
+            print(f"Market feed {symbol} disconnected: {type(error).__name__}: {error}")
+            if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+    engine.feed_status[symbol] = "stopped"
 
-            # =================================================
-            # СОБЫТИЯ СО СТЕНАМИ
-            # =================================================
 
-            if wall_events:
+async def main() -> None:
+    """Standalone market-data entry point retained for local exploration."""
+    from .engine import TradingEngine
+    from .settings import TradingSettings
 
-                print(
-                    "\nWALL EVENTS:"
-                )
-
-                for event in wall_events:
-
-                    print(
-                        f"{event['event']} | "
-                        f"{event['side'].upper()} | "
-                        f"price={event['price']} | "
-                        f"initial="
-                        f"${event['initial_size']:.0f} | "
-                        f"current="
-                        f"${event['current_size']:.0f} | "
-                        f"consumed="
-                        f"${event['consumed_size']:.0f} | "
-                        f"flow="
-                        f"${event['aggressive_volume']:.0f} | "
-                        f"age="
-                        f"{event['age']:.1f}s"
-                    )
+    settings = PairSettings(symbol=DEFAULT_SYMBOL)
+    engine = TradingEngine(
+        {DEFAULT_SYMBOL: settings},
+        TradingSettings(),
+    )
+    engine.start()
+    await market_data_worker(DEFAULT_SYMBOL, engine, settings)
 
 
 if __name__ == "__main__":
