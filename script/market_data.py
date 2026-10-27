@@ -43,7 +43,7 @@ class SnapshotRetryRequired(RuntimeError):
 
 
 def find_first_delta_after_snapshot(snapshot: dict, buffer: list[dict]) -> int | None:
-    """Return the first delta after a matching snapshot, or request a fresh snapshot."""
+    """Find the matching Bybit update; seq is ordered but not consecutive."""
     if buffer and snapshot["seq"] < buffer[0]["seq"]:
         raise SnapshotRetryRequired("REST snapshot is older than the first buffered delta")
     for index, delta in enumerate(buffer):
@@ -61,11 +61,37 @@ def find_first_delta_after_snapshot(snapshot: dict, buffer: list[dict]) -> int |
     return None
 
 
+def buffer_orderbook_delta(buffer: list[dict], delta: dict) -> str:
+    """Keep a contiguous Bybit `u` segment, dropping stale `seq` updates.
+
+    Returns ``appended``, ``ignored`` or ``reset``. Bybit's `seq` is a
+    cross-sequence and may skip values; only `u` must be consecutive.
+    """
+    if buffer and delta["seq"] < buffer[-1]["seq"]:
+        return "ignored"
+    if delta["u"] == 1:
+        buffer.clear()
+        buffer.append(delta)
+        return "reset"
+    if buffer:
+        previous_u = buffer[-1]["u"]
+        if delta["u"] <= previous_u:
+            return "ignored"
+        if delta["u"] != previous_u + 1:
+            buffer.clear()
+            buffer.append(delta)
+            return "reset"
+    buffer.append(delta)
+    return "appended"
+
+
 def apply_orderbook_delta(orderbook: LocalOrderBook, delta: dict) -> None:
-    """Apply the next full-depth update, ignore stale updates, or request resync."""
+    """Apply the next full-depth update, ignoring stale data and rejecting gaps."""
     if delta["u"] == 1:
         raise RuntimeError("Orderbook update ID reset; resynchronization required")
-    if delta["u"] <= orderbook.update_id:
+    if delta["seq"] < orderbook.sequence or delta["u"] < orderbook.update_id:
+        return
+    if delta["u"] == orderbook.update_id:
         return
     if delta["u"] != orderbook.update_id + 1:
         raise RuntimeError("Orderbook update ID gap; resynchronization required")
@@ -90,8 +116,24 @@ async def _fetch_snapshot_while_buffering(
     trade_flow: TradeFlow,
     buffered_deltas: list[dict],
 ) -> tuple[dict, float | None]:
-    snapshot_task = asyncio.create_task(get_orderbook_snapshot(symbol))
     last_price = None
+    # Bybit full-depth has no initial WS snapshot. Start the REST request only
+    # after the first delta is buffered, so a fast REST response cannot race
+    # ahead of the stream and make the first buffered update appear newer.
+    while not buffered_deltas:
+        try:
+            message = await asyncio.wait_for(websocket.recv(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        payload = json.loads(message)
+        _check_subscription(payload)
+        topic = payload.get("topic")
+        if topic == f"orderbook.full.{symbol}":
+            buffer_orderbook_delta(buffered_deltas, payload["data"])
+        elif topic == f"publicTrade.{symbol}":
+            last_price = _update_flow(trade_flow, payload) or last_price
+
+    snapshot_task = asyncio.create_task(get_orderbook_snapshot(symbol))
     try:
         while not snapshot_task.done():
             try:
@@ -102,7 +144,7 @@ async def _fetch_snapshot_while_buffering(
             _check_subscription(payload)
             topic = payload.get("topic")
             if topic == f"orderbook.full.{symbol}":
-                buffered_deltas.append(payload["data"])
+                buffer_orderbook_delta(buffered_deltas, payload["data"])
                 if len(buffered_deltas) > 10000:
                     raise RuntimeError("Too many buffered deltas during snapshot sync")
             elif topic == f"publicTrade.{symbol}":
@@ -141,16 +183,12 @@ async def _run_connection(
             websocket, symbol, trade_flow, buffered_deltas
         )
         last_price = snapshot_last_price or last_price
-        snapshot_refreshes = 0
         while True:
             try:
                 first_index = find_first_delta_after_snapshot(snapshot, buffered_deltas)
             except SnapshotRetryRequired:
-                snapshot_refreshes += 1
-                if snapshot_refreshes > 5:
-                    raise RuntimeError(
-                        "Could not obtain a REST snapshot aligned with the WebSocket stream"
-                    )
+                # The REST response can lag the earliest buffered update. Keep
+                # buffering and request a newer snapshot as prescribed by V5.
                 snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
                     websocket, symbol, trade_flow, buffered_deltas
                 )
@@ -168,9 +206,16 @@ async def _run_connection(
             if topic == f"publicTrade.{symbol}":
                 last_price = _update_flow(trade_flow, payload) or last_price
             elif topic == f"orderbook.full.{symbol}":
-                buffered_deltas.append(payload["data"])
+                buffer_result = buffer_orderbook_delta(
+                    buffered_deltas, payload["data"]
+                )
                 if len(buffered_deltas) > 10000:
                     raise RuntimeError("Too many buffered deltas during snapshot sync")
+                if buffer_result == "reset":
+                    snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
+                        websocket, symbol, trade_flow, buffered_deltas
+                    )
+                    last_price = snapshot_last_price or last_price
 
         orderbook = LocalOrderBook()
         orderbook.load_snapshot(snapshot)

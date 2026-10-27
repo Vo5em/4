@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -17,14 +18,18 @@ from script.formulas import (
 )
 from script.market_data import (
     SnapshotRetryRequired,
+    _fetch_snapshot_while_buffering,
     apply_orderbook_delta,
+    buffer_orderbook_delta,
     find_first_delta_after_snapshot,
+    market_data_worker,
 )
 from script.orderbook import LocalOrderBook
 from script.scanner import find_nearby_levels, find_walls
 from script.settings import PairSettings, TradingSettings
 from script.strategies import StrategyRegistry, TradeSignal
 from script.trade_manager import TradeManager
+from script.trade_flow import TradeFlow
 from script.wall_tracker import WallTracker
 from app.runtime import RuntimeController
 from app.admin import (
@@ -177,10 +182,11 @@ class BybitOrderbookSyncTests(unittest.TestCase):
         snapshot = {"seq": 20, "u": 50}
         buffered = [
             {"seq": 18, "u": 48},
+            {"seq": 19, "u": 49},
             {"seq": 20, "u": 50},
             {"seq": 27, "u": 51},
         ]
-        self.assertEqual(find_first_delta_after_snapshot(snapshot, buffered), 2)
+        self.assertEqual(find_first_delta_after_snapshot(snapshot, buffered), 3)
 
     def test_snapshot_waits_until_stream_reaches_snapshot_sequence(self):
         result = find_first_delta_after_snapshot(
@@ -216,17 +222,118 @@ class BybitOrderbookSyncTests(unittest.TestCase):
 
         self.assertEqual(book.bids, {100.0: 1.0})
 
+
     def test_stale_orderbook_delta_is_ignored_without_resynchronization(self):
         book = LocalOrderBook()
         book.load_snapshot({"u": 50, "seq": 500, "b": [[100, 1]], "a": []})
 
         apply_orderbook_delta(
             book,
-            {"u": 50, "b": [[100, 9]], "a": []},
+            {"u": 50, "seq": 500, "b": [[100, 9]], "a": []},
         )
 
         self.assertEqual(book.update_id, 50)
         self.assertEqual(book.bids, {100.0: 1.0})
+
+    def test_nonconsecutive_cross_sequence_is_valid_when_update_id_is_contiguous(self):
+        buffer = [{"seq": 100, "u": 10}]
+        result = buffer_orderbook_delta(buffer, {"seq": 145, "u": 11})
+        self.assertEqual(result, "appended")
+        self.assertEqual([delta["u"] for delta in buffer], [10, 11])
+
+    def test_update_id_gap_discards_buffer_and_requires_fresh_snapshot(self):
+        buffer = [{"seq": 100, "u": 10}, {"seq": 105, "u": 11}]
+        result = buffer_orderbook_delta(buffer, {"seq": 110, "u": 13})
+        self.assertEqual(result, "reset")
+        self.assertEqual(buffer, [{"seq": 110, "u": 13}])
+
+    def test_decreased_cross_sequence_delta_is_discarded(self):
+        buffer = [{"seq": 110, "u": 10}]
+        result = buffer_orderbook_delta(buffer, {"seq": 109, "u": 11})
+        self.assertEqual(result, "ignored")
+        self.assertEqual(buffer, [{"seq": 110, "u": 10}])
+
+    def test_live_update_id_gap_invalidates_book(self):
+        book = LocalOrderBook()
+        book.load_snapshot({"u": 50, "seq": 500, "b": [[100, 1]], "a": []})
+        with self.assertRaisesRegex(RuntimeError, "gap"):
+            apply_orderbook_delta(book, {"u": 52, "seq": 503, "b": [], "a": []})
+        self.assertEqual(book.bids, {100.0: 1.0})
+
+
+class MarketDataSnapshotHandshakeTests(unittest.TestCase):
+    def test_rest_snapshot_is_requested_after_first_ws_delta_is_buffered(self):
+        class FakeWebSocket:
+            received = 0
+
+            async def recv(self):
+                self.received += 1
+                return json.dumps({
+                    "topic": "orderbook.full.BTCUSDT",
+                    "data": {"seq": 100, "u": 10, "b": [], "a": []},
+                })
+
+        websocket = FakeWebSocket()
+        requested_after = []
+
+        async def snapshot(symbol):
+            requested_after.append(websocket.received)
+            return {"seq": 100, "u": 10, "b": [], "a": []}
+
+        async def immediate_wait_for(coroutine, timeout):
+            return run_immediate(coroutine)
+
+        class CompletedTask:
+            def __init__(self, coroutine):
+                self.result = run_immediate(coroutine)
+
+            def done(self):
+                return True
+
+            def __await__(self):
+                if False:
+                    yield None
+                return self.result
+
+        with patch("script.market_data.get_orderbook_snapshot", side_effect=snapshot), \
+             patch("script.market_data.asyncio.wait_for", side_effect=immediate_wait_for), \
+             patch("script.market_data.asyncio.create_task", side_effect=CompletedTask):
+            result, last_price = run_immediate(
+                _fetch_snapshot_while_buffering(
+                    websocket, "BTCUSDT", TradeFlow(window_seconds=10), []
+                )
+            )
+
+        self.assertEqual(requested_after, [1])
+        self.assertEqual((result["seq"], result["u"]), (100, 10))
+        self.assertIsNone(last_price)
+
+
+class MarketDataReconnectTests(unittest.TestCase):
+    def test_reconnection_reuses_worker_and_clears_error_after_sync(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        engine.start()
+        attempts = []
+
+        async def connection(symbol, current_engine, pair_settings):
+            attempts.append(symbol)
+            if len(attempts) == 1:
+                raise ConnectionError("temporary disconnect")
+            current_engine.set_feed_status(symbol, "connected")
+            current_engine.mode = EngineMode.STOPPED
+
+        async def no_sleep(_delay):
+            return None
+
+        with patch("script.market_data._run_connection", side_effect=connection), \
+             patch("script.market_data.asyncio.sleep", side_effect=no_sleep):
+            run_immediate(
+                market_data_worker("BTCUSDT", engine, engine.pair_settings["BTCUSDT"])
+            )
+
+        self.assertEqual(attempts, ["BTCUSDT", "BTCUSDT"])
+        self.assertEqual(engine.feed_status["BTCUSDT"], "stopped")
+        self.assertIsNone(engine.feed_errors["BTCUSDT"])
 
 
 class StrategyPipelineTests(unittest.TestCase):
