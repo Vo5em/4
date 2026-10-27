@@ -1,6 +1,6 @@
 # Environment variables and secrets
 .env
-!.env
+.env.*
 
 # Python cache and compiled files
 __pycache__/
