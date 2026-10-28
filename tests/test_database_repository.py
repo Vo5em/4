@@ -13,6 +13,7 @@ from database.models import (
     MarketPrice,
     PairStrategyConfig,
     RuntimeState,
+    StrategyChangeEvent,
     TradingPairSetting,
     VirtualTrade,
 )
@@ -362,6 +363,36 @@ class DatabaseRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(session.rows[VirtualTrade][0].close_reason, "STRATEGY_DISABLED")
         self.assertEqual(runtime_state.balance_usdt, 100)
+        self.assertEqual(session.commits, 1)
+
+    def test_strategy_change_history_commits_admin_and_cancellation_reason(self):
+        strategy_row = PairStrategyConfig(
+            symbol="BTCUSDT", enabled_strategy_ids=["stable_wall_v1"]
+        )
+        runtime_state = RuntimeState(
+            id=1, balance_usdt=100, initial_balance_usdt=100,
+            stake_usdt=10, max_open_trades=3, engine_mode="running", initialized=True,
+        )
+        session = FakeSession({PairStrategyConfig: [strategy_row], RuntimeState: [runtime_state]})
+        trade = {
+            "signal_id": "legacy-pending", "strategy_id": "stable_wall_v1",
+            "symbol": "BTCUSDT", "side": "long", "wall_side": "buy",
+            "status": "cancelled", "wall_price": 100, "wall_size": 1000,
+            "wall_ratio": 900, "stake_usdt": 10, "entry_price": 100.015,
+            "stop_loss": 99.98, "take_profit": 100.05, "profit_usdt": 0,
+            "close_reason": "STRATEGY_DISABLED",
+        }
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_enabled_strategies_with_trades(
+                "BTCUSDT", {"bounce"}, [trade], 100, "running", admin_user_id=7319
+            ))
+        event = session.rows[StrategyChangeEvent][0]
+        self.assertEqual(event.previous_strategy, "stable_wall_v1")
+        self.assertEqual(event.new_strategy, "bounce")
+        self.assertEqual(event.admin_user_id, 7319)
+        self.assertEqual(event.cancelled_plans, 1)
+        self.assertEqual(event.cancellation_reasons, {"STRATEGY_DISABLED": 1})
+        self.assertEqual(strategy_row.enabled_strategy_ids, ["bounce"])
         self.assertEqual(session.commits, 1)
 
     def test_save_trade_updates_trade_row_and_runtime_balance(self):

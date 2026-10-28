@@ -22,11 +22,15 @@ class PairSettings:
     min_wall_ratio: float = 888.0
     min_wall_notional_usdt: float = 0.0
     max_wall_distance_bps: float = 100.0
-    min_wall_age_seconds: float = 20.0
+    min_wall_age_seconds: float = 40.0
     consumed_ratio: float = 0.9
     entry_distance_bps: float = 1.5
     stop_distance_bps: float = 2.0
     max_open_trades: int = 1
+    bounce_reversal_bps: float = 1.0
+    breakout_confirm_seconds: float = 5.0
+    breakout_buffer_bps: float = 0.5
+    breakout_max_update_gap_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_pair_symbol(self.symbol))
@@ -38,6 +42,14 @@ class PairSettings:
             raise ValueError("max_wall_distance_bps must not be negative")
         if not isfinite(self.min_wall_age_seconds) or self.min_wall_age_seconds < 0:
             raise ValueError("min_wall_age_seconds must not be negative")
+        if not isfinite(self.bounce_reversal_bps) or self.bounce_reversal_bps <= 0:
+            raise ValueError("bounce_reversal_bps must be positive")
+        if not isfinite(self.breakout_confirm_seconds) or self.breakout_confirm_seconds <= 0:
+            raise ValueError("breakout_confirm_seconds must be positive")
+        if not isfinite(self.breakout_buffer_bps) or self.breakout_buffer_bps < 0:
+            raise ValueError("breakout_buffer_bps must not be negative")
+        if not isfinite(self.breakout_max_update_gap_seconds) or self.breakout_max_update_gap_seconds <= 0:
+            raise ValueError("breakout_max_update_gap_seconds must be positive")
         if not isfinite(self.consumed_ratio) or not 0 < self.consumed_ratio <= 1:
             raise ValueError("consumed_ratio must be greater than 0 and at most 1")
         if (

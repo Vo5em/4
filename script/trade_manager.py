@@ -50,8 +50,14 @@ class TradeManager:
             "wall_id": signal.wall_id,
             "wall_size": signal.wall_size,
             "wall_ratio": signal.wall_ratio,
+            "side": signal.side,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "entry_mode": signal.entry_mode,
+            "signal_id": f"{signal.strategy_id}:{signal.wall_id}",
         }
-        signal_id = data["wall_id"]
+        signal_id = data.get("signal_id") or data["wall_id"]
         symbol = str(data["symbol"]).upper()
         wall_price = float(data["wall_price"])
         wall_size = float(data["wall_size"])
@@ -109,14 +115,34 @@ class TradeManager:
         wall_side = data["wall_side"]
         if wall_side not in {"buy", "sell"}:
             raise ValueError(f"Unsupported wall side: {wall_side}")
-        trade_side = "long" if wall_side == "buy" else "short"
-        entry_price = calculate_entry_price(
-            wall_price, wall_side, pair_settings.entry_distance_bps
-        )
-        stop_loss = calculate_stop_loss_price(
-            wall_price, wall_side, pair_settings.stop_distance_bps
-        )
-        take_profit = calculate_x2_price(entry_price, stop_loss, wall_side)
+        trade_side = data.get("side") or ("long" if wall_side == "buy" else "short")
+        entry_price = data.get("entry_price")
+        if entry_price is None:
+            entry_price = calculate_entry_price(
+                wall_price, wall_side, pair_settings.entry_distance_bps
+            )
+        stop_loss = data.get("stop_loss")
+        if stop_loss is None:
+            stop_loss = calculate_stop_loss_price(
+                wall_price, wall_side, pair_settings.stop_distance_bps
+            )
+        take_profit = data.get("take_profit")
+        if take_profit is None:
+            take_profit = calculate_x2_price(entry_price, stop_loss, wall_side)
+        entry_price = float(entry_price)
+        stop_loss = float(stop_loss)
+        take_profit = float(take_profit)
+        if trade_side not in {"long", "short"} or not all(
+            isfinite(float(value)) and float(value) > 0
+            for value in (entry_price, stop_loss, take_profit)
+        ):
+            raise ValueError("trade levels must be positive finite numbers")
+        if (trade_side == "long" and not stop_loss < entry_price < take_profit) or (
+            trade_side == "short" and not take_profit < entry_price < stop_loss
+        ):
+            raise ValueError("trade levels are on the wrong side of entry")
+        created_at = datetime.now(timezone.utc)
+        immediate = data.get("entry_mode") == "market"
         trade = {
             "signal_id": signal_id,
             "strategy_id": data["strategy_id"],
@@ -130,9 +156,9 @@ class TradeManager:
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "status": "pending",
-            "created_at": datetime.now(timezone.utc),
-            "opened_at": None,
+            "status": "open" if immediate else "pending",
+            "created_at": created_at,
+            "opened_at": created_at if immediate else None,
             "closed_at": None,
             "exit_price": None,
             "close_reason": None,

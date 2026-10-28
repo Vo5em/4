@@ -3,6 +3,7 @@ from sqlalchemy import MetaData, Table, inspect, select
 from database.models import (
     MarketPrice,
     PairStrategyConfig,
+    StrategyChangeEvent,
     RuntimeState,
     TradingPairSetting,
     VirtualTrade,
@@ -47,6 +48,21 @@ async def initialize_database(
         state = await session.get(RuntimeState, 1)
         pair_rows = (await session.scalars(select(TradingPairSetting))).all()
         strategy_rows = (await session.scalars(select(PairStrategyConfig))).all()
+        configured_symbols = {row.symbol for row in strategy_rows}
+        missing_strategy_rows = [
+            PairStrategyConfig(
+                symbol=row.symbol,
+                enabled_strategy_ids=[DEFAULT_STRATEGY_ID],
+                version=1,
+            )
+            for row in pair_rows
+            if row.symbol not in configured_symbols
+        ]
+        if missing_strategy_rows:
+            for strategy_row in missing_strategy_rows:
+                session.add(strategy_row)
+            await session.commit()
+            strategy_rows = (await session.scalars(select(PairStrategyConfig))).all()
         trade_rows = (await session.scalars(select(VirtualTrade))).all()
         market_price_rows = (await session.scalars(select(MarketPrice))).all()
         configured_strategies = {
@@ -80,10 +96,20 @@ async def initialize_database(
                     entry_distance_bps=row.entry_distance_bps,
                     stop_distance_bps=row.stop_distance_bps,
                     max_open_trades=row.max_open_trades,
+                    bounce_reversal_bps=getattr(row, "bounce_reversal_bps", 1.0) or 1.0,
+                    breakout_confirm_seconds=getattr(row, "breakout_confirm_seconds", 5.0) or 5.0,
+                    breakout_buffer_bps=getattr(row, "breakout_buffer_bps", 0.5) or 0.5,
+                    breakout_max_update_gap_seconds=getattr(
+                        row, "breakout_max_update_gap_seconds", 2.0
+                    ) or 2.0,
                 )
                 for row in pair_rows
             },
             "enabled_strategies": enabled_strategies,
+            "strategy_versions": {
+                row.symbol: int(getattr(row, "version", 1) or 1)
+                for row in strategy_rows
+            },
             "trades": [_trade_dict(row) for row in trade_rows],
             "last_prices": {
                 row.symbol: row.last_price for row in market_price_rows
@@ -144,6 +170,10 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
         entry_distance_bps=settings.entry_distance_bps,
         stop_distance_bps=settings.stop_distance_bps,
         max_open_trades=settings.max_open_trades,
+        bounce_reversal_bps=settings.bounce_reversal_bps,
+        breakout_confirm_seconds=settings.breakout_confirm_seconds,
+        breakout_buffer_bps=settings.breakout_buffer_bps,
+        breakout_max_update_gap_seconds=settings.breakout_max_update_gap_seconds,
     )
 
 
@@ -243,6 +273,8 @@ async def save_pair_settings(settings: PairSettings) -> None:
             for key in (
                 "enabled", "min_wall_ratio", "min_wall_notional_usdt", "max_wall_distance_bps", "min_wall_age_seconds",
                 "consumed_ratio", "entry_distance_bps", "stop_distance_bps", "max_open_trades",
+                "bounce_reversal_bps", "breakout_confirm_seconds", "breakout_buffer_bps",
+                "breakout_max_update_gap_seconds",
             ):
                 setattr(row, key, getattr(values, key))
         await session.commit()
@@ -271,21 +303,50 @@ async def save_enabled_strategies_with_trades(
     trades: list[dict],
     balance_usdt: float,
     engine_mode: str,
+    admin_user_id: int | None = None,
+    expected_version: int | None = None,
 ) -> None:
     """Commit a pair's strategy selection and related trade changes together."""
     symbol = normalize_pair_symbol(symbol)
     async with async_session() as session:
         row = await session.get(PairStrategyConfig, symbol)
         selected = sorted(strategy_ids)
+        previous = sorted(row.enabled_strategy_ids) if row is not None else []
+        current_version = int(getattr(row, "version", 1) or 1) if row is not None else 0
+        if expected_version is not None and current_version != expected_version and previous != selected:
+            raise RuntimeError("Strategy configuration changed; refresh the strategy panel")
         if row is None:
             session.add(
                 PairStrategyConfig(
                     symbol=symbol,
                     enabled_strategy_ids=selected,
+                    version=1,
                 )
             )
         else:
             row.enabled_strategy_ids = selected
+            if previous != selected:
+                row.version = current_version + 1
+
+        if previous != selected:
+            reasons = {}
+            for trade in trades:
+                if (
+                    trade.get("status") == "cancelled"
+                    and trade.get("symbol", "").upper() == symbol
+                    and trade.get("strategy_id") in set(previous).difference(selected)
+                ):
+                    reason = trade.get("close_reason") or "UNKNOWN"
+                    reasons[reason] = reasons.get(reason, 0) + 1
+            session.add(StrategyChangeEvent(
+                symbol=symbol,
+                previous_strategy=",".join(previous) or None,
+                new_strategy=",".join(selected) or None,
+                admin_user_id=admin_user_id,
+                result="applied",
+                cancelled_plans=sum(reasons.values()),
+                cancellation_reasons=reasons,
+            ))
 
         for trade in trades:
             row = await session.scalar(
@@ -350,7 +411,9 @@ async def save_pair_settings_with_trades(
             for key in (
                 "enabled", "min_wall_ratio", "min_wall_notional_usdt", "max_wall_distance_bps",
                 "min_wall_age_seconds", "consumed_ratio", "entry_distance_bps",
-                "stop_distance_bps", "max_open_trades",
+                "stop_distance_bps", "max_open_trades", "bounce_reversal_bps",
+                "breakout_confirm_seconds", "breakout_buffer_bps",
+                "breakout_max_update_gap_seconds",
             ):
                 setattr(pair_row, key, getattr(values, key))
 

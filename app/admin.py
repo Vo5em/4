@@ -2,13 +2,14 @@ import os
 from datetime import timezone
 from html import escape
 from dataclasses import replace
+import logging
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import app.keyboard as kb
 from app.runtime import RuntimeController
@@ -16,6 +17,7 @@ from script.engine import EngineMode
 from script.settings import PairSettings
 
 admin = Router()
+logger = logging.getLogger(__name__)
 
 
 def _load_admin_user_ids() -> set[int]:
@@ -176,7 +178,11 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
         f"Условие входа: подтверждённая устойчивая стена, затем касание цены "
         f"на расстоянии {settings.entry_distance_bps:g} б.п. от стены\n"
         f"Стоп за стеной: {settings.stop_distance_bps:g} б.п.\n"
-        f"Время устойчивости: {settings.min_wall_age_seconds:g} с\n"
+        f"Время устойчивости: {max(40.0, settings.min_wall_age_seconds):g} с\n"
+        f"Подтверждение отскока: {settings.bounce_reversal_bps:g} б.п.; пробоя: "
+        f"удержание {settings.breakout_confirm_seconds:g} с за уровнем на "
+        f"{settings.breakout_buffer_bps:g} б.п.; разрыв обновлений до "
+        f"{settings.breakout_max_update_gap_seconds:g} с\n"
         f"Порог потребления: {settings.consumed_ratio:.0%}\n"
         f"Лимит сделок пары: {settings.max_open_trades}\n"
         f"Потенциальные стены: {potential if potential is not None else 'нет данных'}; "
@@ -287,7 +293,7 @@ def pair_settings_text(runtime: RuntimeController) -> str:
             f"дистанция поиска {settings.max_wall_distance_bps:g} б.п.; "
             f"вход {settings.entry_distance_bps:g} б.п.; "
             f"стоп за стеной {settings.stop_distance_bps:g} б.п.; "
-            f"устойчивость {settings.min_wall_age_seconds:g} с; "
+            f"устойчивость {max(40.0, settings.min_wall_age_seconds):g} с; "
             f"порог потребления {settings.consumed_ratio:.0%}; "
             f"лимит сделок {settings.max_open_trades}; "
             f"стратегии {escape(strategies)}"
@@ -405,7 +411,9 @@ async def request_pair_settings(callback: CallbackQuery, state: FSMContext) -> N
             "Отправьте: <code>ПАРА параметр значение</code>.\n"
             "Параметры: <code>enabled, min_wall_ratio, min_wall_notional_usdt, max_wall_distance_bps, "
             "min_wall_age_seconds, consumed_ratio, entry_distance_bps, "
-            "stop_distance_bps, max_open_trades</code>.\n"
+            "stop_distance_bps, max_open_trades, bounce_reversal_bps, "
+            "breakout_confirm_seconds, breakout_buffer_bps, "
+            "breakout_max_update_gap_seconds</code>.\n"
             "Пример: <code>BTCUSDT entry_distance_bps 1.5</code>",
             reply_markup=kb.cancel_input,
         )
@@ -429,18 +437,96 @@ async def request_add_pair(callback: CallbackQuery, state: FSMContext) -> None:
 async def request_strategy_settings(
     callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
 ) -> None:
-    await state.set_state(SettingsInput.waiting_for_strategy)
-    strategy_ids = sorted(runtime.engine.strategy_registry.strategy_ids)
-    available = ", ".join(escape(item) for item in strategy_ids) or "нет"
+    await state.clear()
+    rows = []
+    statuses = []
+    for symbol in runtime.engine.pair_settings:
+        selected = runtime.engine.get_enabled_strategy_ids(symbol)
+        mode = _strategy_label(selected)
+        feed = _feed_label(runtime.engine.feed_status.get(symbol, "нет данных"))
+        statuses.append(f"{symbol}: {mode} · данные: {feed}")
+        version = runtime.engine.strategy_versions.get(symbol, 0)
+        rows.append([InlineKeyboardButton(
+            text=f"{symbol} · {mode}", callback_data=f"stratpair:{symbol}:{version}"
+        )])
+    rows.append([InlineKeyboardButton(text="На главную", callback_data="dashboard")])
     if callback.message is not None:
-        await callback.message.answer(
-            "Отправьте <code>ПАРА strategy_id on|off</code>.\n"
-            f"Доступные стратегии: {available}\n"
-            "Пример: <code>BTCUSDT stable_wall_v1 off</code>. При отключении "
-            "ожидающие входы этой стратегии отменяются, открытые сделки остаются под контролем.",
-            reply_markup=kb.cancel_input,
+        await edit_message_if_changed(
+            callback.message,
+            "<b>Стратегии по парам</b>\n\n" + ("\n".join(statuses) or "Пары не настроены."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
     await callback.answer()
+
+
+def _strategy_label(strategy_ids: set[str]) -> str:
+    if not strategy_ids:
+        return "Отключено"
+    names = {"bounce": "Отскок", "breakout": "Пробой", "stable_wall_v1": "Устаревший режим"}
+    return ", ".join(names.get(item, item) for item in sorted(strategy_ids))
+
+
+@admin.callback_query(Admin(), F.data.startswith("stratpair:"))
+async def choose_strategy_pair(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    _, raw_symbol, _ = (callback.data or "").split(":", 2)
+    symbol = raw_symbol.upper()
+    if symbol not in runtime.engine.pair_settings:
+        await callback.answer("Пара больше не настроена", show_alert=True)
+        return
+    current = runtime.engine.get_enabled_strategy_ids(symbol)
+    buttons = [
+        [InlineKeyboardButton(text=("✓ " if current == {strategy_id} else "") + label,
+                              callback_data=f"stratset:{symbol}:{strategy_id}:{runtime.engine.strategy_versions.get(symbol, 0)}")]
+        for strategy_id, label in (("bounce", "Отскок от стены"), ("breakout", "Пробой стены"), ("off", "Отключено"))
+    ]
+    buttons.append([InlineKeyboardButton(text="К списку пар", callback_data="settings_strategy")])
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"<b>{escape(symbol)}</b> · выбран режим: {_strategy_label(current)}\nВыберите режим:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("stratset:"))
+async def set_pair_strategy(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    _, raw_symbol, strategy_id, raw_version = (callback.data or "").split(":", 3)
+    symbol = raw_symbol.upper()
+    try:
+        expected_version = int(raw_version)
+    except ValueError:
+        await callback.answer("Некорректная версия настройки", show_alert=True)
+        return
+    if symbol not in runtime.engine.pair_settings or strategy_id not in {"bounce", "breakout", "off"}:
+        await callback.answer("Некорректная пара или стратегия", show_alert=True)
+        return
+    selected = set() if strategy_id == "off" else {strategy_id}
+    try:
+        await runtime.update_enabled_strategies(
+            symbol, selected, callback.from_user.id, expected_version
+        )
+    except Exception:
+        logger.exception("Could not switch strategy mode for %s", symbol)
+        await callback.answer(
+            "Настройка изменилась или не сохранилась. Обновите список пар.",
+            show_alert=True,
+        )
+        return
+    rows = [
+        [InlineKeyboardButton(text=("✓ " if selected == {key} else "") + label,
+                              callback_data=f"stratset:{symbol}:{key}:{runtime.engine.strategy_versions.get(symbol, 0)}")]
+        for key, label in (("bounce", "Отскок от стены"), ("breakout", "Пробой стены"), ("off", "Отключено"))
+    ]
+    rows.append([InlineKeyboardButton(text="К списку пар", callback_data="settings_strategy")])
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"<b>{escape(symbol)}</b> · режим сохранён: {_strategy_label(selected)}\n"
+            "Ожидающие входы прежней стратегии отменены; открытые виртуальные сделки продолжают сопровождаться.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer("Режим сохранён")
 
 
 @admin.message(Admin(), StateFilter(SettingsInput.waiting_for_strategy))
@@ -458,13 +544,9 @@ async def update_pair_strategy(
     if strategy_id not in runtime.engine.strategy_registry.strategy_ids:
         await message.answer("Неизвестный strategy_id. Проверьте список в подсказке.")
         return
-    selected = runtime.engine.get_enabled_strategy_ids(symbol)
-    if action == "on":
-        selected.add(strategy_id)
-    else:
-        selected.discard(strategy_id)
+    selected = {strategy_id} if action == "on" else set()
     try:
-        await runtime.update_enabled_strategies(symbol, selected)
+        await runtime.update_enabled_strategies(symbol, selected, message.from_user.id if message.from_user else None)
     except KeyError:
         await message.answer("Неизвестный strategy_id. Проверьте список в подсказке.")
         return
@@ -522,7 +604,8 @@ async def update_pair_settings(
 
     numeric_fields = {
         "min_wall_ratio", "min_wall_notional_usdt", "max_wall_distance_bps", "min_wall_age_seconds",
-        "consumed_ratio", "entry_distance_bps", "stop_distance_bps",
+        "consumed_ratio", "entry_distance_bps", "stop_distance_bps", "bounce_reversal_bps",
+        "breakout_confirm_seconds", "breakout_buffer_bps", "breakout_max_update_gap_seconds",
     }
     if parameter == "enabled":
         if raw_value.lower() not in {"true", "false", "1", "0", "on", "off"}:
@@ -540,6 +623,9 @@ async def update_pair_settings(
             value = float(raw_value)
         except ValueError:
             await message.answer("Для этого параметра нужно числовое значение.")
+            return
+        if parameter == "min_wall_age_seconds" and value < 40:
+            await message.answer("Минимальная устойчивость стены для стратегий — 40 секунд.")
             return
     else:
         await message.answer("Неизвестный параметр. Используйте список из подсказки.")

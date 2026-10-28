@@ -204,7 +204,8 @@ class RuntimeController:
             await self._sync_workers()
 
     async def update_enabled_strategies(
-        self, symbol: str, strategy_ids: set[str]
+        self, symbol: str, strategy_ids: set[str], admin_user_id: int | None = None,
+        expected_version: int | None = None,
     ) -> set[str]:
         symbol = normalize_pair_symbol(symbol)
         selected = set(strategy_ids)
@@ -212,7 +213,14 @@ class RuntimeController:
             if symbol not in self.engine.pair_settings:
                 raise ValueError(f"Pair {symbol} is not configured")
             self.engine.strategy_registry.get_enabled(selected)
+            if len(selected) > 1:
+                raise ValueError("Select only one trading strategy per pair")
             previous = self.engine.get_enabled_strategy_ids(symbol)
+            current_version = self.engine.strategy_versions.get(symbol, 0)
+            if previous == selected:
+                return set(previous)
+            if expected_version is not None and expected_version != current_version:
+                raise RuntimeError("Стратегия уже изменилась. Обновите список пар.")
             previous_trades = [
                 dict(trade) for trade in self.engine.trade_manager.trades
             ]
@@ -229,7 +237,8 @@ class RuntimeController:
                     )
                 )
             if not await self.engine.persist_enabled_strategies(
-                symbol, selected, events
+                symbol, selected, events, admin_user_id=admin_user_id,
+                expected_version=expected_version,
             ):
                 if events:
                     self.engine.restore_trade_state(
@@ -239,6 +248,9 @@ class RuntimeController:
                     )
                 raise RuntimeError("Could not persist strategy settings and trade state")
             self.engine.enabled_strategies[symbol] = selected
+            if previous != selected:
+                self.engine.strategy_versions[symbol] = current_version + 1
+            self.engine.reset_strategy_state(symbol)
             await self._sync_workers()
             return set(selected)
 

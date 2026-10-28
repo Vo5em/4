@@ -373,7 +373,7 @@ async def _run_connection(
     topics = [f"orderbook.full.{symbol}", f"publicTrade.{symbol}"]
     trade_flow = TradeFlow(window_seconds=10)
     wall_tracker = WallTracker(
-        min_age_seconds=pair_settings.min_wall_age_seconds,
+        min_age_seconds=max(40.0, pair_settings.min_wall_age_seconds),
         consumed_ratio=pair_settings.consumed_ratio,
     )
     last_price = None
@@ -478,6 +478,7 @@ async def _run_connection(
             sync_counters["accepted"], sync_counters["discarded"],
             sync_counters["resets"], len(orderbook.bids), len(orderbook.asks),
         )
+        engine.reset_strategy_state(symbol)
 
         flow = trade_flow.get_flow()
         engine.set_feed_status(symbol, "connected")
@@ -508,7 +509,8 @@ async def _run_connection(
                         )
                         pending_reconciled = True
                     events = await engine.process_market_update(
-                        symbol, last_price, stable_walls, wall_events, candidates
+                        symbol, last_price, stable_walls, wall_events, candidates,
+                        price_updated=True,
                     )
                     for event in events:
                         print(f"{symbol} {event['event']} {event['trade'].get('signal_id')}")
@@ -518,7 +520,7 @@ async def _run_connection(
                 continue
 
             pair_settings = engine.pair_settings.get(symbol, pair_settings)
-            wall_tracker.min_age_seconds = pair_settings.min_wall_age_seconds
+            wall_tracker.min_age_seconds = max(40.0, pair_settings.min_wall_age_seconds)
             wall_tracker.consumed_ratio = pair_settings.consumed_ratio
             delta = payload["data"]
             try:
@@ -544,7 +546,8 @@ async def _run_connection(
             if last_price is not None:
                 pending_reconciled = True
                 events = await engine.process_market_update(
-                    symbol, last_price, stable_walls, wall_events, walls
+                    symbol, last_price, stable_walls, wall_events, walls,
+                    price_updated=False,
                 )
                 for event in events:
                     print(f"{symbol} {event['event']} {event['trade'].get('signal_id')}")

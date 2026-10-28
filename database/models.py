@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, Numeric, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, Numeric, String, text
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -40,11 +40,15 @@ class TradingPairSetting(Base):
     min_wall_ratio: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=888.0)
     min_wall_notional_usdt: Mapped[float] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=False, default=0)
     max_wall_distance_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=100.0)
-    min_wall_age_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=20.0)
+    min_wall_age_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=40.0)
     consumed_ratio: Mapped[float] = mapped_column(Numeric(8, 6, asdecimal=False), nullable=False, default=0.9)
     entry_distance_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=1.5)
     stop_distance_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=2.0)
     max_open_trades: Mapped[int] = mapped_column(nullable=False, default=1)
+    bounce_reversal_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=1.0)
+    breakout_confirm_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=5.0)
+    breakout_buffer_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=0.5)
+    breakout_max_update_gap_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=2.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -53,7 +57,22 @@ class PairStrategyConfig(Base):
 
     symbol: Mapped[str] = mapped_column(String(30), primary_key=True)
     enabled_strategy_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    version: Mapped[int] = mapped_column(nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class StrategyChangeEvent(Base):
+    __tablename__ = "strategy_change_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    previous_strategy: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    new_strategy: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    admin_user_id: Mapped[int | None] = mapped_column(nullable=True)
+    result: Mapped[str] = mapped_column(String(24), nullable=False, default="applied")
+    cancelled_plans: Mapped[int] = mapped_column(nullable=False, default=0)
+    cancellation_reasons: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
 
 
 class MarketPrice(Base):
@@ -98,14 +117,33 @@ class VirtualTrade(Base):
 async def async_main() -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # `create_all` does not add columns to an existing installation.
+        # Keep this small additive migration idempotent for deployed databases.
+        await connection.execute(text(
+            "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS "
+            "bounce_reversal_bps NUMERIC(18, 8) NOT NULL DEFAULT 1.0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS "
+            "breakout_confirm_seconds NUMERIC(18, 8) NOT NULL DEFAULT 5.0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS "
+            "breakout_buffer_bps NUMERIC(18, 8) NOT NULL DEFAULT 0.5"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS "
+            "breakout_max_update_gap_seconds NUMERIC(18, 8) NOT NULL DEFAULT 2.0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE pair_strategy_configs ADD COLUMN IF NOT EXISTS "
+            "version INTEGER NOT NULL DEFAULT 1"
+        ))
+        await connection.execute(text(
+            "UPDATE trading_pairs SET min_wall_age_seconds = 40 "
+            "WHERE min_wall_age_seconds < 40"
+        ))
 
 
 async def async_close() -> None:
     await engine.dispose()
-
-
-# Compatibility names retained while application code migrates to explicit models.
-Bot_setting = RuntimeState
-Order = VirtualTrade
-Completad_trades = VirtualTrade
-Simbols = TradingPairSetting

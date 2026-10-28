@@ -30,6 +30,7 @@ class TradingEngine:
         trading_settings: TradingSettings | None = None,
         strategy_registry: StrategyRegistry | None = None,
         enabled_strategies: dict[str, set[str]] | None = None,
+        strategy_versions: dict[str, int] | None = None,
         trade_manager: ExecutionBackend | None = None,
         repository=None,
         last_market_update_at: dict[str, datetime] | None = None,
@@ -44,6 +45,10 @@ class TradingEngine:
         self.enabled_strategies = {
             symbol.upper(): strategy_ids
             for symbol, strategy_ids in (enabled_strategies or {}).items()
+        }
+        self.strategy_versions = {
+            symbol.upper(): int(version)
+            for symbol, version in (strategy_versions or {}).items()
         }
         unknown_pair_settings = set(self.enabled_strategies).difference(
             self.pair_settings
@@ -97,6 +102,12 @@ class TradingEngine:
             raise RuntimeError("Workers can only be registered while the engine is active")
         self._workers.add(task)
         task.add_done_callback(self._workers.discard)
+
+    def reset_strategy_state(self, symbol: str) -> None:
+        for strategy in self.strategy_registry.get_enabled():
+            reset = getattr(strategy, "reset_symbol", None)
+            if reset is not None:
+                reset(symbol)
 
     @staticmethod
     def _utc_now() -> datetime:
@@ -316,7 +327,9 @@ class TradingEngine:
             return True
 
     async def persist_enabled_strategies(
-        self, symbol: str, strategy_ids: set[str], events: list[dict]
+        self, symbol: str, strategy_ids: set[str], events: list[dict],
+        admin_user_id: int | None = None,
+        expected_version: int | None = None,
     ) -> bool:
         """Atomically save strategy selection and any cancelled entries."""
         async with self._persistence_lock:
@@ -330,13 +343,18 @@ class TradingEngine:
             snapshot_refs = dict(self._pending_persistence)
             snapshot = [dict(trade) for trade in snapshot_refs.values()]
             try:
-                await self.repository.save_enabled_strategies_with_trades(
-                    symbol,
-                    strategy_ids,
-                    snapshot,
-                    self.trade_manager.balance_usdt,
-                    self.mode.value,
+                save = self.repository.save_enabled_strategies_with_trades
+                args = (
+                    symbol, strategy_ids, snapshot,
+                    self.trade_manager.balance_usdt, self.mode.value,
                 )
+                if admin_user_id is None and expected_version is None:
+                    await save(*args)
+                else:
+                    await save(
+                        *args, admin_user_id=admin_user_id,
+                        expected_version=expected_version,
+                    )
             except Exception as error:
                 self.record_database_error(error)
                 print(f"Database strategy update failed: {type(error).__name__}")
@@ -375,12 +393,15 @@ class TradingEngine:
         stable_walls: list[dict] | tuple[dict, ...],
         wall_events: list[dict] | tuple[dict, ...] = (),
         wall_candidates: list[dict] | tuple[dict, ...] | None = None,
+        *,
+        price_updated: bool = True,
     ) -> list[dict]:
         """Serialize a market-state transition and its persistence as one unit."""
         async with self.state_lock:
             symbol = symbol.upper()
             events = self.on_market_update(
-                symbol, last_price, stable_walls, wall_events, wall_candidates
+                symbol, last_price, stable_walls, wall_events, wall_candidates,
+                price_updated=price_updated,
             )
             now = self._utc_now()
             self.last_market_update_at[symbol] = now
@@ -397,6 +418,8 @@ class TradingEngine:
         stable_walls: list[dict] | tuple[dict, ...],
         wall_events: list[dict] | tuple[dict, ...] = (),
         wall_candidates: list[dict] | tuple[dict, ...] | None = None,
+        *,
+        price_updated: bool = True,
     ) -> list[dict]:
         symbol = symbol.upper()
         if self.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
@@ -443,6 +466,8 @@ class TradingEngine:
             return events
         if self.repository is not None and self._pending_persistence:
             return events
+        if not price_updated:
+            return events
 
         context = StrategyContext(
             symbol=symbol,
@@ -450,6 +475,8 @@ class TradingEngine:
             stable_walls=tuple(stable_walls),
             wall_events=tuple(wall_events),
             settings=settings,
+            now=monotonic(),
+            price_updated=price_updated,
         )
         strategy_ids = self.enabled_strategies.get(
             symbol, self._default_enabled_strategies
