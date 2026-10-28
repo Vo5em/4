@@ -79,6 +79,7 @@ class FakeRepository:
         self.saved_prices = []
         self.saved_pair_settings = []
         self.saved_enabled_strategies = []
+        self.saved_admin_user_ids = []
         self.fail_strategy_saves = False
 
     async def save_trades(self, trades, balance_usdt, engine_mode=None):
@@ -106,6 +107,8 @@ class FakeRepository:
         if self.fail_strategy_saves or (trades and self.fail_trade_saves):
             raise OSError("temporary strategy transaction failure")
         self.saved_enabled_strategies.append((symbol, set(strategy_ids)))
+        if admin_user_id is not None:
+            self.saved_admin_user_ids.append(admin_user_id)
         if trades:
             self.saved_trade_batches.append((trades, balance_usdt, engine_mode))
 
@@ -1207,9 +1210,9 @@ class StrategyCallbackTests(unittest.TestCase):
             self.answer = AsyncMock()
 
     class FakeCallback:
-        def __init__(self, data, edit_error=None):
+        def __init__(self, data, edit_error=None, user_id=7319):
             self.data = data
-            self.from_user = User(id=7319, is_bot=False, first_name="Admin")
+            self.from_user = User(id=user_id, is_bot=False, first_name="Admin")
             self.message = StrategyCallbackTests.FakeMessage(edit_error)
             self.answer = AsyncMock()
 
@@ -1233,6 +1236,25 @@ class StrategyCallbackTests(unittest.TestCase):
             "BTCUSDT", set(), expected_version=version - 1
         ))
         self.assertEqual(engine.strategy_versions["BTCUSDT"], version)
+
+    def test_large_admin_id_switch_is_persisted_and_confirmed_in_telegram(self):
+        admin_user_id = 8445920246
+        repository = FakeRepository()
+        engine = TradingEngine(
+            {"BTCUSDT": PairSettings("BTCUSDT")},
+            enabled_strategies={"BTCUSDT": {"bounce"}},
+            repository=repository,
+        )
+        callback = self.FakeCallback(
+            "stratset:BTCUSDT:breakout:0", user_id=admin_user_id
+        )
+
+        run_immediate(set_pair_strategy(callback, RuntimeController(engine)))
+
+        self.assertEqual(engine.get_enabled_strategy_ids("BTCUSDT"), {"breakout"})
+        self.assertEqual(repository.saved_admin_user_ids, [admin_user_id])
+        self.assertIn("сохранён", callback.message.edit_text.await_args.args[0])
+        self.assertEqual(callback.answer.await_count, 1)
 
     def test_callback_refresh_failure_does_not_report_database_save_failure(self):
         repository = FakeRepository()

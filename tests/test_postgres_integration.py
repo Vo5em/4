@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import select, text
 
 os.environ.setdefault(
     "DATABASE_URL", "postgresql+asyncpg://127.0.0.1/crypto_bot_test"
 )
 
 from database import request as repository
-from database.models import Base, async_close, async_main
+from database.models import Base, StrategyChangeEvent, async_close, async_main
 from script.settings import PairSettings, TradingSettings
 
 
@@ -40,6 +41,21 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             async with repository.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
             await async_main()
+            # Simulate the deployed legacy schema, then verify startup migration
+            # upgrades the existing column without recreating its table.
+            async with repository.engine.begin() as connection:
+                await connection.execute(text(
+                    "ALTER TABLE strategy_change_events "
+                    "ALTER COLUMN admin_user_id TYPE INTEGER"
+                ))
+            await async_main()
+            async with repository.engine.connect() as connection:
+                column_type = await connection.scalar(text(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_name = 'strategy_change_events' "
+                    "AND column_name = 'admin_user_id'"
+                ))
+            self.assertEqual(column_type, "bigint")
 
             defaults = TradingSettings(
                 stake_usdt=10, initial_balance_usdt=100, max_open_trades=3
@@ -85,8 +101,16 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                 closed_at=now,
             )
             await repository.save_enabled_strategies_with_trades(
-                "BTCUSDT", set(), [cancelled], 100.0, "running"
+                "BTCUSDT", set(), [cancelled], 100.0, "running",
+                admin_user_id=8445920246,
             )
+            async with repository.async_session() as session:
+                saved_admin_user_id = await session.scalar(
+                    select(StrategyChangeEvent.admin_user_id)
+                    .order_by(StrategyChangeEvent.id.desc())
+                    .limit(1)
+                )
+            self.assertEqual(saved_admin_user_id, 8445920246)
 
             restored = await repository.initialize_database(
                 defaults, {"BTCUSDT": PairSettings("BTCUSDT")}

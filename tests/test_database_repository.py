@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault(
@@ -394,6 +395,37 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(event.cancellation_reasons, {"STRATEGY_DISABLED": 1})
         self.assertEqual(strategy_row.enabled_strategy_ids, ["bounce"])
         self.assertEqual(session.commits, 1)
+
+    def test_strategy_change_event_persists_telegram_id_above_int32(self):
+        admin_user_id = 8445920246
+        pair_row = PairStrategyConfig(
+            symbol="BTCUSDT", enabled_strategy_ids=["bounce"]
+        )
+        session = FakeSession({PairStrategyConfig: [pair_row]})
+
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_enabled_strategies_with_trades(
+                "BTCUSDT", {"breakout"}, [], 100, "running",
+                admin_user_id=admin_user_id,
+            ))
+
+        event = session.rows[StrategyChangeEvent][0]
+        self.assertEqual(event.admin_user_id, admin_user_id)
+        self.assertEqual(
+            StrategyChangeEvent.__table__.c.admin_user_id.type.__class__.__name__,
+            "BigInteger",
+        )
+
+    def test_admin_user_id_postgres_migration_alters_column_without_dropping_data(self):
+        migration = (
+            Path(__file__).parents[1]
+            / "database"
+            / "migrations"
+            / "20261029_strategy_change_admin_user_id_bigint.sql"
+        ).read_text(encoding="utf-8").upper()
+        self.assertIn("ALTER TABLE STRATEGY_CHANGE_EVENTS", migration)
+        self.assertIn("ALTER COLUMN ADMIN_USER_ID TYPE BIGINT", migration)
+        self.assertNotIn("DROP TABLE", migration)
 
     def test_strategy_selection_initializes_missing_pair_record_and_version(self):
         session = FakeSession()

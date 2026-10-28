@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, Numeric, String, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, JSON, Numeric, String, text
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -68,7 +68,7 @@ class StrategyChangeEvent(Base):
     symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     previous_strategy: Mapped[str | None] = mapped_column(String(60), nullable=True)
     new_strategy: Mapped[str | None] = mapped_column(String(60), nullable=True)
-    admin_user_id: Mapped[int | None] = mapped_column(nullable=True)
+    admin_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     result: Mapped[str] = mapped_column(String(24), nullable=False, default="applied")
     cancelled_plans: Mapped[int] = mapped_column(nullable=False, default=0)
     cancellation_reasons: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
@@ -138,6 +138,10 @@ async def async_main() -> None:
         await connection.execute(text(
             "ALTER TABLE pair_strategy_configs ADD COLUMN IF NOT EXISTS "
             "version INTEGER NOT NULL DEFAULT 1"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE strategy_change_events "
+            "ALTER COLUMN admin_user_id TYPE BIGINT"
         ))
         await connection.execute(text(
             "UPDATE trading_pairs SET min_wall_age_seconds = 40 "
