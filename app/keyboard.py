@@ -30,7 +30,6 @@ pair_statistics = InlineKeyboardMarkup(
 settings = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="Изменить ставку", callback_data="settings_stake")],
-        [InlineKeyboardButton(text="Изменить общий лимит сделок", callback_data="settings_trade_limit")],
         [InlineKeyboardButton(text="Настроить пару", callback_data="settings_pair")],
         [InlineKeyboardButton(text="Стратегии по парам", callback_data="settings_strategy")],
         [InlineKeyboardButton(text="Добавить USDT-пару", callback_data="settings_add_pair")],

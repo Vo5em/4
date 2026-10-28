@@ -395,6 +395,36 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(strategy_row.enabled_strategy_ids, ["bounce"])
         self.assertEqual(session.commits, 1)
 
+    def test_strategy_selection_initializes_missing_pair_record_and_version(self):
+        session = FakeSession()
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_enabled_strategies_with_trades(
+                "BTCUSDT", {"breakout"}, [], 100, "running",
+                admin_user_id=7319, expected_version=0,
+            ))
+        row = session.rows[PairStrategyConfig][0]
+        self.assertEqual(row.enabled_strategy_ids, ["breakout"])
+        self.assertEqual(row.version, 1)
+        event = session.rows[StrategyChangeEvent][0]
+        self.assertIsNone(event.previous_strategy)
+        self.assertEqual(event.new_strategy, "breakout")
+        self.assertEqual(event.admin_user_id, 7319)
+
+    def test_strategy_repository_rejects_stale_version(self):
+        row = PairStrategyConfig(
+            symbol="BTCUSDT", enabled_strategy_ids=["bounce"], version=3
+        )
+        session = FakeSession({PairStrategyConfig: [row]})
+        with patch.object(repository, "async_session", return_value=session):
+            with self.assertRaisesRegex(RuntimeError, "configuration changed"):
+                run_immediate(repository.save_enabled_strategies_with_trades(
+                    "BTCUSDT", {"breakout"}, [], 100, "running",
+                    admin_user_id=7319, expected_version=2,
+                ))
+        self.assertEqual(row.enabled_strategy_ids, ["bounce"])
+        self.assertEqual(row.version, 3)
+        self.assertEqual(session.commits, 0)
+
     def test_save_trade_updates_trade_row_and_runtime_balance(self):
         runtime_state = RuntimeState(
             id=1,

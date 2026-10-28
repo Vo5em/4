@@ -12,7 +12,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import app.keyboard as kb
-from app.runtime import RuntimeController
+from app.runtime import (
+    RuntimeController,
+    StrategyVersionConflict,
+    StrategyWorkerSyncError,
+)
+from script.engine import StrategyPersistenceError
 from script.engine import EngineMode
 from script.settings import PairSettings
 
@@ -46,7 +51,6 @@ ADMIN_USER_IDS = _load_admin_user_ids()
 
 class SettingsInput(StatesGroup):
     waiting_for_stake = State()
-    waiting_for_trade_limit = State()
     waiting_for_pair = State()
     waiting_for_new_pair = State()
     waiting_for_strategy = State()
@@ -184,7 +188,6 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
         f"{settings.breakout_buffer_bps:g} б.п.; разрыв обновлений до "
         f"{settings.breakout_max_update_gap_seconds:g} с\n"
         f"Порог потребления: {settings.consumed_ratio:.0%}\n"
-        f"Лимит сделок пары: {settings.max_open_trades}\n"
         f"Потенциальные стены: {potential if potential is not None else 'нет данных'}; "
         f"подтверждённые: {stable if stable is not None else 'нет данных'}\n"
         f"Сделки: открыто {stats['open_trades']}, ожидают входа "
@@ -265,7 +268,7 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"Плавающий P/L: {status['unrealized_profit_usdt']:+.2f} USDT · "
         f"оценка баланса: {status['equity_usdt']:.2f} USDT\n"
         f"Ставка на сделку: {status['stake_usdt']:.2f} USDT\n"
-        f"Лимит одновременных сделок: {status['max_open_trades']}\n"
+        "Общий лимит сделок не задан; новые входы зависят от сигналов и доступного баланса\n"
         f"Профит всего: {status['total_profit_usdt']:.2f} USDT\n"
         f"Профит за 7 дней: {status['weekly_profit_usdt']:.2f} USDT\n"
         f"Доходность: {status['total_return_percent']:+.2f}% · "
@@ -295,7 +298,6 @@ def pair_settings_text(runtime: RuntimeController) -> str:
             f"стоп за стеной {settings.stop_distance_bps:g} б.п.; "
             f"устойчивость {max(40.0, settings.min_wall_age_seconds):g} с; "
             f"порог потребления {settings.consumed_ratio:.0%}; "
-            f"лимит сделок {settings.max_open_trades}; "
             f"стратегии {escape(strategies)}"
         )
     return "\n".join(pairs) or "Торговые пары не настроены."
@@ -335,46 +337,14 @@ async def show_settings(
             callback.message,
             "<b>Настройки виртуальной торговли</b>\n\n"
             f"Ставка на сделку: {runtime.engine.trading_settings.stake_usdt:.2f} USDT\n"
-            f"Общий лимит одновременных сделок: {runtime.engine.trading_settings.max_open_trades}\n"
             f"Начальный баланс: {runtime.engine.trading_settings.initial_balance_usdt:.2f} USDT\n\n"
             f"<b>Пары</b>\n{pair_text}\n\n"
-            "Настройки сохраняются в PostgreSQL. Пороги, дистанции и лимит "
+            "Настройки сохраняются в PostgreSQL. Пороги и дистанции "
             "настраиваются отдельно для каждой пары; стратегии пары можно "
             "включить или отключить отдельной кнопкой.",
             reply_markup=kb.settings,
         )
     await callback.answer()
-
-
-@admin.callback_query(Admin(), F.data == "settings_trade_limit")
-async def request_trade_limit(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(SettingsInput.waiting_for_trade_limit)
-    if callback.message is not None:
-        await callback.message.answer(
-            "Отправьте максимальное число одновременно ожидающих и открытых сделок, "
-            "например: <code>3</code>.",
-            reply_markup=kb.cancel_input,
-        )
-    await callback.answer()
-
-
-@admin.message(Admin(), StateFilter(SettingsInput.waiting_for_trade_limit))
-async def update_trade_limit(
-    message: Message,
-    state: FSMContext,
-    runtime: RuntimeController,
-) -> None:
-    try:
-        maximum = int(message.text or "")
-        await runtime.update_max_open_trades(maximum)
-    except (ValueError, TypeError):
-        await message.answer("Введите целое число от 1 и выше.")
-        return
-    except Exception:
-        await message.answer("Не удалось сохранить лимит в базе данных.")
-        return
-    await state.clear()
-    await message.answer(dashboard_text(runtime), reply_markup=kb.main)
 
 
 @admin.callback_query(Admin(), F.data == "settings_stake")
@@ -411,7 +381,7 @@ async def request_pair_settings(callback: CallbackQuery, state: FSMContext) -> N
             "Отправьте: <code>ПАРА параметр значение</code>.\n"
             "Параметры: <code>enabled, min_wall_ratio, min_wall_notional_usdt, max_wall_distance_bps, "
             "min_wall_age_seconds, consumed_ratio, entry_distance_bps, "
-            "stop_distance_bps, max_open_trades, bounce_reversal_bps, "
+            "stop_distance_bps, bounce_reversal_bps, "
             "breakout_confirm_seconds, breakout_buffer_bps, "
             "breakout_max_update_gap_seconds</code>.\n"
             "Пример: <code>BTCUSDT entry_distance_bps 1.5</code>",
@@ -491,7 +461,11 @@ async def choose_strategy_pair(callback: CallbackQuery, runtime: RuntimeControll
 
 @admin.callback_query(Admin(), F.data.startswith("stratset:"))
 async def set_pair_strategy(callback: CallbackQuery, runtime: RuntimeController) -> None:
-    _, raw_symbol, strategy_id, raw_version = (callback.data or "").split(":", 3)
+    parts = (callback.data or "").split(":", 3)
+    if len(parts) != 4:
+        await callback.answer("Некорректная команда. Обновите список пар.", show_alert=True)
+        return
+    _, raw_symbol, strategy_id, raw_version = parts
     symbol = raw_symbol.upper()
     try:
         expected_version = int(raw_version)
@@ -502,31 +476,76 @@ async def set_pair_strategy(callback: CallbackQuery, runtime: RuntimeController)
         await callback.answer("Некорректная пара или стратегия", show_alert=True)
         return
     selected = set() if strategy_id == "off" else {strategy_id}
+    worker_error = False
     try:
         await runtime.update_enabled_strategies(
             symbol, selected, callback.from_user.id, expected_version
         )
-    except Exception:
-        logger.exception("Could not switch strategy mode for %s", symbol)
+    except StrategyVersionConflict:
         await callback.answer(
-            "Настройка изменилась или не сохранилась. Обновите список пар.",
+            "Настройка пары уже изменилась. Откройте список пар заново.",
             show_alert=True,
         )
         return
+    except StrategyPersistenceError:
+        await callback.answer(
+            "Не удалось сохранить режим в PostgreSQL. Настройка не применена; техническая причина записана в журнал.",
+            show_alert=True,
+        )
+        return
+    except StrategyWorkerSyncError:
+        # The database commit and in-memory selection already succeeded.
+        worker_error = True
+    except Exception:
+        logger.exception("Unexpected strategy switch failure for %s", symbol)
+        await callback.answer(
+            "Не удалось применить режим. Техническая причина записана в журнал.",
+            show_alert=True,
+        )
+        return
+    current_selection = runtime.engine.get_enabled_strategy_ids(symbol)
+    mode_text = _strategy_label(current_selection)
+    feed_text = _feed_label(runtime.engine.feed_status.get(symbol, "нет данных"))
+    confirmation = (
+        f"Режим {mode_text} для {symbol} сохранён."
+        if not worker_error
+        else f"Режим {mode_text} для {symbol} сохранён, но поток данных требует проверки ({feed_text})."
+    )
+    try:
+        await callback.answer(confirmation, show_alert=worker_error)
+    except Exception:
+        logger.exception("Telegram could not acknowledge saved strategy for %s", symbol)
     rows = [
-        [InlineKeyboardButton(text=("✓ " if selected == {key} else "") + label,
+        [InlineKeyboardButton(text=("✓ " if current_selection == {key} else "") + label,
                               callback_data=f"stratset:{symbol}:{key}:{runtime.engine.strategy_versions.get(symbol, 0)}")]
         for key, label in (("bounce", "Отскок от стены"), ("breakout", "Пробой стены"), ("off", "Отключено"))
     ]
     rows.append([InlineKeyboardButton(text="К списку пар", callback_data="settings_strategy")])
     if callback.message is not None:
-        await edit_message_if_changed(
-            callback.message,
-            f"<b>{escape(symbol)}</b> · режим сохранён: {_strategy_label(selected)}\n"
-            "Ожидающие входы прежней стратегии отменены; открытые виртуальные сделки продолжают сопровождаться.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        text = (
+            f"<b>{escape(symbol)}</b> · режим сохранён: {escape(mode_text)}\n"
+            f"Данные: {escape(feed_text)}\n"
+            "Ожидающие входы прежней стратегии отменены; открытые виртуальные сделки продолжают сопровождаться."
         )
-    await callback.answer("Режим сохранён")
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        try:
+            await edit_message_if_changed(callback.message, text, reply_markup=markup)
+        except Exception as error:
+            logger.error(
+                "Strategy for %s was saved, but Telegram message refresh failed (%s)",
+                symbol, type(error).__name__,
+            )
+            try:
+                await callback.message.answer(
+                    f"Режим {_strategy_label(current_selection)} для {escape(symbol)} сохранён в PostgreSQL. "
+                    "Сообщение панели не обновилось; откройте раздел «Стратегии по парам» заново.",
+                    reply_markup=markup,
+                )
+            except Exception as error:
+                logger.error(
+                    "Could not send fallback confirmation for saved strategy %s (%s)",
+                    symbol, type(error).__name__,
+                )
 
 
 @admin.message(Admin(), StateFilter(SettingsInput.waiting_for_strategy))
@@ -612,12 +631,6 @@ async def update_pair_settings(
             await message.answer("Для enabled используйте true/false.")
             return
         value = raw_value.lower() in {"true", "1", "on"}
-    elif parameter == "max_open_trades":
-        try:
-            value = int(raw_value)
-        except ValueError:
-            await message.answer("max_open_trades должен быть целым числом.")
-            return
     elif parameter in numeric_fields:
         try:
             value = float(raw_value)

@@ -82,34 +82,55 @@ class StrategyRegistry:
 
 
 class StableWallStrategy:
-    """Initial strategy: prepare one signal per stable wall, deduplicated by ID."""
+    """Legacy identifier kept for persisted configurations; stability alone is not a signal."""
 
     strategy_id = DEFAULT_STRATEGY_ID
 
     def evaluate(self, context: StrategyContext) -> list[TradeSignal]:
-        signals = []
-        for wall in context.stable_walls:
-            side = wall["side"]
-            price = float(wall["price"])
-            instance = wall.get("first_seen_at", wall.get("first_seen", "unknown"))
-            wall_id = f"{context.symbol}:{side}:{price:.12g}:{instance}"
-            signals.append(
-                TradeSignal(
-                    strategy_id=self.strategy_id,
-                    symbol=context.symbol,
-                    wall_side=side,
-                    wall_price=price,
-                    wall_id=wall_id,
-                    wall_size=float(wall["current_size"]),
-                    wall_ratio=float(wall.get("wall_ratio", 0.0)),
-                )
-            )
-        return signals
+        return []
 
 
 def _wall_id(symbol: str, wall: dict) -> str:
     identity = wall.get("first_seen_at", wall.get("first_seen", "unknown"))
     return f"{symbol}:{wall['side']}:{float(wall['price']):.12g}:{identity}"
+
+
+def _nearest_walls_by_side(
+    context: StrategyContext, *, include_consumed: bool = False
+) -> dict[str, str]:
+    """Return the closest stable lifecycle for each book side.
+
+    Strategies still update their confirmation state for every stable wall, but
+    only the nearest stable wall on a side may produce a signal on this update.
+    This preserves support and resistance as separate scenarios.
+    """
+    nearest: dict[str, tuple[float, str]] = {}
+    walls = list(context.stable_walls)
+    if include_consumed:
+        walls.extend(
+            event for event in context.wall_events
+            if event.get("event") == "CONSUMED"
+        )
+    for wall in walls:
+        if float(wall.get("age", 0)) < max(40.0, context.settings.min_wall_age_seconds):
+            continue
+        price = float(wall["price"])
+        if price <= 0:
+            continue
+        identity = _wall_id(context.symbol, wall)
+        consumed = wall.get("event") == "CONSUMED"
+        # A live bid is support and a live ask is resistance. A consumed wall
+        # remains eligible for breakout confirmation after price crosses it.
+        if not include_consumed and not consumed and (
+            (wall["side"] == "buy" and price >= context.last_price)
+            or (wall["side"] == "sell" and price <= context.last_price)
+        ):
+            continue
+        distance = abs(price - context.last_price)
+        current = nearest.get(wall["side"])
+        if current is None or distance < current[0]:
+            nearest[wall["side"]] = (distance, identity)
+    return {side: identity for side, (_, identity) in nearest.items()}
 
 
 def _risk_levels(
@@ -181,6 +202,7 @@ class BounceStrategy:
             self._states.pop(wall_id, None)
 
         signals = []
+        nearest = _nearest_walls_by_side(context)
         for wall in context.stable_walls:
             if float(wall.get("age", 0)) < 40:
                 continue
@@ -222,7 +244,7 @@ class BounceStrategy:
                 side=side, entry_price=price, stop_loss=levels[0], take_profit=levels[1],
                 entry_mode="market",
             ))
-        return signals
+        return [signal for signal in signals if nearest.get(signal.wall_side) == signal.wall_id]
 
 
 class BreakoutStrategy:
@@ -257,6 +279,7 @@ class BreakoutStrategy:
                 self._states.pop(wall_id, None)
 
         signals = []
+        nearest = _nearest_walls_by_side(context, include_consumed=True)
         walls_by_id = {_wall_id(context.symbol, wall): wall for wall in context.stable_walls}
         walls_by_id.update({key: event for key, event in events.items() if event.get("event") == "CONSUMED"})
         for wall_id, wall in walls_by_id.items():
@@ -302,7 +325,7 @@ class BreakoutStrategy:
                 entry_price=context.last_price, stop_loss=levels[0], take_profit=levels[1],
                 entry_mode="market",
             ))
-        return signals
+        return [signal for signal in signals if nearest.get(signal.wall_side) == signal.wall_id]
 
 
 def build_strategy_registry() -> StrategyRegistry:

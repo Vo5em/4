@@ -14,6 +14,19 @@ class WallTracker:
 
 
         self.walls = {}
+        self._restored_lifecycle_identities = {}
+
+    def seed_lifecycle_identities(self, identities):
+        """Reuse persisted identity on first sight of a wall after restart.
+
+        Stability age still starts at zero after a new feed connection. If the
+        wall disappears, the saved identity is consumed and a later lifecycle
+        at the same price receives a new identity.
+        """
+        self._restored_lifecycle_identities = {
+            (side, float(price)): str(identity)
+            for (side, price), identity in identities.items()
+        }
 
     def update(
         self,
@@ -59,7 +72,9 @@ class WallTracker:
                 "qualifies": True,
 
                 "first_seen": now,
-                "first_seen_at": datetime.now(timezone.utc).isoformat(),
+                "first_seen_at": self._restored_lifecycle_identities.pop(
+                    key, datetime.now(timezone.utc).isoformat()
+                ),
                 "last_seen": now,
 
                 "aggressive_volume": 0,

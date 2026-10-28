@@ -290,10 +290,13 @@ async def save_enabled_strategies(symbol: str, strategy_ids: set[str]) -> None:
                 PairStrategyConfig(
                     symbol=symbol,
                     enabled_strategy_ids=values,
+                    version=1,
                 )
             )
         else:
-            row.enabled_strategy_ids = values
+            if row.enabled_strategy_ids != values:
+                row.enabled_strategy_ids = values
+                row.version = int(getattr(row, "version", 1) or 1) + 1
         await session.commit()
 
 
@@ -313,7 +316,7 @@ async def save_enabled_strategies_with_trades(
         selected = sorted(strategy_ids)
         previous = sorted(row.enabled_strategy_ids) if row is not None else []
         current_version = int(getattr(row, "version", 1) or 1) if row is not None else 0
-        if expected_version is not None and current_version != expected_version and previous != selected:
+        if expected_version is not None and current_version != expected_version:
             raise RuntimeError("Strategy configuration changed; refresh the strategy panel")
         if row is None:
             session.add(

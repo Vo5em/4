@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 from enum import Enum
 from time import monotonic
@@ -12,6 +13,11 @@ from .strategies import (
     build_strategy_registry,
 )
 from .trade_manager import TradeManager
+
+logger = logging.getLogger(__name__)
+
+class StrategyPersistenceError(RuntimeError):
+    """A pair strategy setting could not be committed to the repository."""
 
 
 class EngineMode(str, Enum):
@@ -357,8 +363,10 @@ class TradingEngine:
                     )
             except Exception as error:
                 self.record_database_error(error)
-                print(f"Database strategy update failed: {type(error).__name__}")
-                return False
+                logger.exception("Database strategy update failed for %s", symbol)
+                raise StrategyPersistenceError(
+                    "Could not commit pair strategy configuration"
+                ) from error
             self.record_database_success()
             for signal_id, trade_ref in snapshot_refs.items():
                 if self._pending_persistence.get(signal_id) is trade_ref:
@@ -604,15 +612,7 @@ class TradingEngine:
             return "Нет потенциальных стен, прошедших текущие фильтры."
         if stable == 0:
             return "Потенциальные стены ещё не подтвердили устойчивость."
-        active = [
-            trade for trade in self.trade_manager.trades
-            if trade["symbol"] == symbol and trade["status"] in {"pending", "open"}
-        ]
-        if len(active) >= settings.max_open_trades:
-            return "Достигнут лимит сделок этой пары."
         stats = self.trade_manager.get_statistics()
-        if stats["open_trades"] + stats["pending_trades"] >= self.trading_settings.max_open_trades:
-            return "Достигнут общий лимит сделок."
         if stats["available_balance_usdt"] < self.trading_settings.stake_usdt:
             return "Недостаточно свободного виртуального баланса для ставки."
         if symbol in self.strategy_errors:

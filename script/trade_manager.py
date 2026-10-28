@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from math import isfinite
+from threading import Lock
 
 from .formulas import (
     calculate_entry_price,
@@ -17,6 +18,7 @@ class TradeManager:
         self.trades: list[dict] = []
         self.last_prices: dict[str, float] = {}
         self._used_signal_ids: set[str] = set()
+        self._create_lock = Lock()
         self.balance_usdt = self.trading_settings.initial_balance_usdt
 
     def restore_state(
@@ -35,7 +37,46 @@ class TradeManager:
                 if isfinite(float(price)) and float(price) > 0
             }
 
+    def get_wall_lifecycle_identities(self) -> dict[tuple[str, float], str]:
+        """Return durable lifecycle IDs that can be reused when a feed restarts.
+
+        Signal IDs already persist in ``virtual_trades``. Wall lifecycle IDs
+        are encoded after the strategy prefix, so no database schema change is
+        needed to recognize a still-present wall after process restart.
+        """
+        identities: dict[tuple[str, float], str] = {}
+        for trade in self.trades:
+            wall_id = str(trade.get("wall_id") or self._wall_id_from_signal_id(trade))
+            parts = wall_id.split(":", 3)
+            if len(parts) != 4 or parts[0].upper() != str(trade.get("symbol", "")).upper():
+                continue
+            if parts[1] != trade.get("wall_side"):
+                continue
+            try:
+                price = float(parts[2])
+            except ValueError:
+                continue
+            if price != float(trade.get("wall_price", 0)) or not parts[3]:
+                continue
+            identities[(parts[1], price)] = parts[3]
+        return identities
+
     def create_trade(
+        self,
+        signal,
+        pair_settings: PairSettings,
+        *,
+        stake_usdt: float | None = None,
+    ) -> dict | None:
+        # The engine serializes market updates, but callers and future adapters
+        # may invoke execution concurrently. Keep duplicate checks and insertion
+        # in one critical section.
+        with self._create_lock:
+            return self._create_trade_unlocked(
+                signal, pair_settings, stake_usdt=stake_usdt
+            )
+
+    def _create_trade_unlocked(
         self,
         signal,
         pair_settings: PairSettings,
@@ -75,20 +116,12 @@ class TradeManager:
             raise ValueError("wall values must be finite and within valid ranges")
         if signal_id in self._used_signal_ids:
             return None
-
-        active_for_symbol = sum(
-            1
+        wall_id = str(data.get("wall_id") or signal_id)
+        if any(
+            str(trade.get("wall_id") or self._wall_id_from_signal_id(trade)) == wall_id
+            and trade.get("status") in {"pending", "open", "closed"}
             for trade in self.trades
-            if trade["symbol"] == symbol
-            and trade["status"] in {"pending", "open"}
-        )
-        if active_for_symbol >= pair_settings.max_open_trades:
-            return None
-        active_total = sum(
-            trade["status"] in {"pending", "open"}
-            for trade in self.trades
-        )
-        if active_total >= self.trading_settings.max_open_trades:
+        ):
             return None
         if any(
             trade["symbol"] == symbol
@@ -150,6 +183,7 @@ class TradeManager:
             "side": trade_side,
             "wall_side": wall_side,
             "wall_price": wall_price,
+            "wall_id": wall_id,
             "wall_size": wall_size,
             "wall_ratio": wall_ratio,
             "stake_usdt": stake,
@@ -168,6 +202,13 @@ class TradeManager:
         self.trades.append(trade)
         self._used_signal_ids.add(signal_id)
         return trade
+
+    @staticmethod
+    def _wall_id_from_signal_id(trade: dict) -> str:
+        signal_id = str(trade.get("signal_id", ""))
+        strategy_id = str(trade.get("strategy_id", ""))
+        prefix = f"{strategy_id}:"
+        return signal_id[len(prefix):] if signal_id.startswith(prefix) else signal_id
 
     def on_price(self, symbol: str, price: float) -> list[dict]:
         if not isfinite(price) or price <= 0:

@@ -1,8 +1,19 @@
 import asyncio
 from dataclasses import replace
+import logging
 
-from script.engine import EngineMode, TradingEngine
+from script.engine import EngineMode, StrategyPersistenceError, TradingEngine
 from script.settings import PairSettings, TradingSettings, normalize_pair_symbol
+
+logger = logging.getLogger(__name__)
+
+
+class StrategyVersionConflict(RuntimeError):
+    """The strategy buttons were rendered for an older pair configuration."""
+
+
+class StrategyWorkerSyncError(RuntimeError):
+    """The selection committed, but its market worker could not be synchronized."""
 
 
 class RuntimeController:
@@ -220,7 +231,9 @@ class RuntimeController:
             if previous == selected:
                 return set(previous)
             if expected_version is not None and expected_version != current_version:
-                raise RuntimeError("Стратегия уже изменилась. Обновите список пар.")
+                raise StrategyVersionConflict(
+                    "The selected pair strategy changed after this keyboard was rendered"
+                )
             previous_trades = [
                 dict(trade) for trade in self.engine.trade_manager.trades
             ]
@@ -236,22 +249,34 @@ class RuntimeController:
                         symbol, strategy_id, "STRATEGY_DISABLED"
                     )
                 )
-            if not await self.engine.persist_enabled_strategies(
-                symbol, selected, events, admin_user_id=admin_user_id,
-                expected_version=expected_version,
-            ):
+            try:
+                await self.engine.persist_enabled_strategies(
+                    symbol, selected, events, admin_user_id=admin_user_id,
+                    expected_version=expected_version,
+                )
+            except Exception:
                 if events:
                     self.engine.restore_trade_state(
                         previous_trades,
                         previous_balance,
                         previous_pending_persistence,
                     )
-                raise RuntimeError("Could not persist strategy settings and trade state")
+                raise
             self.engine.enabled_strategies[symbol] = selected
             if previous != selected:
                 self.engine.strategy_versions[symbol] = current_version + 1
             self.engine.reset_strategy_state(symbol)
-            await self._sync_workers()
+            try:
+                await self._sync_workers()
+            except Exception as error:
+                self.engine.set_feed_status(symbol, "error", error)
+                logger.exception(
+                    "Strategy for %s was committed, but its market worker could not be synchronized",
+                    symbol,
+                )
+                raise StrategyWorkerSyncError(
+                    "Strategy was committed but the market worker could not be synchronized"
+                ) from error
             return set(selected)
 
     async def add_pair(self, symbol: str) -> PairSettings:

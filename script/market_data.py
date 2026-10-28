@@ -376,6 +376,11 @@ async def _run_connection(
         min_age_seconds=max(40.0, pair_settings.min_wall_age_seconds),
         consumed_ratio=pair_settings.consumed_ratio,
     )
+    restore_wall_ids = getattr(
+        engine.trade_manager, "get_wall_lifecycle_identities", None
+    )
+    if restore_wall_ids is not None:
+        wall_tracker.seed_lifecycle_identities(restore_wall_ids())
     last_price = None
     stable_walls = []
     pending_reconciled = False
