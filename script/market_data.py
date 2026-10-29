@@ -2,8 +2,10 @@ import asyncio
 import json
 import itertools
 import logging
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from time import monotonic
+from time import monotonic, time
 
 import aiohttp
 import websockets
@@ -25,6 +27,106 @@ CATEGORY = "linear"
 logger = logging.getLogger(__name__)
 _last_snapshot_log_at: dict[str, float] = {}
 _connection_generations = itertools.count(1)
+
+
+@dataclass(frozen=True)
+class PriceTick:
+    price: float
+    event_time_ms: int
+    message_time_ms: int
+    sequence: int | None
+    trade_id: str
+    received_monotonic: float
+    received_at: datetime
+    delivery_lag_ms: float
+
+
+class TradeEventCursor:
+    """Reject replayed or out-of-order Bybit publicTrade updates."""
+
+    def __init__(self) -> None:
+        self.last_order: tuple[int, int] | None = None
+        self._seen_ids: set[str] = set()
+        self._seen_order: deque[str] = deque()
+        self.latest: PriceTick | None = None
+
+    def accept(self, tick: PriceTick) -> bool:
+        if tick.trade_id in self._seen_ids:
+            return False
+        order = (tick.event_time_ms, tick.sequence or 0)
+        if self.last_order is not None and order < self.last_order:
+            return False
+        self._seen_ids.add(tick.trade_id)
+        self._seen_order.append(tick.trade_id)
+        if len(self._seen_order) > 4096:
+            self._seen_ids.discard(self._seen_order.popleft())
+        if self.last_order is None or order > self.last_order:
+            self.last_order = order
+        self.latest = tick
+        return True
+
+
+class TickerPriceCursor:
+    """Keep the newest Bybit ticker Last Price across delta messages/reconnects."""
+
+    def __init__(self) -> None:
+        self.last_order: tuple[int, int] | None = None
+        self.last_price: float | None = None
+
+    def update(self, payload: dict) -> tuple[float | None, bool, int, int] | None:
+        data = payload.get("data") or {}
+        if isinstance(data, list):
+            if not data:
+                return None
+            data = data[0]
+        if not isinstance(data, dict):
+            return None
+        now_ms = int(time() * 1000)
+        message_time_ms = int(payload.get("ts") or now_ms)
+        cross_sequence = int(payload.get("cs") or 0)
+        order = (message_time_ms, cross_sequence)
+        if self.last_order is not None and order <= self.last_order:
+            return None
+        if "lastPrice" in data:
+            price = float(data["lastPrice"])
+            changed = self.last_price is None or price != self.last_price
+            self.last_price = price
+        else:
+            price = self.last_price
+            changed = False
+        self.last_order = order
+        if price is None:
+            return None
+        return price, changed, message_time_ms, cross_sequence
+
+
+def _delivery_lag_ms(engine: TradingEngine, symbol: str, channel: str,
+                     exchange_timestamp_ms: int, received_at_ms: int) -> float:
+    """Estimate queue/network delay relative to the best observed clock offset."""
+    offsets = getattr(engine, "exchange_clock_offsets_ms", None)
+    if offsets is None:
+        offsets = {}
+        engine.exchange_clock_offsets_ms = offsets
+    key = (symbol.upper(), channel)
+    offset = received_at_ms - exchange_timestamp_ms
+    baseline = offsets.get(key)
+    if baseline is None or offset < baseline:
+        offsets[key] = offset
+        baseline = offset
+    return max(0.0, float(offset - baseline))
+
+
+def _receive_book_delta(payload: dict) -> dict:
+    received_monotonic = monotonic()
+    received_at_ms = int(time() * 1000)
+    delta = dict(payload["data"])
+    delta["_message_ts"] = int(payload.get("ts") or received_at_ms)
+    delta["_cts"] = payload.get("cts")
+    delta["_received_monotonic"] = received_monotonic
+    delta["_received_at"] = datetime.fromtimestamp(
+        received_at_ms / 1000, tz=timezone.utc
+    )
+    return delta
 
 
 async def get_orderbook_snapshot(symbol: str) -> dict:
@@ -194,16 +296,77 @@ def build_synchronized_orderbook(snapshot: dict, buffered_deltas: list[dict]):
     return orderbook, first_index
 
 
-def _update_flow(trade_flow: TradeFlow, payload: dict) -> float | None:
+def _update_flow(
+    trade_flow: TradeFlow,
+    payload: dict,
+    cursor: TradeEventCursor | None = None,
+    engine: TradingEngine | None = None,
+    symbol: str | None = None,
+) -> float | None:
     last_price = None
+    received_monotonic = monotonic()
+    received_at_ms = int(time() * 1000)
+    received_at = datetime.fromtimestamp(received_at_ms / 1000, tz=timezone.utc)
+    message_time_ms = int(payload.get("ts") or received_at_ms)
     for trade in payload.get("data", []):
-        last_price = float(trade["p"])
+        price = float(trade["p"])
+        if cursor is not None:
+            event_time_ms = int(trade["T"])
+            sequence = int(trade["seq"]) if trade.get("seq") is not None else None
+            trade_id = str(trade["i"])
+            delivery_lag = (
+                _delivery_lag_ms(engine, symbol, "publicTrade", message_time_ms, received_at_ms)
+                if engine is not None and symbol is not None else 0.0
+            )
+            tick = PriceTick(
+                price=price,
+                event_time_ms=event_time_ms,
+                message_time_ms=message_time_ms,
+                sequence=sequence,
+                trade_id=trade_id,
+                received_monotonic=received_monotonic,
+                received_at=received_at,
+                delivery_lag_ms=delivery_lag,
+            )
+            if not cursor.accept(tick):
+                continue
+        last_price = price
         trade_flow.add_trade(
             price=last_price,
             quantity=float(trade["v"]),
             side=trade["S"],
         )
     return last_price
+
+
+def _update_ticker_price(
+    payload: dict,
+    cursor: TickerPriceCursor,
+    engine: TradingEngine,
+    symbol: str,
+) -> tuple[float | None, bool]:
+    update = cursor.update(payload)
+    if update is None:
+        return cursor.last_price, False
+    price, changed, message_time_ms, sequence = update
+    received_monotonic = monotonic()
+    received_at_ms = int(time() * 1000)
+    received_at = datetime.fromtimestamp(received_at_ms / 1000, tz=timezone.utc)
+    engine.record_price_market_data(
+        symbol,
+        event_time_ms=message_time_ms,
+        message_time_ms=message_time_ms,
+        sequence=sequence,
+        trade_id=f"ticker:{symbol.upper()}:{message_time_ms}:{sequence}",
+        received_monotonic=received_monotonic,
+        received_at=received_at,
+        delivery_lag_ms=_delivery_lag_ms(
+            engine, symbol, "tickers", message_time_ms, received_at_ms
+        ),
+        value_updated_at_ms=message_time_ms if changed else None,
+        value_updated_monotonic=received_monotonic if changed else None,
+    )
+    return price, changed
 
 
 def analyze_synced_orderbook(
@@ -295,6 +458,9 @@ async def _fetch_snapshot_while_buffering(
     trade_flow: TradeFlow,
     buffered_deltas: list[dict],
     sync_counters: dict | None = None,
+    trade_cursor: TradeEventCursor | None = None,
+    engine: TradingEngine | None = None,
+    ticker_cursor: TickerPriceCursor | None = None,
 ) -> tuple[dict, float | None]:
     last_price = None
     last_wait_log_at = 0.0
@@ -318,9 +484,13 @@ async def _fetch_snapshot_while_buffering(
         _check_subscription(payload)
         topic = payload.get("topic")
         if topic == f"orderbook.full.{symbol}":
-            buffer_orderbook_delta(buffered_deltas, payload["data"], sync_counters)
+            buffer_orderbook_delta(
+                buffered_deltas, _receive_book_delta(payload), sync_counters
+            )
         elif topic == f"publicTrade.{symbol}":
-            last_price = _update_flow(trade_flow, payload) or last_price
+            _update_flow(trade_flow, payload, trade_cursor, engine, symbol)
+        elif topic == f"tickers.{symbol}" and ticker_cursor is not None and engine is not None:
+            last_price, _ = _update_ticker_price(payload, ticker_cursor, engine, symbol)
 
     snapshot_task = asyncio.create_task(get_orderbook_snapshot(symbol))
     logger.debug(
@@ -350,12 +520,14 @@ async def _fetch_snapshot_while_buffering(
             topic = payload.get("topic")
             if topic == f"orderbook.full.{symbol}":
                 buffer_orderbook_delta(
-                    buffered_deltas, payload["data"], sync_counters
+                    buffered_deltas, _receive_book_delta(payload), sync_counters
                 )
                 if len(buffered_deltas) > 10000:
                     raise RuntimeError("Too many buffered deltas during snapshot sync")
             elif topic == f"publicTrade.{symbol}":
-                last_price = _update_flow(trade_flow, payload) or last_price
+                _update_flow(trade_flow, payload, trade_cursor, engine, symbol)
+            elif topic == f"tickers.{symbol}" and ticker_cursor is not None and engine is not None:
+                last_price, _ = _update_ticker_price(payload, ticker_cursor, engine, symbol)
         snapshot = await snapshot_task
         _log_snapshot_if_due(symbol, snapshot, len(buffered_deltas))
         return snapshot, last_price
@@ -370,8 +542,20 @@ async def _run_connection(
     engine: TradingEngine,
     pair_settings: PairSettings,
 ) -> None:
-    topics = [f"orderbook.full.{symbol}", f"publicTrade.{symbol}"]
+    topics = [
+        f"orderbook.full.{symbol}", f"publicTrade.{symbol}", f"tickers.{symbol}"
+    ]
     trade_flow = TradeFlow(window_seconds=10)
+    trade_cursors = getattr(engine, "trade_event_cursors", None)
+    if trade_cursors is None:
+        trade_cursors = {}
+        engine.trade_event_cursors = trade_cursors
+    trade_cursor = trade_cursors.setdefault(symbol.upper(), TradeEventCursor())
+    ticker_cursors = getattr(engine, "ticker_price_cursors", None)
+    if ticker_cursors is None:
+        ticker_cursors = {}
+        engine.ticker_price_cursors = ticker_cursors
+    ticker_cursor = ticker_cursors.setdefault(symbol.upper(), TickerPriceCursor())
     wall_tracker = WallTracker(
         min_age_seconds=max(40.0, pair_settings.min_wall_age_seconds),
         consumed_ratio=pair_settings.consumed_ratio,
@@ -388,6 +572,7 @@ async def _run_connection(
     last_analysis_log_at = 0.0
     last_alignment_warning_at = 0.0
     last_alignment_wait_log_at = 0.0
+    engine.mark_orderbook_unsynchronized(symbol)
 
     async with websockets.connect(
         BYBIT_WS_URL,
@@ -401,9 +586,10 @@ async def _run_connection(
         buffered_deltas = OrderbookDeltaBuffer(next(_connection_generations))
         logger.info("%s orderbook buffer generation=%d started", symbol, buffered_deltas.generation)
         snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
-            websocket, symbol, trade_flow, buffered_deltas, sync_counters
+            websocket, symbol, trade_flow, buffered_deltas, sync_counters,
+            trade_cursor, engine, ticker_cursor,
         )
-        last_price = snapshot_last_price or last_price
+        last_price = ticker_cursor.last_price or snapshot_last_price or last_price
         while True:
             dropped = discard_deltas_included_by_snapshot(snapshot, buffered_deltas)
             sync_counters["discarded"] += dropped
@@ -429,9 +615,10 @@ async def _run_connection(
                     )
                     last_alignment_warning_at = now
                 snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
-                    websocket, symbol, trade_flow, buffered_deltas, sync_counters
+                    websocket, symbol, trade_flow, buffered_deltas, sync_counters,
+                    trade_cursor, engine, ticker_cursor,
                 )
-                last_price = snapshot_last_price or last_price
+                last_price = ticker_cursor.last_price or snapshot_last_price or last_price
                 continue
             if first_index is not None:
                 break
@@ -456,37 +643,87 @@ async def _run_connection(
             _check_subscription(payload)
             topic = payload.get("topic")
             if topic == f"publicTrade.{symbol}":
-                last_price = _update_flow(trade_flow, payload) or last_price
+                _update_flow(trade_flow, payload, trade_cursor, engine, symbol)
+            elif topic == f"tickers.{symbol}":
+                last_price, _ = _update_ticker_price(
+                    payload, ticker_cursor, engine, symbol
+                )
             elif topic == f"orderbook.full.{symbol}":
                 buffer_result = buffer_orderbook_delta(
-                    buffered_deltas, payload["data"], sync_counters
+                    buffered_deltas, _receive_book_delta(payload), sync_counters
                 )
                 if len(buffered_deltas) > 10000:
                     raise RuntimeError("Too many buffered deltas during snapshot sync")
                 if buffer_result == "reset":
                     snapshot, snapshot_last_price = await _fetch_snapshot_while_buffering(
-                        websocket, symbol, trade_flow, buffered_deltas, sync_counters
+                        websocket, symbol, trade_flow, buffered_deltas, sync_counters,
+                        trade_cursor, engine, ticker_cursor,
                     )
-                    last_price = snapshot_last_price or last_price
+                    last_price = ticker_cursor.last_price or snapshot_last_price or last_price
 
         orderbook, _ = build_synchronized_orderbook(
             snapshot, buffered_deltas
         )
+        last_price = ticker_cursor.last_price or last_price
+        latest_delta = buffered_deltas[-1] if buffered_deltas else {}
+        book_received_mono = latest_delta.get("_received_monotonic", monotonic())
+        book_received_at = latest_delta.get("_received_at", datetime.now(timezone.utc))
+        book_message_ts = int(
+            latest_delta.get("_message_ts", snapshot.get("ts") or int(time() * 1000))
+        )
+        book_cts = latest_delta.get("_cts", snapshot.get("cts"))
+        book_delivery_lag = _delivery_lag_ms(
+            engine, symbol, "orderbook", book_message_ts,
+            int(book_received_at.timestamp() * 1000),
+        )
+        engine.record_orderbook_market_data(
+            symbol,
+            message_time_ms=book_message_ts,
+            cts_ms=int(book_cts) if book_cts is not None else None,
+            sequence=orderbook.sequence,
+            update_id=orderbook.update_id,
+            received_monotonic=book_received_mono,
+            received_at=book_received_at,
+            delivery_lag_ms=book_delivery_lag,
+            synchronized=orderbook.synchronized,
+            generation=buffered_deltas.generation,
+        )
 
         logger.info(
             "%s generation=%d orderbook synchronized at %s: snapshot(seq=%s,u=%s), current(seq=%s,u=%s), "
-            "buffer accepted=%d discarded=%d resets=%d, depth bids=%d asks=%d",
+            "buffer accepted=%d discarded=%d resets=%d, depth bids=%d asks=%d, "
+            "price_event=%s price_age=%s",
             symbol,
             buffered_deltas.generation,
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
             snapshot["seq"], snapshot["u"], orderbook.sequence, orderbook.update_id,
             sync_counters["accepted"], sync_counters["discarded"],
             sync_counters["resets"], len(orderbook.bids), len(orderbook.asks),
+            engine.get_market_data_health(symbol)["price_trade_id"],
+            engine.get_market_data_health(symbol)["price_age_seconds"],
         )
         engine.reset_strategy_state(symbol)
 
         flow = trade_flow.get_flow()
         engine.set_feed_status(symbol, "connected")
+        if (
+            last_price is not None
+            and engine.get_market_data_health(symbol)["fresh"]
+        ):
+            pair_settings = engine.pair_settings.get(symbol, pair_settings)
+            result = analyze_synced_orderbook(
+                orderbook, last_price, flow, pair_settings, wall_tracker
+            )
+            stable_walls = result["stable_walls"]
+            last_analysis_log_at = _log_analysis_if_due(
+                symbol, orderbook, last_price, result, last_analysis_log_at
+            )
+            await engine.process_market_update(
+                symbol, last_price, stable_walls, result["wall_events"],
+                result["candidates"], price_updated=True,
+            )
+            pending_reconciled = True
+            engine.market_reconciliation_required.discard(symbol.upper())
         while (
             engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
             and engine.should_run_market_feed(symbol)
@@ -496,29 +733,41 @@ async def _run_connection(
             topic = payload.get("topic")
 
             if topic == f"publicTrade.{symbol}":
-                last_price = _update_flow(trade_flow, payload) or last_price
+                _update_flow(trade_flow, payload, trade_cursor, engine, symbol)
                 flow = trade_flow.get_flow()
-                if last_price is not None:
-                    candidates = None
-                    wall_events = ()
-                    if not pending_reconciled:
-                        pair_settings = engine.pair_settings.get(symbol, pair_settings)
-                        result = analyze_synced_orderbook(
-                            orderbook, last_price, flow, pair_settings, wall_tracker
-                        )
-                        candidates = result["candidates"]
-                        wall_events = result["wall_events"]
-                        stable_walls = result["stable_walls"]
-                        last_analysis_log_at = _log_analysis_if_due(
-                            symbol, orderbook, last_price, result, last_analysis_log_at
-                        )
-                        pending_reconciled = True
-                    events = await engine.process_market_update(
-                        symbol, last_price, stable_walls, wall_events, candidates,
-                        price_updated=True,
-                    )
-                    for event in events:
-                        print(f"{symbol} {event['event']} {event['trade'].get('signal_id')}")
+                continue
+
+            if topic == f"tickers.{symbol}":
+                last_price, price_changed = _update_ticker_price(
+                    payload, ticker_cursor, engine, symbol
+                )
+                if last_price is None:
+                    continue
+                needs_reconciliation = (
+                    not pending_reconciled
+                    or symbol.upper() in engine.market_reconciliation_required
+                )
+                if not price_changed and not needs_reconciliation:
+                    continue
+                health = engine.get_market_data_health(symbol)
+                if not health["price_fresh"] or not health["book_synchronized"]:
+                    continue
+                flow = trade_flow.get_flow()
+                pair_settings = engine.pair_settings.get(symbol, pair_settings)
+                result = analyze_synced_orderbook(
+                    orderbook, last_price, flow, pair_settings, wall_tracker
+                )
+                stable_walls = result["stable_walls"]
+                last_analysis_log_at = _log_analysis_if_due(
+                    symbol, orderbook, last_price, result, last_analysis_log_at
+                )
+                await engine.process_market_update(
+                    symbol, last_price, stable_walls, result["wall_events"],
+                    result["candidates"], price_updated=True,
+                )
+                pending_reconciled = True
+                if needs_reconciliation:
+                    engine.market_reconciliation_required.discard(symbol.upper())
                 continue
 
             if topic != f"orderbook.full.{symbol}":
@@ -527,17 +776,43 @@ async def _run_connection(
             pair_settings = engine.pair_settings.get(symbol, pair_settings)
             wall_tracker.min_age_seconds = max(40.0, pair_settings.min_wall_age_seconds)
             wall_tracker.consumed_ratio = pair_settings.consumed_ratio
-            delta = payload["data"]
+            delta = _receive_book_delta(payload)
             try:
                 apply_orderbook_delta(orderbook, delta)
             except RuntimeError as error:
+                engine.mark_orderbook_unsynchronized(symbol)
+                logger.warning(
+                    "%s generation=%d invalidated local orderbook at seq=%s u=%s",
+                    symbol, buffered_deltas.generation, delta.get("seq"), delta.get("u"),
+                )
                 raise RuntimeError(
                     f"Orderbook sequence issue for {symbol}; resynchronizing"
                 ) from error
+            book_received_at = delta["_received_at"]
+            book_message_ts = delta["_message_ts"]
+            book_cts = delta.get("_cts")
+            engine.record_orderbook_market_data(
+                symbol,
+                message_time_ms=book_message_ts,
+                cts_ms=int(book_cts) if book_cts is not None else None,
+                sequence=orderbook.sequence,
+                update_id=orderbook.update_id,
+                received_monotonic=delta["_received_monotonic"],
+                received_at=book_received_at,
+                delivery_lag_ms=_delivery_lag_ms(
+                    engine, symbol, "orderbook", book_message_ts,
+                    int(book_received_at.timestamp() * 1000),
+                ),
+                synchronized=orderbook.synchronized,
+                generation=buffered_deltas.generation,
+            )
             # The REST ticker is best-effort during initial synchronization. Until
             # the trade stream provides a price, keep applying book deltas but do
             # not try to calculate price-relative wall distance with None.
-            if last_price is None:
+            if (
+                last_price is None
+                or not engine.get_market_data_health(symbol)["price_fresh"]
+            ):
                 continue
             result = analyze_synced_orderbook(
                 orderbook, last_price, flow, pair_settings, wall_tracker
@@ -554,8 +829,6 @@ async def _run_connection(
                     symbol, last_price, stable_walls, wall_events, walls,
                     price_updated=False,
                 )
-                for event in events:
-                    print(f"{symbol} {event['event']} {event['trade'].get('signal_id')}")
 
 
 async def market_data_worker(

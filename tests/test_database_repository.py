@@ -495,6 +495,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
         saved = session.rows[VirtualTrade][0]
         self.assertEqual(saved.signal_id, trade["signal_id"])
         self.assertEqual(saved.status, "closed")
+        self.assertEqual(saved.entry_price, trade["entry_price"])
+        self.assertEqual(saved.exit_price, trade["exit_price"])
         self.assertEqual(saved.profit_usdt, 0.0035)
         self.assertEqual(runtime_state.balance_usdt, 100.0035)
         self.assertEqual(runtime_state.engine_mode, "running")

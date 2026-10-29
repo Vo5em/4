@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from math import isfinite
-from threading import Lock
+from threading import RLock
 
 from .formulas import (
     calculate_entry_price,
@@ -18,7 +18,7 @@ class TradeManager:
         self.trades: list[dict] = []
         self.last_prices: dict[str, float] = {}
         self._used_signal_ids: set[str] = set()
-        self._create_lock = Lock()
+        self._create_lock = RLock()
         self.balance_usdt = self.trading_settings.initial_balance_usdt
 
     def restore_state(
@@ -211,6 +211,10 @@ class TradeManager:
         return signal_id[len(prefix):] if signal_id.startswith(prefix) else signal_id
 
     def on_price(self, symbol: str, price: float) -> list[dict]:
+        with self._create_lock:
+            return self._on_price_unlocked(symbol, price)
+
+    def _on_price_unlocked(self, symbol: str, price: float) -> list[dict]:
         if not isfinite(price) or price <= 0:
             raise ValueError("price must be a positive finite number")
         symbol = symbol.upper()
@@ -230,12 +234,20 @@ class TradeManager:
                     continue
                 trade["status"] = "open"
                 trade["opened_at"] = datetime.now(timezone.utc)
-                events.append({"event": "ENTRY_ACTIVATED", "trade": trade})
+                events.append({
+                    "event": "ENTRY_ACTIVATED", "trade": trade,
+                    "trigger_price": float(price),
+                    "fill_price": float(trade["entry_price"]),
+                    "price_source": "Bybit V5 linear ticker lastPrice",
+                })
 
             reason = self._exit_reason(trade, price)
             if reason is not None:
                 exit_price = price if reason == "STOP_LOSS" else trade["take_profit"]
-                events.append(self._close_trade(trade, exit_price, reason))
+                event = self._close_trade(trade, exit_price, reason)
+                event["trigger_price"] = float(price)
+                event["price_source"] = "Bybit V5 linear ticker lastPrice"
+                events.append(event)
         return events
 
     def cancel_pending_for_wall(
@@ -358,7 +370,7 @@ class TradeManager:
             profit_percent=(profit / trade["stake_usdt"] * 100),
         )
         self.balance_usdt += profit
-        return {"event": "TRADE_CLOSED", "trade": trade}
+        return {"event": "TRADE_CLOSED", "trade": trade, "fill_price": float(price)}
 
     def close_all(self) -> list[dict]:
         """Close open positions at last observed prices and cancel pending entries."""

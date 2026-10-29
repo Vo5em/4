@@ -40,6 +40,16 @@ class RuntimeController:
                 for key, value in self.engine._pending_persistence.items()
             }
             disabled_pair_events = []
+            if preserve_mode:
+                # Persisted pending entries belong to an earlier process/feed
+                # generation. Keep positions and balance, but rebuild all new
+                # entry decisions from a newly synchronized market snapshot.
+                for symbol in self.engine.pair_settings:
+                    disabled_pair_events.extend(
+                        self.engine.trade_manager.cancel_pending_for_symbol(
+                            symbol, "PROCESS_RESTARTED"
+                        )
+                    )
             for symbol, settings in self.engine.pair_settings.items():
                 if not settings.enabled:
                     disabled_pair_events.extend(

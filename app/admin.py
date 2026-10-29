@@ -121,6 +121,18 @@ async def edit_message_if_changed(message, text: str, reply_markup=None) -> bool
     return True
 
 
+async def _refresh_dashboard_after_action(callback, runtime: RuntimeController) -> None:
+    """A Telegram edit failure must not change an already committed engine action."""
+    if callback.message is None:
+        return
+    try:
+        await edit_message_if_changed(
+            callback.message, dashboard_text(runtime), reply_markup=kb.main
+        )
+    except Exception:
+        logger.exception("Could not refresh admin dashboard after state change")
+
+
 def _date_label(value) -> str:
     if value is None:
         return "нет данных"
@@ -134,6 +146,20 @@ def _algorithm_label(value: str) -> str:
         "stopped": "остановлен",
         "error": "ошибка",
     }.get(value, "нет данных")
+
+
+def _market_health_label(symbol: str, health: dict) -> str:
+    price_age = health.get("price_age_seconds")
+    value_age = health.get("price_value_age_seconds")
+    book_age = health.get("book_age_seconds")
+    synchronized = "да" if health.get("book_synchronized") else "нет"
+    if price_age is None or book_age is None:
+        return f"{symbol}: возраст данных нет данных / синхр. {synchronized}"
+    value_age_label = f"{value_age:.2f} с назад" if value_age is not None else "нет данных"
+    return (
+        f"{symbol}: цена {price_age:.2f} с; Last Price изменился {value_age_label}; "
+        f"стакан {book_age:.2f} с; синхр. {synchronized}"
+    )
 
 
 def _database_label(status: str) -> str:
@@ -166,6 +192,10 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
         if latest_error else "Последняя ошибка: нет"
     )
     price = engine.trade_manager.last_prices.get(symbol)
+    market_health = status.get("market_data_health", {}).get(symbol, {})
+    price_age = market_health.get("price_age_seconds")
+    price_value_age = market_health.get("price_value_age_seconds")
+    book_age = market_health.get("book_age_seconds")
     potential = metric.get("potential_wall_count")
     stable = metric.get("stable_wall_count")
     win_rate = (
@@ -200,6 +230,10 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
         f"доля прибыльных: {win_rate}; K/D {_format_ratio(stats['kd_ratio'], stats['wins'])}\n"
         f"Цена: {f'{price:g}' if price is not None else 'нет данных'}; обновлено "
         f"{_date_label(status['last_market_update_at'].get(symbol))}\n"
+        f"Свежесть: цена {f'{price_age:.2f} с' if price_age is not None else 'нет данных'}; "
+        f"последнее изменение Last Price {f'{price_value_age:.2f} с' if price_value_age is not None else 'нет данных'}; "
+        f"стакан {f'{book_age:.2f} с' if book_age is not None else 'нет данных'}; "
+        f"синхронизация {'да' if market_health.get('book_synchronized') else 'нет'}\n"
         f"Статус алгоритма: {_algorithm_label(status['algorithm_status'])}; "
         f"поток: {_feed_label(status['feed_status'].get(symbol, 'нет данных'))}\n"
         f"Причина отсутствия входа: {escape(engine.get_entry_block_reason(symbol))}\n"
@@ -214,6 +248,11 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"{symbol}: {_feed_label(feed)}"
         for symbol, feed in status["feed_status"].items()
     ) or "нет потоков"
+    market_health = status.get("market_data_health", {})
+    freshness = ", ".join(
+        _market_health_label(symbol, health)
+        for symbol, health in market_health.items()
+    ) or "нет данных"
     strategy_errors = status.get("strategy_errors", {})
     error_text = " | ".join(
         f"{symbol} {strategy_id}: {error_type}"
@@ -258,6 +297,7 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"Алгоритм: {_algorithm_label(status['algorithm_status'])}\n"
         f"Пары: {pairs}\n"
         f"Рыночные данные: {feeds}\n"
+        f"Возраст данных: {freshness}\n"
         f"Поиск и анализ стен: {analysis_status}\n"
         f"Последнее обновление данных: {_date_label(last_update)}\n"
         f"Ошибки потока: {feed_error_text}\n"
@@ -321,8 +361,7 @@ async def cancel_input(
     callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
 ) -> None:
     await state.clear()
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await _refresh_dashboard_after_action(callback, runtime)
     await callback.answer("Ввод отменён")
 
 
@@ -727,8 +766,7 @@ async def start_engine(
         message = str(error)
     except Exception:
         message = "Не удалось запустить движок: проверьте состояние конфигурации и базы данных."
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await _refresh_dashboard_after_action(callback, runtime)
     await callback.answer(message, show_alert=runtime.engine.mode == EngineMode.STOPPED)
 
 
@@ -747,8 +785,7 @@ async def pause_entries(
         message = str(error)
     except Exception:
         message = "Не удалось сохранить режим паузы в базе данных."
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await _refresh_dashboard_after_action(callback, runtime)
     await callback.answer(message, show_alert=runtime.engine.mode == EngineMode.STOPPED)
 
 
@@ -759,13 +796,12 @@ async def resume_entries(
     await state.clear()
     try:
         await runtime.resume_new_entries()
-        message = "Новые входы разрешены."
+        message = "Входы разрешены после получения свежих данных и пересчёта стакана."
     except RuntimeError as error:
         message = str(error)
     except Exception:
         message = "Не удалось сохранить режим работы в базе данных."
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await _refresh_dashboard_after_action(callback, runtime)
     await callback.answer(message, show_alert=runtime.engine.mode == EngineMode.STOPPED)
 
 
@@ -783,8 +819,7 @@ async def stop_engine(
         message = f"Остановка не завершена: {error}"
     except Exception:
         message = "Остановка не завершена: не удалось сохранить состояние в базе данных."
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await _refresh_dashboard_after_action(callback, runtime)
     await callback.answer(message, show_alert=runtime.engine.mode != EngineMode.STOPPED)
 
 
@@ -801,8 +836,7 @@ async def close_open_trades(
         message = f"Сделки не закрыты: {error}"
     except Exception:
         message = "Сделки не закрыты: не удалось сохранить состояние в базе данных."
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await _refresh_dashboard_after_action(callback, runtime)
     await callback.answer(message, show_alert="не закрыты" in message)
 
 

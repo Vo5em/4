@@ -5,6 +5,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from datetime import timedelta
 from math import nan
+from concurrent.futures import ThreadPoolExecutor
+from time import monotonic, time
 from unittest.mock import AsyncMock, patch
 from aiogram.types import Chat, Message, User
 
@@ -20,6 +22,11 @@ from script.market_data import (
     BYBIT_REST_URL,
     OrderbookDeltaBuffer,
     SnapshotRetryRequired,
+    PriceTick,
+    TradeEventCursor,
+    TickerPriceCursor,
+    _update_flow,
+    _update_ticker_price,
     _fetch_snapshot_while_buffering,
     analyze_synced_orderbook,
     apply_orderbook_delta,
@@ -54,6 +61,7 @@ from app.admin import (
     dayid,
     pair_settings_text,
     pair_statistics_text,
+    close_open_trades as close_open_trades_callback,
     edit_message_if_changed,
     set_pair_strategy,
 )
@@ -1070,6 +1078,7 @@ class AdminAuthorizationTests(unittest.TestCase):
         runtime = RuntimeController(engine)
         text = dashboard_text(runtime)
         self.assertIn("Алгоритм: остановлен", text)
+        self.assertIn("Возраст данных: BTCUSDT: возраст данных нет данных", text)
         self.assertIn("Поиск и анализ стен: остановлен", text)
         self.assertIn("Последнее обновление данных: нет данных", text)
         self.assertIn("PostgreSQL: не настроена", text)
@@ -1428,17 +1437,50 @@ class VirtualTradeTests(unittest.TestCase):
         self.assertEqual(trade["close_reason"], "STOP_LOSS")
         self.assertLess(trade["profit_usdt"], 0)
 
+    def test_short_trade_closes_on_take_profit_below_entry(self):
+        signal = dict(self.signal, wall_side="sell", wall_id="short-tp-wall")
+        trade = self.manager.create_trade(signal, self.settings)
+        self.manager.on_price("BTCUSDT", 100.0)
+
+        events = self.manager.on_price("BTCUSDT", trade["take_profit"])
+
+        self.assertEqual([event["event"] for event in events], ["TRADE_CLOSED"])
+        self.assertEqual(trade["close_reason"], "TAKE_PROFIT")
+        self.assertEqual(trade["exit_price"], trade["take_profit"])
+
+    def test_concurrent_price_updates_close_a_position_once(self):
+        trade = self.manager.create_trade(self.signal, self.settings)
+        self.manager.on_price("BTCUSDT", 100.0)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(
+                lambda _: self.manager.on_price("BTCUSDT", trade["take_profit"]),
+                range(16),
+            ))
+
+        closed_events = [
+            event for batch in results for event in batch
+            if event["event"] == "TRADE_CLOSED"
+        ]
+        self.assertEqual(len(closed_events), 1)
+        self.assertEqual(trade["close_reason"], "TAKE_PROFIT")
+
     def test_activation_take_profit_and_deduplication(self):
         trade = self.manager.create_trade(self.signal, self.settings)
         self.assertIsNotNone(trade)
         self.assertIsNone(self.manager.create_trade(self.signal, self.settings))
         events = self.manager.on_price("btcusdt", 100.0)
         self.assertEqual(events[0]["event"], "ENTRY_ACTIVATED")
+        self.assertEqual(events[0]["fill_price"], trade["entry_price"])
+        self.assertEqual(events[0]["trigger_price"], 100.0)
+        self.assertEqual(events[0]["price_source"], "Bybit V5 linear ticker lastPrice")
         self.assertIn("BTCUSDT", self.manager.last_prices)
 
-        self.manager.on_price("BTCUSDT", trade["take_profit"])
+        close_events = self.manager.on_price("BTCUSDT", trade["take_profit"])
         self.assertEqual(trade["close_reason"], "TAKE_PROFIT")
         self.assertGreater(trade["profit_usdt"], 0)
+        self.assertEqual(close_events[0]["trigger_price"], trade["take_profit"])
+        self.assertEqual(close_events[0]["fill_price"], trade["take_profit"])
 
     def test_statistics_include_unrealized_and_available_balance(self):
         self.manager.create_trade(self.signal, self.settings)
@@ -1646,6 +1688,14 @@ class EngineControlTests(unittest.TestCase):
         self.assertEqual(opened["status"], "open")
         self.assertEqual(repository.saved_trade_batches[-1][0][0]["status"], "cancelled")
 
+        engine.start()
+        close_events = engine.on_market_update(
+            "BTCUSDT", opened["take_profit"], [], price_updated=True
+        )
+        self.assertEqual(opened["status"], "closed")
+        self.assertEqual(opened["close_reason"], "TAKE_PROFIT")
+        self.assertIn("TRADE_CLOSED", [event["event"] for event in close_events])
+
     def test_add_pair_validates_persists_and_registers_symbol(self):
         repository = FakeRepository()
         engine = TradingEngine({}, repository=repository)
@@ -1695,6 +1745,256 @@ class EngineControlTests(unittest.TestCase):
 
         self.assertEqual(created, ["market-data-btcusdt"])
 
+
+class MarketFreshnessTests(unittest.TestCase):
+    @staticmethod
+    def make_engine():
+        class SignalStrategy:
+            strategy_id = "freshness_test"
+
+            def evaluate(self, context):
+                return [TradeSignal(
+                    strategy_id=self.strategy_id,
+                    symbol=context.symbol,
+                    wall_side="buy",
+                    wall_price=99.0,
+                    wall_id="freshness-wall",
+                    wall_size=10000.0,
+                    wall_ratio=100.0,
+                    entry_mode="market",
+                    entry_price=context.last_price,
+                )]
+
+        registry = StrategyRegistry()
+        registry.register(SignalStrategy())
+        engine = TradingEngine(
+            {"BTCUSDT": PairSettings("BTCUSDT")},
+            strategy_registry=registry,
+            enabled_strategies={"BTCUSDT": {"freshness_test"}},
+        )
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        return engine
+
+    @staticmethod
+    def record_market_health(engine, *, received_age=0.0, synchronized=True):
+        now_ms = int(time() * 1000)
+        now_mono = monotonic()
+        now = datetime.now(timezone.utc)
+        engine.record_price_market_data(
+            "BTCUSDT", event_time_ms=now_ms, message_time_ms=now_ms,
+            sequence=1, trade_id="trade-1",
+            received_monotonic=now_mono - received_age, received_at=now,
+            delivery_lag_ms=0,
+        )
+        engine.record_orderbook_market_data(
+            "BTCUSDT", message_time_ms=now_ms, cts_ms=now_ms,
+            sequence=1, update_id=1, received_monotonic=now_mono,
+            received_at=now, delivery_lag_ms=0,
+            synchronized=synchronized, generation=1,
+        )
+
+    def test_entries_are_blocked_when_price_data_is_stale(self):
+        engine = self.make_engine()
+        self.record_market_health(engine, received_age=2.0)
+
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+
+        self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
+        self.assertEqual(engine.trade_manager.trades, [])
+
+    def test_unsynchronized_book_blocks_new_entries(self):
+        engine = self.make_engine()
+        self.record_market_health(engine, synchronized=False)
+
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+
+        self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
+        self.assertEqual(engine.get_entry_block_reason("BTCUSDT"), "Локальный стакан не синхронизирован.")
+
+    def test_fresh_synchronized_tick_is_the_virtual_entry_price(self):
+        engine = self.make_engine()
+        self.record_market_health(engine)
+
+        events = engine.on_market_update("BTCUSDT", 100.125, [])
+
+        trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
+        self.assertEqual(trade["entry_price"], 100.125)
+        self.assertEqual(engine.trade_manager.last_prices.get("BTCUSDT"), 100.125)
+
+    def test_public_trade_batch_uses_last_accepted_trade_and_records_sequence(self):
+        cursor = TradeEventCursor()
+        flow = TradeFlow(window_seconds=10)
+        price = _update_flow(flow, {
+            "ts": 1002,
+            "data": [
+                {"T": 1000, "seq": 7, "i": "t1", "p": "100.0", "v": "1", "S": "Buy"},
+                {"T": 1001, "seq": 8, "i": "t2", "p": "100.1", "v": "2", "S": "Sell"},
+            ],
+        }, cursor)
+
+        self.assertEqual(price, 100.1)
+        self.assertEqual(cursor.latest.trade_id, "t2")
+        self.assertEqual(cursor.latest.sequence, 8)
+        self.assertEqual(flow.get_flow()["buy_volume_by_price_total"][100.0], 100.0)
+
+    def test_ticker_snapshot_and_delta_keep_price_current_and_expose_feed_age(self):
+        engine = self.make_engine()
+        cursor = TickerPriceCursor()
+        ts = int(time() * 1000)
+        first = _update_ticker_price(
+            {"ts": ts, "cs": 11, "data": {"lastPrice": "100.25"}},
+            cursor, engine, "BTCUSDT",
+        )
+        heartbeat = _update_ticker_price(
+            {"ts": ts + 100, "cs": 12, "data": {"bid1Price": "100.2"}},
+            cursor, engine, "BTCUSDT",
+        )
+
+        self.assertEqual(first, (100.25, True))
+        self.assertEqual(heartbeat, (100.25, False))
+        health = engine.get_market_data_health("BTCUSDT")
+        self.assertTrue(health["price_fresh"])
+        self.assertLess(health["price_age_seconds"], 0.2)
+
+    def test_open_position_continues_to_be_managed_while_entries_are_paused(self):
+        engine = self.make_engine()
+        self.record_market_health(engine)
+        created = engine.on_market_update("BTCUSDT", 100.0, [])
+        trade = next(event["trade"] for event in created if event["event"] == "TRADE_CREATED")
+        engine.pause_new_entries()
+        self.record_market_health(engine)
+
+        events = engine.on_market_update("BTCUSDT", 98.0, [])
+
+        self.assertEqual(trade["status"], "closed")
+        self.assertEqual(trade["close_reason"], "STOP_LOSS")
+        self.assertIn("TRADE_CLOSED", [event["event"] for event in events])
+
+    def test_admin_close_is_refused_without_fresh_price_metadata(self):
+        engine = self.make_engine()
+        created = engine.on_market_update("BTCUSDT", 100.0, [])
+        trade = next(event["trade"] for event in created if event["event"] == "TRADE_CREATED")
+        trade["status"] = "open"
+        engine.trade_manager.last_prices["BTCUSDT"] = 100.0
+
+        with self.assertRaisesRegex(RuntimeError, "stale market prices"):
+            run_immediate(engine.close_open_trades())
+
+        self.assertEqual(trade["status"], "open")
+
+    def test_telegram_refresh_error_does_not_undo_persisted_close(self):
+        class FakeState:
+            async def clear(self):
+                return None
+
+        class FakeMessage:
+            text = None
+            reply_markup = None
+
+            async def edit_text(self, text, reply_markup=None):
+                raise RuntimeError("telegram edit failed")
+
+        class FakeCallback:
+            message = FakeMessage()
+
+            async def answer(self, text, show_alert=False):
+                self.answer_text = text
+
+        engine = self.make_engine()
+        self.record_market_health(engine)
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
+        callback = FakeCallback()
+
+        run_immediate(close_open_trades_callback(
+            callback, RuntimeController(engine), FakeState()
+        ))
+
+        self.assertEqual(trade["status"], "closed")
+        self.assertIn("Закрыто открытых", callback.answer_text)
+
+    def test_resume_ignores_pre_cutoff_trade_event(self):
+        engine = self.make_engine()
+        engine.pause_new_entries()
+        engine.resume_new_entries()
+        cutoff = engine.entry_event_cutoff_ms["BTCUSDT"]
+        self.record_market_health(engine)
+        engine._market_health("BTCUSDT")["price_event_time_ms"] = cutoff - 1
+
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+
+        self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
+
+    def test_trade_cursor_deduplicates_and_rejects_out_of_order_events(self):
+        cursor = TradeEventCursor()
+        base = dict(
+            price=100.0, message_time_ms=1000, sequence=10,
+            received_monotonic=1.0,
+            received_at=datetime.fromtimestamp(1, tz=timezone.utc),
+            delivery_lag_ms=0.0,
+        )
+        first = PriceTick(event_time_ms=100, trade_id="first", **base)
+        self.assertTrue(cursor.accept(first))
+        self.assertFalse(cursor.accept(first))
+        older = PriceTick(event_time_ms=99, trade_id="older", **base)
+        self.assertFalse(cursor.accept(older))
+        self.assertEqual(cursor.latest.trade_id, "first")
+
+    def test_book_only_refresh_does_not_reuse_old_price_for_stop_management(self):
+        engine = self.make_engine()
+        self.record_market_health(engine)
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
+        trade["status"] = "open"
+        engine._market_health("BTCUSDT")["price_received_monotonic"] = monotonic() - 2.0
+        engine.record_orderbook_market_data(
+            "BTCUSDT", message_time_ms=int(time() * 1000), cts_ms=int(time() * 1000),
+            sequence=2, update_id=2, received_monotonic=monotonic(),
+            received_at=datetime.now(timezone.utc), delivery_lag_ms=0,
+            synchronized=True, generation=1,
+        )
+
+        events = engine.on_market_update("BTCUSDT", 90.0, [], price_updated=False)
+
+        self.assertNotIn("TRADE_CLOSED", [event["event"] for event in events])
+        self.assertEqual(trade["status"], "open")
+
+
+class EngineControlContinuationTests(unittest.TestCase):
+    def test_restart_cancels_old_pending_plan_but_keeps_open_trade_and_balance(self):
+        settings = PairSettings("BTCUSDT", max_open_trades=3)
+        engine = TradingEngine({"BTCUSDT": settings})
+        pending = engine.trade_manager.create_trade({
+            "strategy_id": "stable_wall_v1", "symbol": "BTCUSDT",
+            "wall_side": "buy", "wall_price": 100.0,
+            "wall_id": "restart-pending", "wall_size": 1000.0,
+            "wall_ratio": 900.0,
+        }, settings)
+        opened = engine.trade_manager.create_trade({
+            "strategy_id": "stable_wall_v1", "symbol": "BTCUSDT",
+            "wall_side": "sell", "wall_price": 101.0,
+            "wall_id": "restart-open", "wall_size": 1000.0,
+            "wall_ratio": 900.0,
+        }, settings)
+        engine.trade_manager.on_price("BTCUSDT", 101.0)
+        balance = engine.trade_manager.balance_usdt
+        engine.mode = EngineMode.ENTRIES_PAUSED
+        runtime = RuntimeController(engine)
+
+        def fake_create_task(coroutine, *, name):
+            coroutine.close()
+            return FakeTask()
+
+        with patch("app.runtime.asyncio.create_task", side_effect=fake_create_task):
+            run_immediate(runtime.start(preserve_mode=True))
+
+        self.assertEqual(pending["status"], "cancelled")
+        self.assertEqual(pending["close_reason"], "PROCESS_RESTARTED")
+        self.assertEqual(opened["status"], "open")
+        self.assertEqual(engine.trade_manager.balance_usdt, balance)
+        self.assertEqual(engine.mode, EngineMode.ENTRIES_PAUSED)
+
     def test_add_pair_rejects_invalid_and_duplicate_symbols(self):
         runtime = RuntimeController(TradingEngine({}))
         with self.assertRaises(ValueError):
@@ -1737,6 +2037,7 @@ class EngineControlTests(unittest.TestCase):
         self.assertEqual(pending["status"], "cancelled")
         self.assertEqual(engine.mode, EngineMode.ENTRIES_PAUSED)
         engine.on_market_update("BTCUSDT", 100.01, [])
+        MarketFreshnessTests.record_market_health(engine)
 
         stop = engine.stop_all()
         with patch("script.engine.asyncio.current_task", return_value=None):
@@ -1828,6 +2129,8 @@ class EngineControlTests(unittest.TestCase):
         )
         runtime = RuntimeController(engine)
 
+        MarketFreshnessTests.record_market_health(engine)
+
         events = run_immediate(runtime.close_open_trades())
 
         self.assertEqual([event["event"] for event in events], ["TRADE_CLOSED"])
@@ -1859,6 +2162,7 @@ class EngineControlTests(unittest.TestCase):
             pair,
         )
         run_immediate(engine.process_market_update("BTCUSDT", 100.0, []))
+        MarketFreshnessTests.record_market_health(engine)
         repository.fail_trade_saves = True
         runtime = RuntimeController(engine)
         balance_before = engine.trade_manager.balance_usdt
