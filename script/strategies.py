@@ -242,7 +242,7 @@ class BounceStrategy:
                 wall_side=wall["side"], wall_price=level, wall_id=wall_id,
                 wall_size=float(wall["current_size"]), wall_ratio=float(wall.get("wall_ratio", 0)),
                 side=side, entry_price=price, stop_loss=levels[0], take_profit=levels[1],
-                entry_mode="market",
+                entry_mode="limit",
             ))
         return [signal for signal in signals if nearest.get(signal.wall_side) == signal.wall_id]
 
@@ -323,7 +323,7 @@ class BreakoutStrategy:
                 wall_size=float(wall.get("current_size", wall.get("initial_size", 0))),
                 wall_ratio=float(wall.get("wall_ratio", 0)), side=side,
                 entry_price=context.last_price, stop_loss=levels[0], take_profit=levels[1],
-                entry_mode="market",
+                entry_mode="limit",
             ))
         return [signal for signal in signals if nearest.get(signal.wall_side) == signal.wall_id]
 

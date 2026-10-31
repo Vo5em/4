@@ -699,9 +699,28 @@ class WallStrategyTests(unittest.TestCase):
         trade = manager.create_trade(signal, self.settings)
         self.assertEqual(trade["side"], "long")
         self.assertEqual(trade["strategy_id"], BOUNCE_STRATEGY_ID)
+        self.assertEqual(trade["status"], "pending")
+        self.assertIsNone(trade["opened_at"])
+        self.assertIsNone(manager.create_trade(signal, self.settings))
+        manager.on_price("BTCUSDT", signal.entry_price)
         self.assertEqual(trade["status"], "open")
         self.assertIsNotNone(trade["opened_at"])
-        self.assertIsNone(manager.create_trade(signal, self.settings))
+
+    def test_breakout_creates_pending_then_activates_on_price_confirmation(self):
+        strategy = BreakoutStrategy()
+        wall = self.wall("sell")
+        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 10, [wall])), [])
+        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 12, [wall])), [])
+        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 14, [wall])), [])
+        signal, = strategy.evaluate(self.context(strategy, 100.02, 15.1, [wall]))
+        manager = TradeManager(TradingSettings(stake_usdt=10, initial_balance_usdt=100))
+
+        trade = manager.create_trade(signal, self.settings)
+
+        self.assertEqual(trade["status"], "pending")
+        self.assertIsNone(trade["opened_at"])
+        self.assertEqual(manager.on_price("BTCUSDT", signal.entry_price)[0]["event"], "ENTRY_ACTIVATED")
+        self.assertEqual(trade["status"], "open")
 
     def test_one_wall_does_not_create_conflicting_strategy_trades(self):
         manager = TradeManager(TradingSettings(stake_usdt=10, initial_balance_usdt=100))
