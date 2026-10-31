@@ -1,7 +1,9 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+from math import isfinite
 from time import monotonic, time
 
 from .settings import PairSettings, TradingSettings
@@ -102,6 +104,10 @@ class TradingEngine:
                 "price_event_time_ms": None,
                 "price_value_updated_at_ms": None,
                 "price_value_updated_monotonic": None,
+                "price_value": None,
+                "price_source": None,
+                "price_connection_generation": None,
+                "active_connection_generation": None,
                 "price_message_time_ms": None,
                 "price_sequence": None,
                 "price_trade_id": None,
@@ -253,6 +259,10 @@ class TradingEngine:
                 "price_event_time_ms": None,
                 "price_value_updated_at_ms": None,
                 "price_value_updated_monotonic": None,
+                "price_value": None,
+                "price_source": None,
+                "price_connection_generation": None,
+                "active_connection_generation": None,
                 "price_message_time_ms": None,
                 "price_sequence": None,
                 "price_trade_id": None,
@@ -273,6 +283,7 @@ class TradingEngine:
         self, symbol: str, *, event_time_ms: int, message_time_ms: int,
         sequence: int | None, trade_id: str, received_monotonic: float,
         received_at: datetime, delivery_lag_ms: float,
+        price_value: float, source: str, connection_generation: int,
         value_updated_at_ms: int | None = None,
         value_updated_monotonic: float | None = None,
     ) -> None:
@@ -285,6 +296,9 @@ class TradingEngine:
             price_sequence=sequence,
             price_trade_id=trade_id,
             price_delivery_lag_ms=max(0.0, float(delivery_lag_ms)),
+            price_value=float(price_value),
+            price_source=source,
+            price_connection_generation=connection_generation,
         )
         if value_updated_at_ms is not None:
             health["price_value_updated_at_ms"] = int(value_updated_at_ms)
@@ -307,10 +321,16 @@ class TradingEngine:
             book_delivery_lag_ms=max(0.0, float(delivery_lag_ms)),
             book_synchronized=bool(synchronized),
             connection_generation=generation,
+            active_connection_generation=generation,
         )
 
-    def mark_orderbook_unsynchronized(self, symbol: str) -> None:
-        self._market_health(symbol)["book_synchronized"] = False
+    def mark_orderbook_unsynchronized(
+        self, symbol: str, generation: int | None = None
+    ) -> None:
+        health = self._market_health(symbol)
+        health["book_synchronized"] = False
+        if generation is not None:
+            health["active_connection_generation"] = generation
 
     def get_market_data_health(self, symbol: str) -> dict:
         health = dict(self._market_health(symbol))
@@ -335,6 +355,10 @@ class TradingEngine:
             price_age is not None
             and price_age <= MARKET_PRICE_STALE_AFTER_SECONDS
             and (health["price_delivery_lag_ms"] or 0) <= MARKET_PRICE_STALE_AFTER_SECONDS * 1000
+            and health["price_source"] == MARKET_PRICE_SOURCE
+            and health["price_value"] is not None
+            and health["price_connection_generation"] is not None
+            and health["price_connection_generation"] == health["active_connection_generation"]
         )
         health["book_fresh"] = (
             book_age is not None
@@ -344,6 +368,7 @@ class TradingEngine:
         health["fresh"] = (
             health["price_fresh"] and health["book_fresh"]
             and health["book_synchronized"]
+            and health["connection_generation"] == health["active_connection_generation"]
         )
         health["exchange_price_age_seconds"] = (
             max(0.0, now_ms - health["price_event_time_ms"]) / 1000
@@ -428,11 +453,18 @@ class TradingEngine:
 
     def _require_fresh_exit_prices(self) -> None:
         open_symbols = {trade["symbol"] for trade in self.trade_manager.get_open_trades()}
-        stale = [
-            symbol for symbol in sorted(open_symbols)
-            if not self._has_market_data_metadata(symbol)
-            or not self.get_market_data_health(symbol)["price_fresh"]
-        ]
+        stale = []
+        for symbol in sorted(open_symbols):
+            health = self.get_market_data_health(symbol)
+            manager_price = self.trade_manager.last_prices.get(symbol)
+            if (
+                not self._has_market_data_metadata(symbol)
+                or not health["price_fresh"]
+                or manager_price is None
+                or health.get("price_value") is None
+                or Decimal(str(manager_price)) != Decimal(str(health["price_value"]))
+            ):
+                stale.append(symbol)
         if stale:
             raise RuntimeError(
                 "Cannot close virtual positions using stale market prices for: "
@@ -502,17 +534,19 @@ class TradingEngine:
                 price_source = MARKET_PRICE_SOURCE
             logger.info(
                 "%s %s trade_id=%s signal_id=%s strategy=%s side=%s wall=%s@%s "
-                "entry=%s trigger=%s fill=%s sl=%s tp=%s source=%s "
-                "event_time_ms=%s received_at=%s processed_at=%s price_age=%s "
+                "entry=%s trigger=%s fill=%s close_price=%s sl=%s tp=%s source=%s "
+                "event_time_ms=%s received_at=%s closed_at=%s processed_at=%s price_age=%s "
                 "book_age=%s synced=%s generation=%s mode=%s reason=%s",
                 symbol, event_type, trade.get("id"),
                 trade.get("signal_id"), trade.get("strategy_id"),
                 trade.get("side"), trade.get("wall_side"), trade.get("wall_price"),
                 trade.get("entry_price"), event.get("trigger_price"),
                 fill_price,
+                trade.get("exit_price") if event_type == "TRADE_CLOSED" else None,
                 trade.get("stop_loss"), trade.get("take_profit"),
                 price_source or "n/a",
                 health.get("price_event_time_ms"), health.get("price_received_at"),
+                trade.get("closed_at") if event_type == "TRADE_CLOSED" else None,
                 self._utc_now().isoformat(timespec="milliseconds"),
                 health.get("price_age_seconds"), health.get("book_age_seconds"),
                 health.get("book_synchronized"), health.get("connection_generation"),
@@ -670,13 +704,37 @@ class TradingEngine:
         symbol = symbol.upper()
         if self.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
             return []
+        try:
+            numeric_price = float(last_price)
+            decimal_price = Decimal(str(last_price))
+        except (TypeError, ValueError, InvalidOperation):
+            logger.warning("%s ignoring invalid market price %r", symbol, last_price)
+            return []
+        if not isfinite(numeric_price) or decimal_price <= 0:
+            logger.warning("%s ignoring invalid market price %r", symbol, last_price)
+            return []
 
         events = []
         settings = self.pair_settings.get(symbol)
         health_known = self._has_market_data_metadata(symbol)
         health = self.get_market_data_health(symbol) if health_known else None
-        accepted_price_update = bool(
-            price_updated and (health is None or health["price_fresh"])
+        health_matches_price = False
+        if health is not None and health.get("price_value") is not None:
+            try:
+                health_matches_price = (
+                    decimal_price == Decimal(str(health["price_value"]))
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                health_matches_price = False
+        confirmed_price_update = bool(
+            price_updated and health is not None
+            and health["price_fresh"] and health_matches_price
+        )
+        # Direct strategy unit callers may supply a synthetic price without
+        # feed metadata. Such calls can exercise strategy logic, but never
+        # manage or close a live position.
+        strategy_price_valid = confirmed_price_update or (
+            price_updated and health is None
         )
         if settings is not None and not settings.enabled:
             events.extend(
@@ -712,15 +770,49 @@ class TradingEngine:
                     "WALL_NO_LONGER_QUALIFIES",
                 )
             )
-        # Do not reuse the last trade price for book-only refreshes. A stop or
-        # target is evaluated only once for each accepted fresh publicTrade tick.
-        if accepted_price_update:
+        if confirmed_price_update:
+            for trade in self.trade_manager.trades:
+                if trade["symbol"] == symbol and trade["status"] in {"pending", "open"}:
+                    logger.debug(
+                        "trade monitor check trade_id=%s symbol=%s side=%s market_price=%s "
+                        "tp=%s sl=%s event_ts=%s age=%.3fs source=%s result=checking",
+                        trade.get("id", trade.get("signal_id")), symbol, trade["side"],
+                        last_price, trade["take_profit"], trade["stop_loss"],
+                        health.get("price_event_time_ms"), health["price_age_seconds"],
+                        health.get("price_source"),
+                    )
             events.extend(self.trade_manager.on_price(symbol, last_price))
+        elif price_updated and any(
+            trade["symbol"] == symbol and trade["status"] == "open"
+            for trade in self.trade_manager.trades
+        ):
+            now = monotonic()
+            warning_key = f"{symbol}:open-trade-price-rejected"
+            last_warn = self._stale_data_warning_at.get(warning_key, 0.0)
+            if now - last_warn >= 30:
+                reason = (
+                    "missing market metadata" if health is None else
+                    "input price does not match the confirmed ticker" if not health_matches_price else
+                    "stale price or old WebSocket generation"
+                )
+                logger.warning(
+                    "%s open trade check skipped: %s; event_ts=%s age=%s source=%s "
+                    "price=%s confirmed_price=%s generation=%s/%s",
+                    symbol, reason,
+                    health.get("price_event_time_ms") if health else None,
+                    health.get("price_age_seconds") if health else None,
+                    health.get("price_source") if health else None,
+                    last_price,
+                    health.get("price_value") if health else None,
+                    health.get("price_connection_generation") if health else None,
+                    health.get("active_connection_generation") if health else None,
+                )
+                self._stale_data_warning_at[warning_key] = now
         if settings is None or not settings.enabled or self.mode != EngineMode.RUNNING:
             return events
         if self.repository is not None and self._pending_persistence:
             return events
-        if not accepted_price_update or (health is not None and not health["fresh"]):
+        if not strategy_price_valid or (health is not None and not health["fresh"]):
             if health is not None and not health["fresh"]:
                 now = monotonic()
                 last_warn = self._stale_data_warning_at.get(symbol, 0.0)

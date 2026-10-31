@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from math import isfinite
 from threading import RLock
 
@@ -215,10 +216,15 @@ class TradeManager:
             return self._on_price_unlocked(symbol, price)
 
     def _on_price_unlocked(self, symbol: str, price: float) -> list[dict]:
-        if not isfinite(price) or price <= 0:
+        try:
+            decimal_price = Decimal(str(price))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("price must be a positive finite number") from None
+        if not decimal_price.is_finite() or decimal_price <= 0:
             raise ValueError("price must be a positive finite number")
+        numeric_price = float(decimal_price)
         symbol = symbol.upper()
-        self.last_prices[symbol] = float(price)
+        self.last_prices[symbol] = numeric_price
         events = []
         for trade in self.trades:
             if trade["symbol"] != symbol or trade["status"] not in {"pending", "open"}:
@@ -226,9 +232,9 @@ class TradeManager:
 
             if trade["status"] == "pending":
                 triggered = (
-                    price <= trade["entry_price"]
+                    decimal_price <= Decimal(str(trade["entry_price"]))
                     if trade["side"] == "long"
-                    else price >= trade["entry_price"]
+                    else decimal_price >= Decimal(str(trade["entry_price"]))
                 )
                 if not triggered:
                     continue
@@ -236,16 +242,18 @@ class TradeManager:
                 trade["opened_at"] = datetime.now(timezone.utc)
                 events.append({
                     "event": "ENTRY_ACTIVATED", "trade": trade,
-                    "trigger_price": float(price),
+                    "trigger_price": numeric_price,
                     "fill_price": float(trade["entry_price"]),
                     "price_source": "Bybit V5 linear ticker lastPrice",
                 })
 
-            reason = self._exit_reason(trade, price)
+            reason = self._exit_reason(trade, decimal_price)
             if reason is not None:
-                exit_price = price if reason == "STOP_LOSS" else trade["take_profit"]
-                event = self._close_trade(trade, exit_price, reason)
-                event["trigger_price"] = float(price)
+                # The ticker event that crossed the boundary is the virtual fill.
+                # Persist it as close_price even when it gaps past TP/SL.
+                event = self._close_trade(trade, numeric_price, reason)
+                event["trigger_price"] = numeric_price
+                event["close_price"] = numeric_price
                 event["price_source"] = "Bybit V5 linear ticker lastPrice"
                 events.append(event)
         return events
@@ -341,15 +349,18 @@ class TradeManager:
 
     @staticmethod
     def _exit_reason(trade: dict, price: float) -> str | None:
+        market_price = Decimal(str(price))
+        take_profit = Decimal(str(trade["take_profit"]))
+        stop_loss = Decimal(str(trade["stop_loss"]))
         if trade["side"] == "long":
-            if price <= trade["stop_loss"]:
+            if market_price <= stop_loss:
                 return "STOP_LOSS"
-            if price >= trade["take_profit"]:
+            if market_price >= take_profit:
                 return "TAKE_PROFIT"
         else:
-            if price >= trade["stop_loss"]:
+            if market_price >= stop_loss:
                 return "STOP_LOSS"
-            if price <= trade["take_profit"]:
+            if market_price <= take_profit:
                 return "TAKE_PROFIT"
         return None
 
