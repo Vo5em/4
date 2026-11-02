@@ -204,7 +204,7 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "exit_fee_usdt": getattr(row, "exit_fee_usdt", None),
         "gross_pnl_usdt": getattr(row, "gross_pnl_usdt", None),
         "fee_rate": getattr(row, "fee_rate", None),
-        "accounting_version": getattr(row, "accounting_version", 0) or 0,
+        "accounting_version": getattr(row, "accounting_version", None) or 1,
         # Older rows have no accounting metadata; keep their recorded PnL and
         # allow TradeManager's legacy stake-as-notional/zero-fee fallback.
         "entry_fee": getattr(row, "entry_fee_usdt", None) or 0.0,
@@ -226,6 +226,30 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "opened_at": row.opened_at,
         "closed_at": row.closed_at,
     }
+
+
+_VIRTUAL_TRADE_FIELDS = (
+    "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
+    "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
+    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
+    "gross_pnl_usdt", "fee_rate", "accounting_version", "stop_loss",
+    "take_profit", "entry_fill_price", "wall_id", "entry_trigger_direction",
+    "entry_armed", "exit_price", "profit_usdt", "close_reason",
+    "profit_percent", "created_at", "opened_at", "closed_at",
+)
+
+
+def _virtual_trade_values(trade: dict, *, is_insert: bool = False) -> dict:
+    """Build ORM values without turning an omitted partial field into NULL."""
+    values = {key: trade[key] for key in _VIRTUAL_TRADE_FIELDS if key in trade}
+    if values.get("accounting_version") is None:
+        # `None` is not a valid accounting schema version. On UPDATE it means
+        # the caller has no version to change; on INSERT use the current model.
+        values.pop("accounting_version", None)
+    if is_insert and "accounting_version" not in values:
+        # Version 1 is the project's current margin/fee accounting model.
+        values["accounting_version"] = 1
+    return values
 
 
 async def save_runtime_state(
@@ -269,18 +293,7 @@ async def save_trades(
             row = await session.scalar(
                 select(VirtualTrade).where(VirtualTrade.signal_id == trade["signal_id"])
             )
-            values = {
-                key: trade.get(key)
-                for key in (
-                    "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
-                    "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
-                    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
-                    "gross_pnl_usdt", "fee_rate", "accounting_version",
-                    "stop_loss", "take_profit", "entry_fill_price", "wall_id",
-                    "entry_trigger_direction", "entry_armed", "exit_price", "profit_usdt", "close_reason",
-                    "profit_percent", "created_at", "opened_at", "closed_at",
-                )
-            }
+            values = _virtual_trade_values(trade, is_insert=row is None)
             if row is None:
                 session.add(VirtualTrade(**values))
             else:
@@ -389,18 +402,7 @@ async def save_enabled_strategies_with_trades(
                     VirtualTrade.signal_id == trade["signal_id"]
                 )
             )
-            values = {
-                key: trade.get(key)
-                for key in (
-                    "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
-                    "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
-                    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
-                    "gross_pnl_usdt", "fee_rate", "accounting_version",
-                    "stop_loss", "take_profit", "entry_fill_price", "wall_id",
-                    "entry_trigger_direction", "entry_armed", "exit_price", "profit_usdt", "close_reason",
-                    "profit_percent", "created_at", "opened_at", "closed_at",
-                )
-            }
+            values = _virtual_trade_values(trade, is_insert=row is None)
             if row is None:
                 session.add(VirtualTrade(**values))
             else:
@@ -426,18 +428,7 @@ async def save_pair_settings_with_trades(
             row = await session.scalar(
                 select(VirtualTrade).where(VirtualTrade.signal_id == trade["signal_id"])
             )
-            values = {
-                key: trade.get(key)
-                for key in (
-                    "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
-                    "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
-                    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
-                    "gross_pnl_usdt", "fee_rate", "accounting_version",
-                    "stop_loss", "take_profit", "entry_fill_price", "wall_id",
-                    "entry_trigger_direction", "entry_armed", "exit_price", "profit_usdt", "close_reason",
-                    "profit_percent", "created_at", "opened_at", "closed_at",
-                )
-            }
+            values = _virtual_trade_values(trade, is_insert=row is None)
             if row is None:
                 session.add(VirtualTrade(**values))
             else:

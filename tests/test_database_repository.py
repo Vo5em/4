@@ -541,6 +541,61 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertTrue(row.entry_armed)
         self.assertEqual(row.entry_fill_price, 100.01)
 
+    def test_partial_trade_update_preserves_accounting_version_and_insert_defaults_it(self):
+        existing = VirtualTrade(
+            signal_id="old-plan", strategy_id="bounce", symbol="BTCUSDT",
+            side="long", wall_side="buy", status="pending", wall_price=100,
+            wall_size=1000, stake_usdt=10, entry_price=100.02,
+            stop_loss=99.98, take_profit=100.06, accounting_version=1,
+        )
+
+        class ReplacementSession(FakeSession):
+            def __init__(self):
+                super().__init__({VirtualTrade: [existing]})
+                self.trade_selects = 0
+
+            async def scalar(self, statement):
+                self.trade_selects += 1
+                return existing if self.trade_selects == 1 else None
+
+        session = ReplacementSession()
+        cancelled = {
+            "signal_id": "old-plan", "status": "cancelled",
+            "close_reason": "PLAN_REPLACED",
+        }
+        replacement = {
+            "signal_id": "new-plan", "strategy_id": "bounce",
+            "symbol": "BTCUSDT", "side": "long", "wall_side": "buy",
+            "status": "pending", "wall_price": 100.01, "wall_size": 1100,
+            "stake_usdt": 10, "entry_price": 100.03, "stop_loss": 99.99,
+            "take_profit": 100.07,
+        }
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_trades([cancelled, replacement], 100))
+
+        self.assertEqual(existing.status, "cancelled")
+        self.assertEqual(existing.close_reason, "PLAN_REPLACED")
+        self.assertEqual(existing.accounting_version, 1)
+        inserted = session.rows[VirtualTrade][1]
+        self.assertEqual(inserted.accounting_version, 1)
+        self.assertEqual(session.commits, 1)
+
+    def test_trade_value_mapping_omits_unprovided_accounting_version_for_update(self):
+        values = repository._virtual_trade_values(
+            {"signal_id": "partial", "status": "cancelled"}
+        )
+        self.assertNotIn("accounting_version", values)
+        self.assertNotIn(
+            "accounting_version",
+            repository._virtual_trade_values({"accounting_version": None}),
+        )
+        self.assertEqual(
+            repository._virtual_trade_values({"signal_id": "new"}, is_insert=True)[
+                "accounting_version"
+            ],
+            1,
+        )
+
     def test_pair_settings_and_cancelled_trade_commit_together(self):
         runtime_state = RuntimeState(
             id=1,

@@ -27,6 +27,11 @@ class TradeManager:
     ) -> None:
         self.trades = [dict(trade) for trade in trades]
         for trade in self.trades:
+            if trade.get("accounting_version") is None:
+                # Existing deployed rows are initialized as version 1 by the
+                # additive schema migration; this also covers old in-memory
+                # fixtures without changing their recorded PnL.
+                trade["accounting_version"] = 1
             # Rows written before margin accounting used stake as their whole
             # notional and did not charge fees. Preserve that interpretation;
             # most importantly, leave recorded historical profit untouched.
@@ -248,6 +253,7 @@ class TradeManager:
             "exit_fee_usdt": 0.0,
             "gross_pnl": 0.0,
             "gross_pnl_usdt": 0.0,
+            "accounting_version": 1,
             "net_pnl": 0.0,
             "margin_return_pct": 0.0,
             "entry_price": entry_price,

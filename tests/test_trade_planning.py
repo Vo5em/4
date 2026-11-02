@@ -8,6 +8,16 @@ from script.trade_levels import calculate_trade_levels
 from script.trade_manager import TradeManager
 
 
+def run_immediate(coroutine):
+    try:
+        coroutine.send(None)
+    except StopIteration as completed:
+        return completed.value
+    finally:
+        coroutine.close()
+    raise AssertionError("Coroutine unexpectedly suspended in synchronous test")
+
+
 class TradeLevelPolicyTests(unittest.TestCase):
     def test_four_approved_scenarios_are_tick_aligned_and_directional(self):
         cases = (
@@ -82,6 +92,25 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             "ETHUSDT", price, walls, (), walls, price_updated=price_updated
         )
 
+    class Repository:
+        def __init__(self):
+            self.fail = False
+            self.trade_batches = []
+
+        async def save_trades(self, trades, balance_usdt, engine_mode=None):
+            if self.fail:
+                raise OSError("simulated PostgreSQL write failure")
+            self.trade_batches.append((trades, balance_usdt, engine_mode))
+
+        async def save_market_price(self, symbol, price):
+            return None
+
+    @staticmethod
+    async def process_update(engine, price, walls):
+        return await engine.process_market_update(
+            "ETHUSDT", price, walls, (), walls,
+        )
+
     def test_stable_bid_and_ask_create_two_pending_plans_without_confirmation(self):
         engine, _ = self.make_engine()
         walls = [
@@ -95,6 +124,8 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         plans = {trade["wall_side"]: trade for trade in pending}
         self.assertEqual(plans["buy"]["side"], "long")
         self.assertEqual(plans["sell"]["side"], "short")
+        self.assertEqual(plans["buy"]["accounting_version"], 1)
+        self.assertEqual(plans["sell"]["accounting_version"], 1)
         self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 60)
 
     def test_nearest_wall_replaces_plan_and_unchanged_plan_is_not_recreated(self):
@@ -112,6 +143,63 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(current[0]["wall_id"], "ETHUSDT:buy:100:near")
         self.assertEqual(first["status"], "cancelled")
         self.assertEqual(first["close_reason"], "PLAN_REPLACED")
+
+    def test_pending_replacement_is_one_database_batch_and_preserves_reserve(self):
+        engine, _ = self.make_engine()
+        repository = self.Repository()
+        engine.repository = repository
+        engine.start()
+        far = self.wall("buy", 99.0, "persisted-far")
+        near = self.wall("buy", 100.0, "persisted-near")
+
+        async def updates():
+            await self.process_update(engine, 100.5, [far])
+            original_balance = engine.trade_manager.balance_usdt
+            original_pending, = engine.trade_manager.get_pending_trades()
+            events = await self.process_update(engine, 100.5, [far, near])
+            return original_balance, original_pending, events
+
+        # Drive both updates in the same coroutine so the engine's asyncio
+        # locks remain bound to one event loop on Windows.
+        original_balance, original_pending, events = run_immediate(updates())
+
+        self.assertEqual(len(repository.trade_batches), 2)
+        replacement_batch = repository.trade_batches[-1][0]
+        self.assertEqual(
+            [(row["signal_id"], row["status"], row.get("close_reason"))
+             for row in replacement_batch],
+            [(original_pending["signal_id"], "cancelled", "PLAN_REPLACED"),
+             (next(row["trade"]["signal_id"] for row in events
+                   if row["event"] == "TRADE_CREATED"), "pending", None)],
+        )
+        self.assertEqual(repository.trade_batches[-1][1], original_balance)
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 30)
+
+    def test_failed_postgres_replacement_rolls_back_trade_and_reserved_balance(self):
+        engine, _ = self.make_engine()
+        repository = self.Repository()
+        engine.repository = repository
+        engine.start()
+        far = self.wall("buy", 99.0, "rollback-far")
+        near = self.wall("buy", 100.0, "rollback-near")
+        async def updates():
+            await self.process_update(engine, 100.5, [far])
+            initial_balance = engine.trade_manager.balance_usdt
+            original_pending, = engine.trade_manager.get_pending_trades()
+            repository.fail = True
+            events = await self.process_update(engine, 100.5, [far, near])
+            return initial_balance, original_pending, events
+
+        initial_balance, original_pending, events = run_immediate(updates())
+
+        restored_pending, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(events, [])
+        self.assertEqual(restored_pending["signal_id"], original_pending["signal_id"])
+        self.assertEqual(restored_pending["wall_id"], original_pending["wall_id"])
+        self.assertEqual(engine.trade_manager.balance_usdt, initial_balance)
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 30)
+        self.assertEqual(engine.get_status()["persistence_pending"], 0)
+        self.assertEqual(len(repository.trade_batches), 1)
 
     def test_missing_current_bybit_tick_size_cancels_pending_and_blocks_new_plan(self):
         engine, _ = self.make_engine()
@@ -196,8 +284,12 @@ class TradingPlanLifecycleTests(unittest.TestCase):
 
     def test_postgres_model_has_additive_lifecycle_columns(self):
         columns = VirtualTrade.__table__.columns
-        for name in ("wall_id", "entry_trigger_direction", "entry_armed", "entry_fill_price"):
+        for name in (
+            "wall_id", "entry_trigger_direction", "entry_armed",
+            "entry_fill_price", "accounting_version",
+        ):
             self.assertIn(name, columns)
+        self.assertEqual(columns["accounting_version"].server_default.arg.text, "1")
 
 
 if __name__ == "__main__":

@@ -894,6 +894,14 @@ class TradingEngine:
         """Serialize a market-state transition and its persistence as one unit."""
         async with self.state_lock:
             symbol = symbol.upper()
+            previous_trades = [
+                dict(trade) for trade in self.trade_manager.trades
+            ]
+            previous_balance = self.trade_manager.balance_usdt
+            previous_prices = dict(self.trade_manager.last_prices)
+            previous_pending_persistence = {
+                key: dict(value) for key, value in self._pending_persistence.items()
+            }
             events = self.on_market_update(
                 symbol, last_price, stable_walls, wall_events, wall_candidates,
                 price_updated=price_updated,
@@ -911,7 +919,22 @@ class TradingEngine:
                     if diagnostics.get("planner_evaluated")
                     else self.get_entry_block_reason(symbol)
                 )
-            await self.persist_events(events)
+            if not await self.persist_events(events):
+                # Do not leave a replacement/open/close visible in memory when
+                # its corresponding PostgreSQL transaction failed. The next
+                # market update will derive the desired transition again.
+                self.restore_trade_state(
+                    previous_trades, previous_balance,
+                    previous_pending_persistence,
+                )
+                self.trade_manager.last_prices = previous_prices
+                self.trade_manager.discard_deferred_entry_tick(symbol)
+                if diagnostics is not None:
+                    diagnostics["planner_decision"] = (
+                        "Сохранение торгового перехода в PostgreSQL не выполнено; "
+                        "изменение сделки и баланса отменено в памяти."
+                    )
+                return []
             await self.persist_market_price(symbol, last_price)
             return events
 
