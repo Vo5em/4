@@ -33,6 +33,7 @@ settings = InlineKeyboardMarkup(
         [InlineKeyboardButton(text="Изменить ставку", callback_data="settings_stake")],
         [InlineKeyboardButton(text="Настроить пару", callback_data="settings_pair")],
         [InlineKeyboardButton(text="Плечо по парам", callback_data="settings_leverage")],
+        [InlineKeyboardButton(text="Настроить TP / SL", callback_data="settings_trade_levels")],
         [InlineKeyboardButton(text="Стратегии по парам", callback_data="settings_strategy")],
         [InlineKeyboardButton(text="Добавить USDT-пару", callback_data="settings_add_pair")],
         [InlineKeyboardButton(text="На главную", callback_data="dashboard")],

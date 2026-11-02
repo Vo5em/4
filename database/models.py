@@ -28,6 +28,12 @@ class RuntimeState(Base):
     stake_usdt: Mapped[float] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=False)
     max_open_trades: Mapped[int] = mapped_column(nullable=False, default=3)
     default_leverage: Mapped[float] = mapped_column(Numeric(10, 4, asdecimal=False), nullable=False, default=25.0)
+    default_take_profit_bps: Mapped[float] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=False, default=5.0, server_default=text("5.0")
+    )
+    default_stop_loss_bps: Mapped[float] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=False, default=5.0, server_default=text("5.0")
+    )
     engine_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="stopped")
     initialized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
@@ -53,6 +59,8 @@ class TradingPairSetting(Base):
     leverage: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False), nullable=True)
     maker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.0002)
     taker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.00055)
+    take_profit_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    stop_loss_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -153,9 +161,29 @@ async def async_main() -> None:
             "breakout_max_update_gap_seconds NUMERIC(18, 8) NOT NULL DEFAULT 2.0"
         ))
         await connection.execute(text("ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS default_leverage NUMERIC(10,4) NOT NULL DEFAULT 25.0"))
+        await connection.execute(text(
+            "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
+            "default_take_profit_bps NUMERIC(18,8) NOT NULL DEFAULT 5.0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
+            "default_stop_loss_bps NUMERIC(18,8) NOT NULL DEFAULT 5.0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE runtime_state ALTER COLUMN default_take_profit_bps SET DEFAULT 5.0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE runtime_state ALTER COLUMN default_stop_loss_bps SET DEFAULT 5.0"
+        ))
         await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS leverage NUMERIC(10,4)"))
         await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS maker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.0002"))
         await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS taker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.00055"))
+        await connection.execute(text(
+            "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS take_profit_bps NUMERIC(18,8)"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS stop_loss_bps NUMERIC(18,8)"
+        ))
         for column, sql_type in (("leverage", "NUMERIC(10,4)"), ("position_notional_usdt", "NUMERIC(24,8)"), ("entry_fee_usdt", "NUMERIC(24,8)"), ("exit_fee_usdt", "NUMERIC(24,8)"), ("gross_pnl_usdt", "NUMERIC(24,8)"), ("fee_rate", "NUMERIC(18,10)")):
             await connection.execute(text(f"ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS {column} {sql_type}"))
         await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS accounting_version INTEGER NOT NULL DEFAULT 1"))

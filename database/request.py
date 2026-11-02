@@ -32,6 +32,8 @@ async def initialize_database(
                 stake_usdt=default_trading_settings.stake_usdt,
                 max_open_trades=default_trading_settings.max_open_trades,
                 default_leverage=default_trading_settings.leverage,
+                default_take_profit_bps=default_trading_settings.default_take_profit_bps,
+                default_stop_loss_bps=default_trading_settings.default_stop_loss_bps,
                 engine_mode="stopped",
                 initialized=False,
             )
@@ -82,6 +84,12 @@ async def initialize_database(
                 initial_balance_usdt=state.initial_balance_usdt,
                 max_open_trades=state.max_open_trades,
                 leverage=getattr(state, "default_leverage", 25.0) or 25.0,
+                default_take_profit_bps=getattr(
+                    state, "default_take_profit_bps", 5.0
+                ) or 5.0,
+                default_stop_loss_bps=getattr(
+                    state, "default_stop_loss_bps", 5.0
+                ) or 5.0,
             ),
             "balance_usdt": state.balance_usdt,
             "engine_mode": state.engine_mode,
@@ -107,6 +115,8 @@ async def initialize_database(
                     leverage=getattr(row, "leverage", None),
                     maker_fee_rate=getattr(row, "maker_fee_rate", 0.0002) or 0.0002,
                     taker_fee_rate=getattr(row, "taker_fee_rate", 0.00055) or 0.00055,
+                    take_profit_bps=getattr(row, "take_profit_bps", None),
+                    stop_loss_bps=getattr(row, "stop_loss_bps", None),
                 )
                 for row in pair_rows
             },
@@ -182,6 +192,8 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
         leverage=settings.leverage,
         maker_fee_rate=settings.maker_fee_rate,
         taker_fee_rate=settings.taker_fee_rate,
+        take_profit_bps=settings.take_profit_bps,
+        stop_loss_bps=settings.stop_loss_bps,
     )
 
 
@@ -268,6 +280,8 @@ async def save_runtime_state(
                 initial_balance_usdt=trading_settings.initial_balance_usdt,
                 max_open_trades=trading_settings.max_open_trades,
                 default_leverage=trading_settings.leverage,
+                default_take_profit_bps=trading_settings.default_take_profit_bps,
+                default_stop_loss_bps=trading_settings.default_stop_loss_bps,
                 stake_usdt=trading_settings.stake_usdt,
             )
             session.add(state)
@@ -277,6 +291,8 @@ async def save_runtime_state(
         state.stake_usdt = trading_settings.stake_usdt
         state.max_open_trades = trading_settings.max_open_trades
         state.default_leverage = trading_settings.leverage
+        state.default_take_profit_bps = trading_settings.default_take_profit_bps
+        state.default_stop_loss_bps = trading_settings.default_stop_loss_bps
         state.initialized = initialized
         await session.commit()
 
@@ -320,6 +336,7 @@ async def save_pair_settings(settings: PairSettings) -> None:
                 "bounce_reversal_bps", "breakout_confirm_seconds", "breakout_buffer_bps",
                 "breakout_max_update_gap_seconds",
                 "leverage", "maker_fee_rate", "taker_fee_rate",
+                "take_profit_bps", "stop_loss_bps",
             ):
                 setattr(row, key, getattr(values, key))
         await session.commit()
@@ -447,6 +464,7 @@ async def save_pair_settings_with_trades(
                 "breakout_confirm_seconds", "breakout_buffer_bps",
                 "breakout_max_update_gap_seconds",
                 "leverage", "maker_fee_rate", "taker_fee_rate",
+                "take_profit_bps", "stop_loss_bps",
             ):
                 setattr(pair_row, key, getattr(values, key))
 
@@ -468,6 +486,8 @@ async def save_trading_settings(settings: TradingSettings) -> None:
                 stake_usdt=settings.stake_usdt,
                 max_open_trades=settings.max_open_trades,
                 default_leverage=settings.leverage,
+                default_take_profit_bps=settings.default_take_profit_bps,
+                default_stop_loss_bps=settings.default_stop_loss_bps,
             )
             session.add(state)
         else:
@@ -475,6 +495,53 @@ async def save_trading_settings(settings: TradingSettings) -> None:
             state.initial_balance_usdt = settings.initial_balance_usdt
             state.max_open_trades = settings.max_open_trades
             state.default_leverage = settings.leverage
+            state.default_take_profit_bps = settings.default_take_profit_bps
+            state.default_stop_loss_bps = settings.default_stop_loss_bps
+        await session.commit()
+
+
+async def save_trading_settings_with_trades(
+    settings: TradingSettings,
+    trades: list[dict],
+    balance_usdt: float,
+    engine_mode: str,
+) -> None:
+    """Atomically save global TP/SL defaults and re-planned trade rows."""
+    async with async_session() as session:
+        state = await session.get(RuntimeState, 1)
+        if state is None:
+            state = RuntimeState(
+                id=1,
+                balance_usdt=balance_usdt,
+                initial_balance_usdt=settings.initial_balance_usdt,
+                stake_usdt=settings.stake_usdt,
+                max_open_trades=settings.max_open_trades,
+                default_leverage=settings.leverage,
+                default_take_profit_bps=settings.default_take_profit_bps,
+                default_stop_loss_bps=settings.default_stop_loss_bps,
+                engine_mode=engine_mode,
+            )
+            session.add(state)
+        else:
+            state.balance_usdt = balance_usdt
+            state.initial_balance_usdt = settings.initial_balance_usdt
+            state.stake_usdt = settings.stake_usdt
+            state.max_open_trades = settings.max_open_trades
+            state.default_leverage = settings.leverage
+            state.default_take_profit_bps = settings.default_take_profit_bps
+            state.default_stop_loss_bps = settings.default_stop_loss_bps
+            state.engine_mode = engine_mode
+
+        for trade in trades:
+            row = await session.scalar(
+                select(VirtualTrade).where(VirtualTrade.signal_id == trade["signal_id"])
+            )
+            values = _virtual_trade_values(trade, is_insert=row is None)
+            if row is None:
+                session.add(VirtualTrade(**values))
+            else:
+                for key, value in values.items():
+                    setattr(row, key, value)
         await session.commit()
 
 

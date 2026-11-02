@@ -1,4 +1,5 @@
 import os
+from math import isfinite
 from datetime import timezone
 from html import escape
 from dataclasses import replace
@@ -20,6 +21,11 @@ from app.runtime import (
 from script.engine import StrategyPersistenceError
 from script.engine import EngineMode
 from script.settings import PairSettings
+from script.trade_levels import (
+    ENTRY_DISTANCE_BPS,
+    effective_trade_level_bps,
+    estimate_trade_outcomes,
+)
 
 admin = Router()
 logger = logging.getLogger(__name__)
@@ -56,6 +62,7 @@ class SettingsInput(StatesGroup):
     waiting_for_strategy = State()
     waiting_for_pair_statistics = State()
     waiting_for_pair_leverage = State()
+    waiting_for_trade_level = State()
 
 
 class Admin(Filter):
@@ -331,6 +338,9 @@ def pair_settings_text(runtime: RuntimeController) -> str:
         state = "включена" if settings.enabled else "выключена"
         strategy_ids = runtime.engine.get_enabled_strategy_ids(symbol)
         strategies = ", ".join(sorted(strategy_ids)) or "нет"
+        take_profit_bps, stop_loss_bps = effective_trade_level_bps(
+            settings, runtime.engine.trading_settings
+        )
         pairs.append(
             f"• {symbol}: {state}; стена {settings.min_wall_ratio:g}× / "
             f"от {settings.min_wall_notional_usdt:g} USDT; "
@@ -340,9 +350,120 @@ def pair_settings_text(runtime: RuntimeController) -> str:
             f"устойчивость {max(40.0, settings.min_wall_age_seconds):g} с; "
             f"порог потребления {settings.consumed_ratio:.0%}; "
             f"плечо {settings.leverage if settings.leverage is not None else runtime.engine.trading_settings.leverage:g}x; "
+            f"TP {take_profit_bps:g} / SL {stop_loss_bps:g} б.п.; "
             f"стратегии {escape(strategies)}"
         )
     return "\n".join(pairs) or "Торговые пары не настроены."
+
+
+def _level_value_label(override: float | None, default: float) -> str:
+    if override is None:
+        return f"глобальное {default:g} б.п."
+    return f"персональное {override:g} б.п."
+
+
+def trade_level_pair_text(runtime: RuntimeController, symbol: str) -> str:
+    symbol = symbol.strip().upper()
+    pair = runtime.engine.pair_settings.get(symbol)
+    if pair is None:
+        return "Пара больше не подключена."
+    trading = runtime.engine.trading_settings
+    tp_bps, sl_bps = effective_trade_level_bps(pair, trading)
+    leverage = pair.leverage or trading.leverage
+    notional = trading.stake_usdt * leverage
+    entry = 100.0
+    tp_long = entry * (1 + tp_bps / 10000)
+    sl_long = entry * (1 - sl_bps / 10000)
+    tp_short = entry * (1 - tp_bps / 10000)
+    sl_short = entry * (1 + sl_bps / 10000)
+    long = estimate_trade_outcomes(
+        side="long", entry_price=entry, take_profit_price=tp_long,
+        stop_loss_price=sl_long, position_notional_usdt=notional,
+        taker_fee_rate=pair.taker_fee_rate,
+    )
+    short = estimate_trade_outcomes(
+        side="short", entry_price=entry, take_profit_price=tp_short,
+        stop_loss_price=sl_short, position_notional_usdt=notional,
+        taker_fee_rate=pair.taker_fee_rate,
+    )
+    strategies = runtime.engine.get_enabled_strategy_ids(symbol)
+    warnings = []
+    if "bounce" in strategies and sl_bps <= float(ENTRY_DISTANCE_BPS):
+        warnings.append(
+            "Bounce: SL может не выйти за стену; такие планы будут отклоняться."
+        )
+    if "breakout" in strategies and tp_bps <= float(ENTRY_DISTANCE_BPS):
+        warnings.append(
+            "Breakout: TP может не достичь стены; такие планы будут отклоняться."
+        )
+    lines = [
+        f"<b>{escape(symbol)} · TP / SL</b>",
+        f"TP: {_level_value_label(pair.take_profit_bps, trading.default_take_profit_bps)}",
+        f"SL: {_level_value_label(pair.stop_loss_bps, trading.default_stop_loss_bps)}",
+        f"Эффективно: TP {tp_bps:g} / SL {sl_bps:g} б.п. от Entry",
+        f"Оценка: ставка {trading.stake_usdt:g} × {leverage:g}x = {notional:g} USDT; "
+        f"Taker {pair.taker_fee_rate * 100:.4f}% за каждое виртуальное исполнение.",
+        "Пример на Entry 100 USDT, до округления по tickSize:",
+        f"LONG: TP до комиссий {long['tp_gross_pnl_usdt']:+.4f}, "
+        f"TP после комиссий {long['tp_net_pnl_usdt']:+.4f}, "
+        f"SL после комиссий {long['sl_net_pnl_usdt']:+.4f} USDT; "
+        f"net TP/SL {long['net_reward_risk']:.3f}.",
+        f"SHORT: TP до комиссий {short['tp_gross_pnl_usdt']:+.4f}, "
+        f"TP после комиссий {short['tp_net_pnl_usdt']:+.4f}, "
+        f"SL после комиссий {short['sl_net_pnl_usdt']:+.4f} USDT; "
+        f"net TP/SL {short['net_reward_risk']:.3f}.",
+        "Это расчётная оценка, не гарантия цены или исполнения.",
+    ]
+    lines.extend(f"⚠️ {escape(item)}" for item in warnings)
+    return "\n".join(lines)
+
+
+def trade_level_pair_keyboard(runtime: RuntimeController, symbol: str) -> InlineKeyboardMarkup:
+    pair = runtime.engine.pair_settings[symbol]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить TP", callback_data=f"levels_set:pair:{symbol}:tp")],
+        [InlineKeyboardButton(text="Изменить SL", callback_data=f"levels_set:pair:{symbol}:sl")],
+        [InlineKeyboardButton(text="Сбросить TP к глобальному", callback_data=f"levels_reset:{symbol}:tp")],
+        [InlineKeyboardButton(text="Сбросить SL к глобальному", callback_data=f"levels_reset:{symbol}:sl")],
+        [InlineKeyboardButton(text="К списку пар", callback_data="levels_pairs")],
+        [InlineKeyboardButton(text="Общие TP / SL", callback_data="settings_trade_levels")],
+        [InlineKeyboardButton(text="Настройки", callback_data="settings")],
+    ])
+
+
+def trade_levels_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить общий TP", callback_data="levels_set:global:tp")],
+        [InlineKeyboardButton(text="Изменить общий SL", callback_data="levels_set:global:sl")],
+        [InlineKeyboardButton(text="Настройки пар", callback_data="levels_pairs")],
+        [InlineKeyboardButton(text="Назад", callback_data="settings")],
+    ])
+
+
+def trade_levels_text(runtime: RuntimeController) -> str:
+    settings = runtime.engine.trading_settings
+    lines = [
+        "<b>Общие настройки TP / SL</b>",
+        f"Глобальный TP от Entry: <b>{settings.default_take_profit_bps:g} б.п.</b>",
+        f"Глобальный SL от Entry: <b>{settings.default_stop_loss_bps:g} б.п.</b>",
+        "Пара может переопределить TP и SL независимо. Сброс отдельного значения "
+        "возвращает его к глобальному.",
+    ]
+    for symbol, pair in runtime.engine.pair_settings.items():
+        tp, sl = effective_trade_level_bps(pair, settings)
+        lines.append(f"{escape(symbol)}: эффективно TP {tp:g} / SL {sl:g} б.п.")
+    return "\n".join(lines)
+
+
+def trade_levels_pairs_keyboard(runtime: RuntimeController) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text=f"{symbol} · TP {effective_trade_level_bps(pair, runtime.engine.trading_settings)[0]:g} / "
+             f"SL {effective_trade_level_bps(pair, runtime.engine.trading_settings)[1]:g} б.п.",
+        callback_data=f"levels_pair:{symbol}",
+    )] for symbol, pair in runtime.engine.pair_settings.items()]
+    rows.append([InlineKeyboardButton(text="Общие TP / SL", callback_data="settings_trade_levels")])
+    rows.append([InlineKeyboardButton(text="Настройки", callback_data="settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @admin.message(F.chat.type == "private", Command("id"))
@@ -379,6 +500,9 @@ async def show_settings(
             "<b>Настройки виртуальной торговли</b>\n\n"
             f"Ставка на сделку: {runtime.engine.trading_settings.stake_usdt:.2f} USDT\n"
             f"Начальный баланс: {runtime.engine.trading_settings.initial_balance_usdt:.2f} USDT\n\n"
+            f"Глобальный TP / SL: "
+            f"{runtime.engine.trading_settings.default_take_profit_bps:g} / "
+            f"{runtime.engine.trading_settings.default_stop_loss_bps:g} б.п. от Entry\n\n"
             f"<b>Пары</b>\n{pair_text}\n\n"
             "Настройки сохраняются в PostgreSQL. Пороги, дистанции и плечо "
             "настраиваются отдельно для каждой пары; плечо новых сделок "
@@ -413,6 +537,161 @@ async def update_stake(message: Message, state: FSMContext, runtime: RuntimeCont
         return
     await state.clear()
     await message.answer(dashboard_text(runtime), reply_markup=kb.main)
+
+
+@admin.callback_query(Admin(), F.data == "settings_trade_levels")
+async def show_trade_level_settings(
+    callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
+) -> None:
+    await state.clear()
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message, trade_levels_text(runtime), trade_levels_keyboard()
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data == "levels_pairs")
+async def show_trade_level_pairs(
+    callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
+) -> None:
+    await state.clear()
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            "<b>Настройки TP / SL по парам</b>\nВыберите подключённую пару.",
+            trade_levels_pairs_keyboard(runtime),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("levels_pair:"))
+async def show_trade_level_pair(
+    callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
+) -> None:
+    await state.clear()
+    symbol = callback.data.split(":", 1)[1].strip().upper()
+    pair = runtime.engine.pair_settings.get(symbol)
+    if pair is None:
+        await callback.answer("Пара больше не подключена", show_alert=True)
+        return
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            trade_level_pair_text(runtime, symbol),
+            trade_level_pair_keyboard(runtime, symbol),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("levels_set:"))
+async def request_trade_level_value(
+    callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
+) -> None:
+    parts = callback.data.split(":")
+    if len(parts) not in {3, 4} or parts[1] not in {"global", "pair"}:
+        await callback.answer("Некорректная настройка", show_alert=True)
+        return
+    scope = parts[1]
+    if scope == "global":
+        if len(parts) != 3:
+            await callback.answer("Некорректная настройка", show_alert=True)
+            return
+        field = parts[2]
+        symbol = None
+    else:
+        if len(parts) != 4:
+            await callback.answer("Некорректная настройка", show_alert=True)
+            return
+        symbol, field = parts[2].strip().upper(), parts[3]
+        if symbol not in runtime.engine.pair_settings:
+            await callback.answer("Пара больше не подключена", show_alert=True)
+            return
+    if field not in {"tp", "sl"}:
+        await callback.answer("Неизвестный параметр", show_alert=True)
+        return
+    await state.update_data(level_scope=scope, level_symbol=symbol, level_field=field)
+    await state.set_state(SettingsInput.waiting_for_trade_level)
+    prompt = (
+        "Введите положительное значение в bps, например <code>5</code>."
+        if scope == "global" else
+        f"Введите персональное значение {field.upper()} для <code>{escape(symbol)}</code> в bps."
+    )
+    if callback.message is not None:
+        await callback.message.answer(
+            prompt + "\nДля возврата к глобальному значению используйте отдельную кнопку сброса.",
+            reply_markup=kb.cancel_input,
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("levels_reset:"))
+async def reset_pair_trade_level(
+    callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
+) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[2] not in {"tp", "sl"}:
+        await callback.answer("Некорректная настройка", show_alert=True)
+        return
+    symbol, field = parts[1].strip().upper(), parts[2]
+    current = runtime.engine.pair_settings.get(symbol)
+    if current is None:
+        await callback.answer("Пара больше не подключена", show_alert=True)
+        return
+    attribute = "take_profit_bps" if field == "tp" else "stop_loss_bps"
+    try:
+        await runtime.update_pair_settings(replace(current, **{attribute: None}))
+    except Exception:
+        logger.exception("Could not reset %s bps override for %s", field, symbol)
+        await callback.answer("Не удалось сохранить настройку; состояние не изменено", show_alert=True)
+        return
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            trade_level_pair_text(runtime, symbol),
+            trade_level_pair_keyboard(runtime, symbol),
+        )
+    await callback.answer(f"{field.upper()} снова использует глобальное значение")
+
+
+@admin.message(Admin(), StateFilter(SettingsInput.waiting_for_trade_level))
+async def update_trade_level_value(
+    message: Message, state: FSMContext, runtime: RuntimeController
+) -> None:
+    data = await state.get_data()
+    try:
+        value = float(message.text or "")
+        if not isfinite(value) or value <= 0:
+            raise ValueError("Значение должно быть положительным конечным числом")
+        scope, symbol, field = (
+            data.get("level_scope"), data.get("level_symbol"), data.get("level_field")
+        )
+        if field not in {"tp", "sl"} or scope not in {"global", "pair"}:
+            raise ValueError("Сессия настройки устарела; откройте меню заново")
+        if scope == "global":
+            await runtime.update_trade_level_defaults(
+                take_profit_bps=value if field == "tp" else None,
+                stop_loss_bps=value if field == "sl" else None,
+            )
+            text = trade_levels_text(runtime)
+            markup = trade_levels_keyboard()
+        else:
+            current = runtime.engine.pair_settings.get(str(symbol).upper())
+            if current is None:
+                raise ValueError("Пара больше не подключена")
+            attribute = "take_profit_bps" if field == "tp" else "stop_loss_bps"
+            await runtime.update_pair_settings(replace(current, **{attribute: value}))
+            text = trade_level_pair_text(runtime, str(symbol))
+            markup = trade_level_pair_keyboard(runtime, str(symbol).upper())
+    except (ValueError, TypeError) as error:
+        await message.answer(f"Настройка отклонена: {escape(str(error))}")
+        return
+    except Exception:
+        logger.exception("Could not save TP/SL settings")
+        await message.answer("Не удалось сохранить TP/SL и связанные планы; прежние настройки сохранены.")
+        return
+    await state.clear()
+    await message.answer(text, reply_markup=markup)
 
 
 @admin.callback_query(Admin(), F.data == "settings_pair")

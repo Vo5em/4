@@ -35,6 +35,8 @@ class PairSettings:
     maker_fee_rate: float = 0.0002
     taker_fee_rate: float = 0.00055
     maintenance_margin_rate: float = 0.005
+    take_profit_bps: float | None = None
+    stop_loss_bps: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_pair_symbol(self.symbol))
@@ -75,6 +77,16 @@ class PairSettings:
             raise ValueError("leverage must be positive and no greater than 125")
         if any(not isfinite(rate) or rate < 0 or rate >= 1 for rate in (self.maker_fee_rate, self.taker_fee_rate, self.maintenance_margin_rate)):
             raise ValueError("fee and maintenance margin rates must be in [0, 1)")
+        for name, value in (
+            ("take_profit_bps", self.take_profit_bps),
+            ("stop_loss_bps", self.stop_loss_bps),
+        ):
+            try:
+                valid = value is None or (isfinite(value) and value > 0)
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"{name} override must be a positive finite number or None")
 
 
 @dataclass(frozen=True)
@@ -85,6 +97,8 @@ class TradingSettings:
     initial_balance_usdt: float = 1000.0
     max_open_trades: int = 3
     leverage: float = 25.0
+    default_take_profit_bps: float = 5.0
+    default_stop_loss_bps: float = 5.0
 
     def __post_init__(self) -> None:
         if not isfinite(self.stake_usdt) or self.stake_usdt <= 0:
@@ -97,3 +111,13 @@ class TradingSettings:
             raise ValueError("max_open_trades must be at least 1")
         if not isfinite(self.leverage) or self.leverage <= 0 or self.leverage > 125:
             raise ValueError("leverage must be positive and no greater than 125")
+        for name, value in (
+            ("default_take_profit_bps", self.default_take_profit_bps),
+            ("default_stop_loss_bps", self.default_stop_loss_bps),
+        ):
+            try:
+                valid = isfinite(value) and value > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"{name} must be a positive finite number")

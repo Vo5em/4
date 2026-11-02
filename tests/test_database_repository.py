@@ -121,6 +121,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
             max_open_trades=3,
             engine_mode="running",
             initialized=True,
+            default_take_profit_bps=32,
+            default_stop_loss_bps=24,
         )
         pair_row = TradingPairSetting(
             symbol="BTCUSDT",
@@ -134,6 +136,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
             stop_distance_bps=2,
             max_open_trades=1,
             leverage=17.5,
+            take_profit_bps=48,
+            stop_loss_bps=None,
         )
         strategy_row = PairStrategyConfig(
             symbol="BTCUSDT", enabled_strategy_ids=[]
@@ -191,6 +195,10 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(state["enabled_strategies"], {"BTCUSDT": set()})
         self.assertEqual(state["last_prices"], {"BTCUSDT": 100.25})
         self.assertEqual(state["pair_settings"]["BTCUSDT"].leverage, 17.5)
+        self.assertEqual(state["trading_settings"].default_take_profit_bps, 32)
+        self.assertEqual(state["trading_settings"].default_stop_loss_bps, 24)
+        self.assertEqual(state["pair_settings"]["BTCUSDT"].take_profit_bps, 48)
+        self.assertIsNone(state["pair_settings"]["BTCUSDT"].stop_loss_bps)
         self.assertEqual(len(state["trades"]), 1)
         self.assertEqual(state["trades"][0]["status"], "open")
         self.assertEqual(state["trades"][0]["signal_id"], trade.signal_id)
@@ -299,10 +307,11 @@ class DatabaseRepositoryTests(unittest.TestCase):
             min_wall_ratio=900,
             max_open_trades=2,
             leverage=35,
+            take_profit_bps=55,
         )
         trading_settings = TradingSettings(
             stake_usdt=25, initial_balance_usdt=100, max_open_trades=5,
-            leverage=40,
+            leverage=40, default_take_profit_bps=42, default_stop_loss_bps=36,
         )
 
         with patch.object(repository, "async_session", return_value=session):
@@ -313,10 +322,61 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(pair_row.min_wall_ratio, 900)
         self.assertEqual(pair_row.max_open_trades, 2)
         self.assertEqual(pair_row.leverage, 35)
+        self.assertEqual(pair_row.take_profit_bps, 55)
+        self.assertIsNone(pair_row.stop_loss_bps)
         self.assertEqual(runtime_row.stake_usdt, 25)
         self.assertEqual(runtime_row.max_open_trades, 5)
         self.assertEqual(runtime_row.default_leverage, 40)
+        self.assertEqual(runtime_row.default_take_profit_bps, 42)
+        self.assertEqual(runtime_row.default_stop_loss_bps, 36)
         self.assertEqual(session.commits, 2)
+
+    def test_global_trade_level_settings_and_pending_replacement_commit_together(self):
+        runtime_row = RuntimeState(
+            id=1, balance_usdt=100, initial_balance_usdt=100,
+            stake_usdt=10, max_open_trades=3, default_leverage=25,
+            default_take_profit_bps=5, default_stop_loss_bps=5,
+            engine_mode="running", initialized=True,
+        )
+        session = FakeSession({RuntimeState: [runtime_row]})
+        settings = TradingSettings(
+            default_take_profit_bps=12, default_stop_loss_bps=8,
+        )
+        replacement = {
+            "signal_id": "replacement", "strategy_id": "bounce",
+            "symbol": "BTCUSDT", "side": "long", "wall_side": "buy",
+            "status": "pending", "wall_price": 100, "wall_size": 1000,
+            "wall_ratio": 900, "stake_usdt": 10, "leverage": 25,
+            "position_notional_usdt": 250, "entry_price": 100.02,
+            "stop_loss": 99.94, "take_profit": 100.14,
+            "accounting_version": 1, "profit_usdt": 0,
+            "profit_percent": 0, "entry_armed": True,
+        }
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_trading_settings_with_trades(
+                settings, [replacement], 100, "running",
+            ))
+
+        saved_trade = session.rows[VirtualTrade][0]
+        self.assertEqual(runtime_row.default_take_profit_bps, 12)
+        self.assertEqual(runtime_row.default_stop_loss_bps, 8)
+        self.assertEqual(saved_trade.status, "pending")
+        self.assertEqual(saved_trade.accounting_version, 1)
+        self.assertEqual(session.commits, 1)
+
+    def test_trade_level_schema_defaults_and_nullable_pair_overrides(self):
+        runtime_columns = RuntimeState.__table__.columns
+        pair_columns = TradingPairSetting.__table__.columns
+        self.assertEqual(
+            runtime_columns["default_take_profit_bps"].server_default.arg.text,
+            "5.0",
+        )
+        self.assertEqual(
+            runtime_columns["default_stop_loss_bps"].server_default.arg.text,
+            "5.0",
+        )
+        self.assertTrue(pair_columns["take_profit_bps"].nullable)
+        self.assertTrue(pair_columns["stop_loss_bps"].nullable)
 
     def test_save_enabled_strategies_inserts_and_updates(self):
         session = FakeSession()

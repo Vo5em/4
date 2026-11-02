@@ -16,7 +16,7 @@ from .strategies import (
     _wall_id,
 )
 from .trade_manager import TradeManager
-from .trade_levels import calculate_trade_levels
+from .trade_levels import calculate_trade_levels, effective_trade_level_bps
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,9 @@ class TradingEngine:
             }
             for symbol in self.pair_settings
         }
+        self.latest_stable_walls: dict[str, tuple[dict, ...]] = {}
+        self.latest_wall_events: dict[str, tuple[dict, ...]] = {}
+        self.latest_market_prices: dict[str, float] = {}
         self.entry_event_cutoff_ms: dict[str, int] = {}
         self.entry_event_receive_cutoff: dict[str, float] = {}
         self.market_reconciliation_required: set[str] = set()
@@ -426,6 +429,40 @@ class TradingEngine:
                 ]
             result[pair] = snapshot
         return result
+
+    def replan_after_level_settings_change(self, symbol: str) -> list[dict]:
+        """Reconcile PENDING plans against the latest safe wall snapshot.
+
+        This reuses the registered strategies and the normal planner path with
+        price-trigger processing disabled. If no current synchronized snapshot
+        is available, old plans are cancelled and the next market update will
+        create plans from fresh data.
+        """
+        symbol = symbol.upper()
+        if (
+            self.mode != EngineMode.RUNNING
+            or symbol not in self.pair_settings
+            or not self.pair_settings[symbol].enabled
+            or symbol not in self.latest_stable_walls
+            or symbol not in self.latest_market_prices
+        ):
+            return self.trade_manager.cancel_pending_for_symbol(
+                symbol, "LEVEL_SETTINGS_CHANGED_WAITING_FOR_MARKET"
+            )
+        if self._has_market_data_metadata(symbol):
+            health = self.get_market_data_health(symbol)
+            if not health["fresh"]:
+                return self.trade_manager.cancel_pending_for_symbol(
+                    symbol, "LEVEL_SETTINGS_CHANGED_MARKET_STALE"
+                )
+        return self.on_market_update(
+            symbol,
+            self.latest_market_prices[symbol],
+            self.latest_stable_walls[symbol],
+            self.latest_wall_events.get(symbol, ()),
+            self.latest_stable_walls[symbol],
+            price_updated=False,
+        )
 
     def _prepare_planner_wall_rows(
         self, symbol: str, stable_walls, strategy_ids: set[str], additional_walls=()
@@ -817,6 +854,37 @@ class TradingEngine:
                     self._pending_persistence.pop(signal_id, None)
             return True
 
+    async def persist_trading_settings(
+        self, settings: TradingSettings, events: list[dict]
+    ) -> bool:
+        """Atomically persist global settings and their PENDING replacements."""
+        async with self._persistence_lock:
+            for event in events:
+                trade = event.get("trade")
+                if trade is not None:
+                    self._pending_persistence[trade["signal_id"]] = trade
+            if self.repository is None:
+                self._pending_persistence.clear()
+                self._log_trade_lifecycle_events(events)
+                return True
+            snapshot_refs = dict(self._pending_persistence)
+            snapshot = [dict(trade) for trade in snapshot_refs.values()]
+            try:
+                await self.repository.save_trading_settings_with_trades(
+                    settings, snapshot, self.trade_manager.balance_usdt,
+                    self.mode.value,
+                )
+            except Exception as error:
+                self.record_database_error(error)
+                logger.exception("Database global trade-level settings update failed")
+                return False
+            self.record_database_success()
+            self._log_trade_lifecycle_events(events)
+            for signal_id, trade_ref in snapshot_refs.items():
+                if self._pending_persistence.get(signal_id) is trade_ref:
+                    self._pending_persistence.pop(signal_id, None)
+            return True
+
     async def persist_enabled_strategies(
         self, symbol: str, strategy_ids: set[str], events: list[dict],
         admin_user_id: int | None = None,
@@ -971,6 +1039,9 @@ class TradingEngine:
                 "Некорректная цена; стратегии не запускались.",
             )
             return []
+        self.latest_stable_walls[symbol] = tuple(dict(wall) for wall in stable_walls)
+        self.latest_wall_events[symbol] = tuple(dict(event) for event in wall_events)
+        self.latest_market_prices[symbol] = numeric_price
 
         if self.diagnostic_only:
             diagnostics = self.wall_diagnostics.setdefault(symbol, {})
@@ -1137,7 +1208,7 @@ class TradingEngine:
             self.trade_manager.discard_deferred_entry_tick(symbol)
             return events
         if (health is not None and not health["fresh"]) or (
-            health is None and not strategy_price_valid
+            health is None and not strategy_price_valid and price_updated
         ):
             reason = (
                 self.get_entry_block_reason(symbol)
@@ -1251,13 +1322,30 @@ class TradingEngine:
                         ))
                     continue
                 if strategy.strategy_id in {"bounce", "breakout"}:
-                    levels = calculate_trade_levels(
-                        strategy_id=strategy.strategy_id,
-                        wall_side=wall_side,
-                        wall_price=signal.wall_price,
-                        tick_size=tick_size,
-                        bounce_stop_distance_bps=settings.stop_distance_bps,
+                    take_profit_bps, stop_loss_bps = effective_trade_level_bps(
+                        settings, self.trading_settings
                     )
+                    try:
+                        levels = calculate_trade_levels(
+                            strategy_id=strategy.strategy_id,
+                            wall_side=wall_side,
+                            wall_price=signal.wall_price,
+                            tick_size=tick_size,
+                            take_profit_bps=take_profit_bps,
+                            stop_loss_bps=stop_loss_bps,
+                        )
+                    except ValueError as error:
+                        reason = f"Уровни невалидны: {error}"
+                        trade_rejections.append(reason)
+                        if existing is not None:
+                            events.extend(self.trade_manager.cancel_pending_for_slot(
+                                symbol, strategy.strategy_id, wall_side,
+                                "INVALID_TRADE_LEVELS",
+                            ))
+                        self._record_trade_plan_result(
+                            symbol, signal.wall_id, strategy.strategy_id, None, reason
+                        )
+                        continue
                 elif all(value is not None for value in (
                     signal.entry_price, signal.stop_loss, signal.take_profit
                 )):

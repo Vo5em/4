@@ -1,10 +1,16 @@
 import unittest
+from dataclasses import replace
 
 from database.models import VirtualTrade
 from script.engine import EngineMode, TradingEngine
 from script.settings import PairSettings, TradingSettings
+from app.runtime import RuntimeController
 from script.strategies import BOUNCE_STRATEGY_ID, BREAKOUT_STRATEGY_ID
-from script.trade_levels import calculate_trade_levels
+from script.trade_levels import (
+    calculate_trade_levels,
+    effective_trade_level_bps,
+    estimate_trade_outcomes,
+)
 from script.trade_manager import TradeManager
 
 
@@ -33,6 +39,8 @@ class TradeLevelPolicyTests(unittest.TestCase):
                     wall_side=wall_side,
                     wall_price=wall,
                     tick_size="0.01",
+                    take_profit_bps=5,
+                    stop_loss_bps=5,
                 )
                 self.assertEqual(levels["side"], expected_side)
                 self.assertEqual(levels["entry_trigger_direction"], trigger)
@@ -44,10 +52,8 @@ class TradeLevelPolicyTests(unittest.TestCase):
                 else:
                     self.assertLess(levels["take_profit"], levels["entry_price"])
                     self.assertLess(levels["entry_price"], levels["stop_loss"])
-                self.assertEqual(
-                    abs(levels["take_profit"] - levels["entry_price"]),
-                    abs(levels["entry_price"] - levels["stop_loss"]),
-                )
+                self.assertGreater(levels["take_profit"], 0)
+                self.assertGreater(levels["stop_loss"], 0)
 
     def test_bounce_bid_matches_approved_unrounded_formula_before_tick_rounding(self):
         levels = calculate_trade_levels(
@@ -55,10 +61,77 @@ class TradeLevelPolicyTests(unittest.TestCase):
             wall_side="buy",
             wall_price="2284.80",
             tick_size="0.00001",
+            take_profit_bps=5,
+            stop_loss_bps=5,
         )
         self.assertAlmostEqual(float(levels["entry_price"]), 2285.14272, places=5)
-        self.assertAlmostEqual(float(levels["stop_loss"]), 2284.34304, places=5)
-        self.assertAlmostEqual(float(levels["take_profit"]), 2285.94240, places=5)
+        self.assertAlmostEqual(float(levels["stop_loss"]), 2284.00014, places=5)
+        self.assertAlmostEqual(float(levels["take_profit"]), 2286.28530, places=5)
+
+    def test_tp_and_sl_bps_are_from_entry_and_round_outward_to_tick(self):
+        levels = calculate_trade_levels(
+            strategy_id=BOUNCE_STRATEGY_ID,
+            wall_side="buy", wall_price="100", tick_size="0.01",
+            take_profit_bps=12, stop_loss_bps=8,
+        )
+        self.assertEqual(float(levels["entry_price"]), 100.02)
+        self.assertEqual(float(levels["take_profit"]), 100.15)
+        self.assertEqual(float(levels["stop_loss"]), 99.93)
+
+    def test_breakout_tp_before_wall_and_bounce_sl_inside_wall_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "does not reach"):
+            calculate_trade_levels(
+                strategy_id=BREAKOUT_STRATEGY_ID, wall_side="sell",
+                wall_price=100, tick_size="0.01",
+                take_profit_bps=1, stop_loss_bps=5,
+            )
+        with self.assertRaisesRegex(ValueError, "does not extend beyond"):
+            calculate_trade_levels(
+                strategy_id=BOUNCE_STRATEGY_ID, wall_side="buy",
+                wall_price=100, tick_size="0.01",
+                take_profit_bps=5, stop_loss_bps=1.5,
+            )
+
+    def test_invalid_bps_values_are_rejected(self):
+        for invalid in (0, -1, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                calculate_trade_levels(
+                    strategy_id=BOUNCE_STRATEGY_ID, wall_side="buy",
+                    wall_price=100, tick_size="0.01",
+                    take_profit_bps=invalid, stop_loss_bps=5,
+                )
+        for factory in (
+            lambda: TradingSettings(default_take_profit_bps="bad"),
+            lambda: TradingSettings(default_stop_loss_bps=float("nan")),
+            lambda: PairSettings("BTCUSDT", take_profit_bps=-1),
+            lambda: PairSettings("ETHUSDT", stop_loss_bps="bad"),
+        ):
+            with self.subTest(factory=factory), self.assertRaises(ValueError):
+                factory()
+
+    def test_pair_overrides_are_independent_and_fall_back_to_global(self):
+        global_settings = TradingSettings(
+            default_take_profit_bps=40, default_stop_loss_bps=40,
+        )
+        btc = PairSettings("BTCUSDT", take_profit_bps=50)
+        eth = PairSettings("ETHUSDT", stop_loss_bps=25)
+        self.assertEqual(effective_trade_level_bps(btc, global_settings), (50, 40))
+        self.assertEqual(effective_trade_level_bps(eth, global_settings), (40, 25))
+        self.assertEqual(
+            effective_trade_level_bps(replace(btc, take_profit_bps=None), global_settings),
+            (40, 40),
+        )
+
+    def test_pnl_projection_uses_notional_and_taker_fee_both_sides(self):
+        outcome = estimate_trade_outcomes(
+            side="long", entry_price=100, take_profit_price=100.05,
+            stop_loss_price=99.95, position_notional_usdt=750,
+            taker_fee_rate=0.00055,
+        )
+        self.assertAlmostEqual(float(outcome["tp_gross_pnl_usdt"]), 0.375)
+        self.assertAlmostEqual(float(outcome["entry_fee_usdt"]), 0.4125)
+        self.assertLess(outcome["tp_net_pnl_usdt"], 0)
+        self.assertLess(outcome["sl_net_pnl_usdt"], -0.375)
 
 
 class TradingPlanLifecycleTests(unittest.TestCase):
@@ -96,6 +169,8 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         def __init__(self):
             self.fail = False
             self.trade_batches = []
+            self.pair_batches = []
+            self.global_batches = []
 
         async def save_trades(self, trades, balance_usdt, engine_mode=None):
             if self.fail:
@@ -104,6 +179,20 @@ class TradingPlanLifecycleTests(unittest.TestCase):
 
         async def save_market_price(self, symbol, price):
             return None
+
+        async def save_pair_settings_with_trades(
+            self, settings, trades, balance_usdt, engine_mode,
+        ):
+            if self.fail:
+                raise OSError("simulated pair settings write failure")
+            self.pair_batches.append((settings, trades, balance_usdt, engine_mode))
+
+        async def save_trading_settings_with_trades(
+            self, settings, trades, balance_usdt, engine_mode,
+        ):
+            if self.fail:
+                raise OSError("simulated global settings write failure")
+            self.global_batches.append((settings, trades, balance_usdt, engine_mode))
 
     @staticmethod
     async def process_update(engine, price, walls):
@@ -200,6 +289,97 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 30)
         self.assertEqual(engine.get_status()["persistence_pending"], 0)
         self.assertEqual(len(repository.trade_batches), 1)
+
+    def test_pair_level_update_replaces_pending_but_preserves_open_levels(self):
+        engine, settings = self.make_engine()
+        engine.start()
+        bid = self.wall("buy", 100, "pair-level-bid")
+        ask = self.wall("sell", 101, "pair-level-ask")
+        self.update(engine, 100.5, [bid, ask])
+        bid_pending = engine.trade_manager.get_pending_for_slot(
+            "ETHUSDT", BOUNCE_STRATEGY_ID, "buy"
+        )
+        ask_old = engine.trade_manager.get_pending_for_slot(
+            "ETHUSDT", BOUNCE_STRATEGY_ID, "sell"
+        )
+        engine.trade_manager.on_price("ETHUSDT", 100.5)
+        engine.trade_manager.on_price("ETHUSDT", 100.01)
+        self.assertEqual(bid_pending["status"], "open")
+        frozen_open_levels = tuple(
+            bid_pending[key] for key in ("entry_price", "stop_loss", "take_profit")
+        )
+        original_balance = engine.trade_manager.balance_usdt
+
+        runtime = RuntimeController(engine)
+
+        async def no_worker_changes():
+            return None
+
+        runtime._sync_workers = no_worker_changes
+        updated = replace(settings, take_profit_bps=8)
+        run_immediate(runtime.update_pair_settings(updated))
+
+        ask_new = engine.trade_manager.get_pending_for_slot(
+            "ETHUSDT", BOUNCE_STRATEGY_ID, "sell"
+        )
+        self.assertEqual(ask_old["status"], "cancelled")
+        self.assertNotEqual(ask_new["take_profit"], ask_old["take_profit"])
+        self.assertAlmostEqual(
+            ask_new["take_profit"],
+            ask_new["entry_price"] * (1 - 8 / 10000),
+            delta=0.01,
+        )
+        self.assertEqual(tuple(
+            bid_pending[key] for key in ("entry_price", "stop_loss", "take_profit")
+        ), frozen_open_levels)
+        self.assertEqual(engine.trade_manager.balance_usdt, original_balance)
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 60)
+
+        run_immediate(runtime.update_pair_settings(
+            replace(updated, take_profit_bps=None)
+        ))
+        ask_reset = engine.trade_manager.get_pending_for_slot(
+            "ETHUSDT", BOUNCE_STRATEGY_ID, "sell"
+        )
+        self.assertNotEqual(ask_reset["signal_id"], ask_new["signal_id"])
+        self.assertAlmostEqual(
+            ask_reset["take_profit"],
+            float(ask_reset["entry_price"]) * (1 - 5 / 10000),
+            delta=0.01,
+        )
+
+    def test_global_level_update_replans_pending_atomically_and_rolls_back_on_error(self):
+        engine, _ = self.make_engine()
+        repository = self.Repository()
+        engine.repository = repository
+        engine.start()
+        wall = self.wall("buy", 100, "global-level-bid")
+        self.update(engine, 100.5, [wall])
+        old_pending, = engine.trade_manager.get_pending_trades()
+        runtime = RuntimeController(engine)
+
+        new_settings = run_immediate(runtime.update_trade_level_defaults(
+            take_profit_bps=12
+        ))
+        new_pending, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(new_settings.default_take_profit_bps, 12)
+        self.assertNotEqual(new_pending["take_profit"], old_pending["take_profit"])
+        self.assertEqual(len(repository.global_batches), 1)
+        self.assertEqual(
+            [trade["status"] for trade in repository.global_batches[0][1]],
+            ["cancelled", "pending"],
+        )
+
+        previous_settings = engine.trading_settings
+        previous_pending_id = new_pending["signal_id"]
+        balance = engine.trade_manager.balance_usdt
+        repository.fail = True
+        with self.assertRaises(RuntimeError):
+            run_immediate(runtime.update_trade_level_defaults(stop_loss_bps=10))
+        restored_pending, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(engine.trading_settings, previous_settings)
+        self.assertEqual(restored_pending["signal_id"], previous_pending_id)
+        self.assertEqual(engine.trade_manager.balance_usdt, balance)
 
     def test_missing_current_bybit_tick_size_cancels_pending_and_blocks_new_plan(self):
         engine, _ = self.make_engine()

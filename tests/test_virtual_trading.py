@@ -64,6 +64,10 @@ from app.admin import (
     dayid,
     pair_settings_text,
     pair_statistics_text,
+    trade_level_pair_text,
+    trade_level_pair_keyboard,
+    trade_levels_text,
+    trade_levels_keyboard,
     stable_walls_text,
     stable_walls_keyboard,
     navigate_stable_walls,
@@ -91,7 +95,16 @@ class TradeManager(CoreTradeManager):
                 wall_side=data.get("wall_side", "buy"),
                 wall_price=data["wall_price"],
                 tick_size="0.00001",
-                bounce_stop_distance_bps=pair_settings.stop_distance_bps,
+                take_profit_bps=(
+                    pair_settings.take_profit_bps
+                    if pair_settings.take_profit_bps is not None
+                    else self.trading_settings.default_take_profit_bps
+                ),
+                stop_loss_bps=(
+                    pair_settings.stop_loss_bps
+                    if pair_settings.stop_loss_bps is not None
+                    else self.trading_settings.default_stop_loss_bps
+                ),
             )
             data = {**data, **levels}
             if not data.get("entry_trigger_direction"):
@@ -962,13 +975,17 @@ class StrategyPipelineTests(unittest.TestCase):
             enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
         )
         engine.instrument_tick_sizes["BTCUSDT"] = 0.01
-        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
         wall_id = "BTCUSDT:buy:100:diagnostic-life"
+        prepared_levels = calculate_trade_levels(
+            strategy_id=BOUNCE_STRATEGY_ID, wall_side="buy", wall_price=100,
+            tick_size=0.01,
+            take_profit_bps=engine.trading_settings.default_take_profit_bps,
+            stop_loss_bps=engine.trading_settings.default_stop_loss_bps,
+        )
         existing = {
             "strategy_id": "bounce", "symbol": "BTCUSDT", "wall_side": "buy",
             "wall_price": 100, "wall_id": wall_id, "signal_id": "already-pending",
-            "wall_size": 1000, "wall_ratio": 900, "side": "long",
-            "entry_price": 100.02, "stop_loss": 99.98, "take_profit": 100.06,
+            "wall_size": 1000, "wall_ratio": 900, **prepared_levels,
             "entry_mode": "limit",
         }
         self.assertIsNotNone(engine.trade_manager.create_trade(existing, settings))
@@ -1519,6 +1536,42 @@ class StrategyCallbackTests(unittest.TestCase):
         self.assertFalse(run_immediate(Admin()(callback)))
 
 
+class TradeLevelTelegramTests(unittest.TestCase):
+    def test_global_and_pair_menus_distinguish_overrides_from_effective_values(self):
+        engine = TradingEngine(
+            {
+                "BTCUSDT": PairSettings("BTCUSDT", take_profit_bps=50),
+                "ETHUSDT": PairSettings("ETHUSDT", stop_loss_bps=25),
+            },
+            TradingSettings(default_take_profit_bps=40, default_stop_loss_bps=40),
+        )
+        runtime = RuntimeController(engine)
+
+        global_text = trade_levels_text(runtime)
+        btc_text = trade_level_pair_text(runtime, "btcusdt")
+        eth_text = trade_level_pair_text(runtime, "ETHUSDT")
+        self.assertIn("Глобальный TP от Entry: <b>40 б.п.</b>", global_text)
+        self.assertIn("BTCUSDT: эффективно TP 50 / SL 40 б.п.", global_text)
+        self.assertIn("персональное 50 б.п.", btc_text)
+        self.assertIn("глобальное 40 б.п.", btc_text)
+        self.assertIn("Эффективно: TP 50 / SL 40 б.п.", btc_text)
+        self.assertIn("персональное 25 б.п.", eth_text)
+        self.assertIn("Эффективно: TP 40 / SL 25 б.п.", eth_text)
+
+        global_callbacks = [
+            button.callback_data for row in trade_levels_keyboard().inline_keyboard
+            for button in row
+        ]
+        pair_callbacks = [
+            button.callback_data for row in trade_level_pair_keyboard(runtime, "BTCUSDT").inline_keyboard
+            for button in row
+        ]
+        self.assertIn("levels_set:global:tp", global_callbacks)
+        self.assertIn("levels_set:global:sl", global_callbacks)
+        self.assertIn("levels_reset:BTCUSDT:tp", pair_callbacks)
+        self.assertIn("levels_reset:BTCUSDT:sl", pair_callbacks)
+
+
 class StableWallTelegramTests(unittest.TestCase):
     def setUp(self):
         self.runtime = RuntimeController(TradingEngine({
@@ -1773,13 +1826,14 @@ class VirtualTradeTests(unittest.TestCase):
         trade = self.manager.create_trade(signal, self.settings)
 
         self.assertAlmostEqual(trade["entry_price"], 99.985)
-        self.assertAlmostEqual(trade["stop_loss"], 100.02)
+        self.assertAlmostEqual(trade["stop_loss"], 100.035)
         self.assertAlmostEqual(
             trade["entry_price"] - trade["take_profit"],
             trade["stop_loss"] - trade["entry_price"],
         )
+        self.manager.on_price("BTCUSDT", 99.9)
         self.manager.on_price("BTCUSDT", 100.0)
-        events = self.manager.on_price("BTCUSDT", 100.03)
+        events = self.manager.on_price("BTCUSDT", 100.04)
         self.assertEqual(events[0]["event"], "TRADE_CLOSED")
         self.assertEqual(trade["close_reason"], "STOP_LOSS")
         self.assertLess(trade["profit_usdt"], 0)

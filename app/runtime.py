@@ -4,6 +4,7 @@ import logging
 
 from script.engine import EngineMode, StrategyPersistenceError, TradingEngine
 from script.settings import PairSettings, TradingSettings, normalize_pair_symbol
+from script.trade_levels import effective_trade_level_bps
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,8 @@ class RuntimeController:
                 initial_balance_usdt=self.engine.trading_settings.initial_balance_usdt,
                 max_open_trades=self.engine.trading_settings.max_open_trades,
                 leverage=self.engine.trading_settings.leverage,
+                default_take_profit_bps=self.engine.trading_settings.default_take_profit_bps,
+                default_stop_loss_bps=self.engine.trading_settings.default_stop_loss_bps,
             )
             if self.engine.repository is not None:
                 try:
@@ -184,6 +187,8 @@ class RuntimeController:
                 initial_balance_usdt=self.engine.trading_settings.initial_balance_usdt,
                 max_open_trades=maximum,
                 leverage=self.engine.trading_settings.leverage,
+                default_take_profit_bps=self.engine.trading_settings.default_take_profit_bps,
+                default_stop_loss_bps=self.engine.trading_settings.default_stop_loss_bps,
             )
             if self.engine.repository is not None:
                 try:
@@ -207,21 +212,81 @@ class RuntimeController:
                 key: dict(value)
                 for key, value in self.engine._pending_persistence.items()
             }
+            previous_settings = self.engine.pair_settings.get(symbol)
             events = []
             if not settings.enabled:
                 events = self.engine.trade_manager.cancel_pending_for_symbol(
                     symbol, "PAIR_DISABLED"
                 )
+            elif previous_settings is not None and effective_trade_level_bps(
+                previous_settings, self.engine.trading_settings
+            ) != effective_trade_level_bps(settings, self.engine.trading_settings):
+                self.engine.pair_settings[symbol] = settings
+                self.engine.trade_manager.set_pair_settings_for_price_check(settings)
+                events = self.engine.replan_after_level_settings_change(symbol)
             if not await self.engine.persist_pair_settings(settings, events):
-                if events:
-                    self.engine.restore_trade_state(
-                        previous_trades,
-                        previous_balance,
-                        previous_pending_persistence,
+                if previous_settings is not None:
+                    self.engine.pair_settings[symbol] = previous_settings
+                    self.engine.trade_manager.set_pair_settings_for_price_check(
+                        previous_settings
                     )
+                self.engine.restore_trade_state(
+                    previous_trades,
+                    previous_balance,
+                    previous_pending_persistence,
+                )
                 raise RuntimeError("Could not persist pair settings and trade state")
             self.engine.pair_settings[symbol] = settings
+            self.engine.trade_manager.set_pair_settings_for_price_check(settings)
             await self._sync_workers()
+
+    async def update_trade_level_defaults(
+        self,
+        *,
+        take_profit_bps: float | None = None,
+        stop_loss_bps: float | None = None,
+    ) -> TradingSettings:
+        """Save global bps defaults and atomically re-plan affected PENDINGs."""
+        async with self._lifecycle_lock, self.engine.state_lock:
+            previous_settings = self.engine.trading_settings
+            updated = replace(
+                previous_settings,
+                default_take_profit_bps=(
+                    previous_settings.default_take_profit_bps
+                    if take_profit_bps is None else take_profit_bps
+                ),
+                default_stop_loss_bps=(
+                    previous_settings.default_stop_loss_bps
+                    if stop_loss_bps is None else stop_loss_bps
+                ),
+            )
+            if updated == previous_settings:
+                return updated
+            previous_trades = [
+                dict(trade) for trade in self.engine.trade_manager.trades
+            ]
+            previous_balance = self.engine.trade_manager.balance_usdt
+            previous_pending_persistence = {
+                key: dict(value)
+                for key, value in self.engine._pending_persistence.items()
+            }
+            self.engine.trading_settings = updated
+            self.engine.trade_manager.trading_settings = updated
+            events = []
+            for symbol in self.engine.pair_settings:
+                events.extend(
+                    self.engine.replan_after_level_settings_change(symbol)
+                )
+            if not await self.engine.persist_trading_settings(updated, events):
+                self.engine.trading_settings = previous_settings
+                self.engine.trade_manager.trading_settings = previous_settings
+                self.engine.restore_trade_state(
+                    previous_trades,
+                    previous_balance,
+                    previous_pending_persistence,
+                )
+                raise RuntimeError("Could not persist global TP/SL settings and trade state")
+            return updated
 
     async def update_enabled_strategies(
         self, symbol: str, strategy_ids: set[str], admin_user_id: int | None = None,
