@@ -296,9 +296,11 @@ class DatabaseRepositoryTests(unittest.TestCase):
             enabled=False,
             min_wall_ratio=900,
             max_open_trades=2,
+            leverage=35,
         )
         trading_settings = TradingSettings(
-            stake_usdt=25, initial_balance_usdt=100, max_open_trades=5
+            stake_usdt=25, initial_balance_usdt=100, max_open_trades=5,
+            leverage=40,
         )
 
         with patch.object(repository, "async_session", return_value=session):
@@ -308,8 +310,10 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertFalse(pair_row.enabled)
         self.assertEqual(pair_row.min_wall_ratio, 900)
         self.assertEqual(pair_row.max_open_trades, 2)
+        self.assertEqual(pair_row.leverage, 35)
         self.assertEqual(runtime_row.stake_usdt, 25)
         self.assertEqual(runtime_row.max_open_trades, 5)
+        self.assertEqual(runtime_row.default_leverage, 40)
         self.assertEqual(session.commits, 2)
 
     def test_save_enabled_strategies_inserts_and_updates(self):
@@ -486,6 +490,13 @@ class DatabaseRepositoryTests(unittest.TestCase):
             "profit_usdt": 0.0035,
             "profit_percent": 0.035,
             "close_reason": "TAKE_PROFIT",
+            "leverage": 25,
+            "position_notional_usdt": 250,
+            "entry_fee_usdt": 0.1375,
+            "exit_fee_usdt": 0.1376,
+            "gross_pnl_usdt": 0.2786,
+            "fee_rate": 0.00055,
+            "accounting_version": 1,
         }
         with patch.object(repository, "async_session", return_value=session):
             run_immediate(
@@ -498,6 +509,12 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(saved.entry_price, trade["entry_price"])
         self.assertEqual(saved.exit_price, trade["exit_price"])
         self.assertEqual(saved.profit_usdt, 0.0035)
+        self.assertEqual(saved.leverage, 25)
+        self.assertEqual(saved.position_notional_usdt, 250)
+        self.assertEqual(saved.entry_fee_usdt, 0.1375)
+        self.assertEqual(saved.exit_fee_usdt, 0.1376)
+        self.assertEqual(saved.gross_pnl_usdt, 0.2786)
+        self.assertEqual(saved.fee_rate, 0.00055)
         self.assertEqual(runtime_state.balance_usdt, 100.0035)
         self.assertEqual(runtime_state.engine_mode, "running")
         self.assertEqual(session.commits, 1)

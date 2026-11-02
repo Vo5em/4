@@ -31,6 +31,10 @@ class PairSettings:
     breakout_confirm_seconds: float = 5.0
     breakout_buffer_bps: float = 0.5
     breakout_max_update_gap_seconds: float = 2.0
+    leverage: float | None = None
+    maker_fee_rate: float = 0.0002
+    taker_fee_rate: float = 0.00055
+    maintenance_margin_rate: float = 0.005
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_pair_symbol(self.symbol))
@@ -67,6 +71,10 @@ class PairSettings:
             raise ValueError("max_open_trades must be an integer")
         if self.max_open_trades < 1:
             raise ValueError("max_open_trades must be at least 1")
+        if self.leverage is not None and (not isfinite(self.leverage) or self.leverage <= 0 or self.leverage > 125):
+            raise ValueError("leverage must be positive and no greater than 125")
+        if any(not isfinite(rate) or rate < 0 or rate >= 1 for rate in (self.maker_fee_rate, self.taker_fee_rate, self.maintenance_margin_rate)):
+            raise ValueError("fee and maintenance margin rates must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class TradingSettings:
     stake_usdt: float = 10.0
     initial_balance_usdt: float = 1000.0
     max_open_trades: int = 3
+    leverage: float = 25.0
 
     def __post_init__(self) -> None:
         if not isfinite(self.stake_usdt) or self.stake_usdt <= 0:
@@ -86,3 +95,5 @@ class TradingSettings:
             raise ValueError("max_open_trades must be an integer")
         if self.max_open_trades < 1:
             raise ValueError("max_open_trades must be at least 1")
+        if not isfinite(self.leverage) or self.leverage <= 0 or self.leverage > 125:
+            raise ValueError("leverage must be positive and no greater than 125")

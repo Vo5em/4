@@ -29,6 +29,25 @@ class TradeManager:
         last_prices: dict[str, float] | None = None,
     ) -> None:
         self.trades = [dict(trade) for trade in trades]
+        for trade in self.trades:
+            # Rows written before margin accounting used stake as their whole
+            # notional and did not charge fees. Preserve that interpretation;
+            # most importantly, leave recorded historical profit untouched.
+            stake = float(trade.get("stake_usdt") or 0.0)
+            notional = trade.get("position_notional_usdt")
+            if notional is None:
+                notional = stake
+                trade["position_notional_usdt"] = notional
+            if trade.get("leverage") is None:
+                trade["leverage"] = notional / stake if stake > 0 else 1.0
+            entry_fee = trade.get("entry_fee_usdt")
+            if entry_fee is None:
+                entry_fee = 0.0
+            trade["entry_fee"] = trade.get("entry_fee", entry_fee) or 0.0
+            trade["entry_fee_usdt"] = trade.get("entry_fee_usdt", entry_fee) or 0.0
+            trade["exit_fee"] = trade.get("exit_fee", trade.get("exit_fee_usdt") or 0.0) or 0.0
+            trade["gross_pnl"] = trade.get("gross_pnl", trade.get("gross_pnl_usdt"))
+            trade["taker_fee_rate"] = trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0) or 0.0
         self._used_signal_ids = {trade["signal_id"] for trade in self.trades}
         self.balance_usdt = float(balance_usdt)
         if last_prices is not None:
@@ -138,6 +157,8 @@ class TradeManager:
             if stake_usdt is None
             else stake_usdt
         )
+        leverage = float(pair_settings.leverage or self.trading_settings.leverage)
+        position_notional = stake * leverage
         reserved = sum(
             trade["stake_usdt"]
             for trade in self.trades
@@ -188,6 +209,19 @@ class TradeManager:
             "wall_size": wall_size,
             "wall_ratio": wall_ratio,
             "stake_usdt": stake,
+            "leverage": leverage,
+            "position_notional_usdt": position_notional,
+            "maker_fee_rate": pair_settings.maker_fee_rate,
+            "taker_fee_rate": pair_settings.taker_fee_rate,
+            "fee_rate": pair_settings.taker_fee_rate,
+            "entry_fee": 0.0,
+            "entry_fee_usdt": 0.0,
+            "exit_fee": 0.0,
+            "exit_fee_usdt": 0.0,
+            "gross_pnl": 0.0,
+            "gross_pnl_usdt": 0.0,
+            "net_pnl": 0.0,
+            "margin_return_pct": 0.0,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
@@ -200,6 +234,10 @@ class TradeManager:
             "profit_usdt": 0.0,
             "profit_percent": 0.0,
         }
+        if immediate:
+            trade["entry_fee"] = position_notional * pair_settings.taker_fee_rate
+            trade["entry_fee_usdt"] = trade["entry_fee"]
+            self.balance_usdt -= trade["entry_fee"]
         self.trades.append(trade)
         self._used_signal_ids.add(signal_id)
         return trade
@@ -240,6 +278,9 @@ class TradeManager:
                     continue
                 trade["status"] = "open"
                 trade["opened_at"] = datetime.now(timezone.utc)
+                trade["entry_fee"] = trade["position_notional_usdt"] * trade["taker_fee_rate"]
+                trade["entry_fee_usdt"] = trade["entry_fee"]
+                self.balance_usdt -= trade["entry_fee"]
                 events.append({
                     "event": "ENTRY_ACTIVATED", "trade": trade,
                     "trigger_price": numeric_price,
@@ -366,21 +407,33 @@ class TradeManager:
 
     def _close_trade(self, trade: dict, price: float, reason: str) -> dict:
         direction = 1 if trade["side"] == "long" else -1
-        profit = (
-            (price - trade["entry_price"])
-            / trade["entry_price"]
-            * trade["stake_usdt"]
+        notional = trade.get("position_notional_usdt") or trade["stake_usdt"]
+        entry_fee = trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0)
+        gross_pnl = (
+            notional
+            * (price - trade["entry_price"]) / trade["entry_price"]
             * direction
         )
+        exit_notional = notional * price / trade["entry_price"]
+        exit_fee = exit_notional * trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0)
+        net_pnl = gross_pnl - entry_fee - exit_fee
         trade.update(
             status="closed",
             exit_price=float(price),
             closed_at=datetime.now(timezone.utc),
             close_reason=reason,
-            profit_usdt=profit,
-            profit_percent=(profit / trade["stake_usdt"] * 100),
+            exit_fee=exit_fee,
+            exit_fee_usdt=exit_fee,
+            gross_pnl=gross_pnl,
+            gross_pnl_usdt=gross_pnl,
+            net_pnl=net_pnl,
+            profit_usdt=net_pnl,
+            profit_percent=(net_pnl / trade["stake_usdt"] * 100),
+            margin_return_pct=(net_pnl / trade["stake_usdt"] * 100),
         )
-        self.balance_usdt += profit
+        # Balance is cash/equity: the reserved margin is not removed here;
+        # closing releases its reservation and applies only net PnL.
+        self.balance_usdt += gross_pnl - exit_fee
         return {"event": "TRADE_CLOSED", "trade": trade, "fill_price": float(price)}
 
     def close_all(self) -> list[dict]:
@@ -455,10 +508,13 @@ class TradeManager:
         weekly_losses = sum(trade["profit_usdt"] < 0 for trade in weekly)
         open_trades = self.get_open_trades()
         unrealized_profit = sum(
-            (self.last_prices[trade["symbol"]] - trade["entry_price"])
-            / trade["entry_price"]
-            * trade["stake_usdt"]
+            ((self.last_prices[trade["symbol"]] - trade["entry_price"])
+            / trade["entry_price"] * (trade.get("position_notional_usdt") or trade["stake_usdt"])
             * (1 if trade["side"] == "long" else -1)
+            - trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0)
+            - (trade.get("position_notional_usdt") or trade["stake_usdt"])
+            * self.last_prices[trade["symbol"]] / trade["entry_price"]
+            * trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0))
             for trade in open_trades
             if trade["symbol"] in self.last_prices
         )
@@ -467,10 +523,18 @@ class TradeManager:
             for trade in self.trades
             if trade["status"] in {"pending", "open"}
         )
+        # Entry fees are already deducted from cash when a position opens.
+        # Add them back when combining net unrealized trade PnL with cash, so
+        # equity includes that cost exactly once.
+        outstanding_entry_fees = sum(
+            trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0)
+            for trade in open_trades
+        )
         return {
             "balance_usdt": self.balance_usdt,
-            "equity_usdt": self.balance_usdt + unrealized_profit,
+            "equity_usdt": self.balance_usdt + unrealized_profit + outstanding_entry_fees,
             "available_balance_usdt": self.balance_usdt - reserved,
+            "reserved_margin_usdt": reserved,
             "unrealized_profit_usdt": unrealized_profit,
             "stake_usdt": self.trading_settings.stake_usdt,
             "max_open_trades": self.trading_settings.max_open_trades,

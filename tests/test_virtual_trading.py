@@ -1,6 +1,7 @@
 import os
 import json
 import unittest
+from types import SimpleNamespace
 from dataclasses import replace
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -1524,20 +1525,91 @@ class VirtualTradeTests(unittest.TestCase):
 
         close_events = self.manager.on_price("BTCUSDT", trade["take_profit"])
         self.assertEqual(trade["close_reason"], "TAKE_PROFIT")
-        self.assertGreater(trade["profit_usdt"], 0)
+        self.assertGreater(trade["gross_pnl_usdt"], 0)
+        self.assertAlmostEqual(
+            trade["profit_usdt"],
+            trade["gross_pnl_usdt"] - trade["entry_fee_usdt"] - trade["exit_fee_usdt"],
+        )
         self.assertEqual(close_events[0]["trigger_price"], trade["take_profit"])
         self.assertEqual(close_events[0]["fill_price"], trade["take_profit"])
 
     def test_statistics_include_unrealized_and_available_balance(self):
-        self.manager.create_trade(self.signal, self.settings)
+        trade = self.manager.create_trade(self.signal, self.settings)
         self.manager.on_price("BTCUSDT", 100.0)
 
         stats = self.manager.get_statistics()
 
-        expected_unrealized = (100.0 - 100.015) / 100.015 * 10
+        notional = trade["stake_usdt"] * trade["leverage"]
+        gross = (100.0 - 100.015) / 100.015 * notional
+        expected_unrealized = gross - trade["entry_fee_usdt"] - notional * 100.0 / 100.015 * trade["taker_fee_rate"]
         self.assertAlmostEqual(stats["unrealized_profit_usdt"], expected_unrealized)
         self.assertAlmostEqual(stats["equity_usdt"], 100 + expected_unrealized)
-        self.assertEqual(stats["available_balance_usdt"], 90)
+        self.assertAlmostEqual(stats["available_balance_usdt"], 90 - trade["entry_fee_usdt"])
+
+    def test_pair_specific_leverage_is_frozen_and_margin_is_reserved_per_trade(self):
+        btc = PairSettings("BTCUSDT", leverage=10)
+        eth = PairSettings("ETHUSDT", leverage=20)
+        eth_signal = dict(self.signal, symbol="ETHUSDT", wall_id="eth-wall")
+
+        btc_trade = self.manager.create_trade(self.signal, btc, stake_usdt=30)
+        eth_trade = self.manager.create_trade(eth_signal, eth, stake_usdt=30)
+
+        self.assertEqual((btc_trade["leverage"], btc_trade["position_notional_usdt"]), (10, 300))
+        self.assertEqual((eth_trade["leverage"], eth_trade["position_notional_usdt"]), (20, 600))
+        # A pending trade reserves its stake only; it does not remove margin
+        # from cash or reserve leveraged notional.
+        self.assertEqual(self.manager.balance_usdt, 100)
+        self.assertEqual(self.manager.get_statistics()["reserved_margin_usdt"], 60)
+        self.assertEqual(self.manager.get_statistics()["available_balance_usdt"], 40)
+
+        self.manager.on_price("BTCUSDT", 100)
+        self.manager.on_price("ETHUSDT", 100)
+        self.manager.trading_settings = TradingSettings(
+            stake_usdt=30, initial_balance_usdt=100, max_open_trades=2, leverage=50
+        )
+        self.manager.on_price("BTCUSDT", btc_trade["take_profit"])
+        self.manager.on_price("ETHUSDT", eth_trade["take_profit"])
+
+        self.assertEqual(btc_trade["leverage"], 10)
+        self.assertEqual(eth_trade["leverage"], 20)
+        self.assertAlmostEqual(self.manager.balance_usdt, 100 + btc_trade["profit_usdt"] + eth_trade["profit_usdt"])
+        self.assertEqual(self.manager.get_statistics()["reserved_margin_usdt"], 0)
+
+    def test_legacy_trade_restore_preserves_historical_financial_values(self):
+        legacy = {
+            "signal_id": "legacy-1", "symbol": "BTCUSDT", "side": "long",
+            "wall_side": "buy", "stake_usdt": 10, "status": "closed",
+            "entry_price": 100, "exit_price": 101, "profit_usdt": 7.25,
+            "profit_percent": 72.5, "leverage": None,
+            "position_notional_usdt": None, "entry_fee_usdt": None,
+            "exit_fee_usdt": None, "taker_fee_rate": 0.0,
+        }
+        self.manager.restore_state([legacy], 107.25)
+        self.assertEqual(self.manager.trades[0]["profit_usdt"], 7.25)
+        self.assertEqual(self.manager.get_statistics()["total_profit_usdt"], 7.25)
+
+    def test_database_trade_hydration_restores_margin_and_fee_snapshot(self):
+        from database.request import _trade_dict
+
+        row = SimpleNamespace(
+            signal_id="persisted", strategy_id="stable_wall_v1", symbol="BTCUSDT",
+            side="long", wall_side="buy", status="open", wall_price=100,
+            wall_size=50, wall_ratio=2, stake_usdt=30, leverage=25,
+            position_notional_usdt=750, entry_fee_usdt=0.4125,
+            exit_fee_usdt=None, gross_pnl_usdt=None, fee_rate=0.00055,
+            accounting_version=1, entry_price=100, stop_loss=99,
+            take_profit=102, exit_price=None, profit_usdt=0,
+            profit_percent=0, close_reason=None, created_at=datetime.now(timezone.utc),
+            opened_at=datetime.now(timezone.utc), closed_at=None,
+        )
+        hydrated = _trade_dict(row)
+        restored = TradeManager(self.trading_settings)
+        restored.restore_state([hydrated], 99.5875)
+
+        self.assertEqual(restored.trades[0]["leverage"], 25)
+        self.assertEqual(restored.trades[0]["position_notional_usdt"], 750)
+        self.assertEqual(restored.trades[0]["entry_fee"], 0.4125)
+        self.assertEqual(restored.trades[0]["taker_fee_rate"], 0.00055)
 
     def test_distinct_signals_are_not_limited_by_configured_open_trade_caps(self):
         second = dict(self.signal, wall_id="wall-2", wall_price=101.0)

@@ -61,7 +61,7 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                 stake_usdt=10, initial_balance_usdt=100, max_open_trades=3
             )
             state = await repository.initialize_database(
-                defaults, {"BTCUSDT": PairSettings("BTCUSDT")}
+                defaults, {"BTCUSDT": PairSettings("BTCUSDT", leverage=17)}
             )
             self.assertFalse(state["initialized"])
             self.assertEqual(
@@ -80,6 +80,13 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                 "wall_size": 1000.0,
                 "wall_ratio": 900.0,
                 "stake_usdt": 10.0,
+                "leverage": 17.0,
+                "position_notional_usdt": 170.0,
+                "entry_fee_usdt": 0.0935,
+                "exit_fee_usdt": 0.0,
+                "gross_pnl_usdt": 0.0,
+                "fee_rate": 0.00055,
+                "accounting_version": 1,
                 "entry_price": 100.015,
                 "stop_loss": 99.98,
                 "take_profit": 100.05,
@@ -113,11 +120,16 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             self.assertEqual(saved_admin_user_id, 8445920246)
 
             restored = await repository.initialize_database(
-                defaults, {"BTCUSDT": PairSettings("BTCUSDT")}
+                defaults, {"BTCUSDT": PairSettings("BTCUSDT", leverage=17)}
             )
             self.assertEqual(restored["enabled_strategies"], {"BTCUSDT": set()})
             self.assertEqual(restored["last_prices"], {"BTCUSDT": 100.02})
             self.assertEqual(restored["trades"][0]["status"], "cancelled")
+            self.assertEqual(restored["trades"][0]["leverage"], 17.0)
+            self.assertEqual(restored["trades"][0]["position_notional_usdt"], 170.0)
+            self.assertEqual(restored["trades"][0]["entry_fee_usdt"], 0.0935)
+            self.assertEqual(restored["trades"][0]["taker_fee_rate"], 0.00055)
+            self.assertEqual(restored["pair_settings"]["BTCUSDT"].leverage, 17.0)
             self.assertEqual(
                 restored["trades"][0]["close_reason"], "STRATEGY_DISABLED"
             )

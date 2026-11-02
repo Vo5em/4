@@ -27,6 +27,7 @@ class RuntimeState(Base):
     initial_balance_usdt: Mapped[float] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=False)
     stake_usdt: Mapped[float] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=False)
     max_open_trades: Mapped[int] = mapped_column(nullable=False, default=3)
+    default_leverage: Mapped[float] = mapped_column(Numeric(10, 4, asdecimal=False), nullable=False, default=25.0)
     engine_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="stopped")
     initialized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
@@ -49,6 +50,9 @@ class TradingPairSetting(Base):
     breakout_confirm_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=5.0)
     breakout_buffer_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=0.5)
     breakout_max_update_gap_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=2.0)
+    leverage: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False), nullable=True)
+    maker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.0002)
+    taker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.00055)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -102,6 +106,13 @@ class VirtualTrade(Base):
     wall_size: Mapped[float] = mapped_column(Numeric(30, 8, asdecimal=False), nullable=False)
     wall_ratio: Mapped[float] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=False, default=0)
     stake_usdt: Mapped[float] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=False)
+    leverage: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False), nullable=True)
+    position_notional_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
+    entry_fee_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
+    exit_fee_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
+    gross_pnl_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
+    fee_rate: Mapped[float | None] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=True)
+    accounting_version: Mapped[int] = mapped_column(nullable=False, default=1)
     entry_price: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
     stop_loss: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
     take_profit: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
@@ -135,6 +146,13 @@ async def async_main() -> None:
             "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS "
             "breakout_max_update_gap_seconds NUMERIC(18, 8) NOT NULL DEFAULT 2.0"
         ))
+        await connection.execute(text("ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS default_leverage NUMERIC(10,4) NOT NULL DEFAULT 25.0"))
+        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS leverage NUMERIC(10,4)"))
+        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS maker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.0002"))
+        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS taker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.00055"))
+        for column, sql_type in (("leverage", "NUMERIC(10,4)"), ("position_notional_usdt", "NUMERIC(24,8)"), ("entry_fee_usdt", "NUMERIC(24,8)"), ("exit_fee_usdt", "NUMERIC(24,8)"), ("gross_pnl_usdt", "NUMERIC(24,8)"), ("fee_rate", "NUMERIC(18,10)")):
+            await connection.execute(text(f"ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS {column} {sql_type}"))
+        await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS accounting_version INTEGER NOT NULL DEFAULT 1"))
         await connection.execute(text(
             "ALTER TABLE pair_strategy_configs ADD COLUMN IF NOT EXISTS "
             "version INTEGER NOT NULL DEFAULT 1"

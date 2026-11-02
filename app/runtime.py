@@ -168,6 +168,7 @@ class RuntimeController:
                 stake_usdt=stake_usdt,
                 initial_balance_usdt=self.engine.trading_settings.initial_balance_usdt,
                 max_open_trades=self.engine.trading_settings.max_open_trades,
+                leverage=self.engine.trading_settings.leverage,
             )
             if self.engine.repository is not None:
                 try:
@@ -185,6 +186,7 @@ class RuntimeController:
                 stake_usdt=self.engine.trading_settings.stake_usdt,
                 initial_balance_usdt=self.engine.trading_settings.initial_balance_usdt,
                 max_open_trades=maximum,
+                leverage=self.engine.trading_settings.leverage,
             )
             if self.engine.repository is not None:
                 try:

@@ -31,6 +31,7 @@ async def initialize_database(
                 initial_balance_usdt=default_trading_settings.initial_balance_usdt,
                 stake_usdt=default_trading_settings.stake_usdt,
                 max_open_trades=default_trading_settings.max_open_trades,
+                default_leverage=default_trading_settings.leverage,
                 engine_mode="stopped",
                 initialized=False,
             )
@@ -80,6 +81,7 @@ async def initialize_database(
                 stake_usdt=state.stake_usdt,
                 initial_balance_usdt=state.initial_balance_usdt,
                 max_open_trades=state.max_open_trades,
+                leverage=getattr(state, "default_leverage", 25.0) or 25.0,
             ),
             "balance_usdt": state.balance_usdt,
             "engine_mode": state.engine_mode,
@@ -102,6 +104,9 @@ async def initialize_database(
                     breakout_max_update_gap_seconds=getattr(
                         row, "breakout_max_update_gap_seconds", 2.0
                     ) or 2.0,
+                    leverage=getattr(row, "leverage", None),
+                    maker_fee_rate=getattr(row, "maker_fee_rate", 0.0002) or 0.0002,
+                    taker_fee_rate=getattr(row, "taker_fee_rate", 0.00055) or 0.00055,
                 )
                 for row in pair_rows
             },
@@ -174,6 +179,9 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
         breakout_confirm_seconds=settings.breakout_confirm_seconds,
         breakout_buffer_bps=settings.breakout_buffer_bps,
         breakout_max_update_gap_seconds=settings.breakout_max_update_gap_seconds,
+        leverage=settings.leverage,
+        maker_fee_rate=settings.maker_fee_rate,
+        taker_fee_rate=settings.taker_fee_rate,
     )
 
 
@@ -189,6 +197,20 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "wall_size": row.wall_size,
         "wall_ratio": row.wall_ratio,
         "stake_usdt": row.stake_usdt,
+        "leverage": getattr(row, "leverage", None),
+        "position_notional_usdt": getattr(row, "position_notional_usdt", None),
+        "entry_fee_usdt": getattr(row, "entry_fee_usdt", None),
+        "exit_fee_usdt": getattr(row, "exit_fee_usdt", None),
+        "gross_pnl_usdt": getattr(row, "gross_pnl_usdt", None),
+        "fee_rate": getattr(row, "fee_rate", None),
+        "accounting_version": getattr(row, "accounting_version", 0) or 0,
+        # Older rows have no accounting metadata; keep their recorded PnL and
+        # allow TradeManager's legacy stake-as-notional/zero-fee fallback.
+        "entry_fee": getattr(row, "entry_fee_usdt", None) or 0.0,
+        "exit_fee": getattr(row, "exit_fee_usdt", None) or 0.0,
+        "gross_pnl": getattr(row, "gross_pnl_usdt", None),
+        "taker_fee_rate": getattr(row, "fee_rate", None) or 0.0,
+        "fee_rate": getattr(row, "fee_rate", None),
         "entry_price": row.entry_price,
         "stop_loss": row.stop_loss,
         "take_profit": row.take_profit,
@@ -217,6 +239,7 @@ async def save_runtime_state(
                 balance_usdt=balance_usdt,
                 initial_balance_usdt=trading_settings.initial_balance_usdt,
                 max_open_trades=trading_settings.max_open_trades,
+                default_leverage=trading_settings.leverage,
                 stake_usdt=trading_settings.stake_usdt,
             )
             session.add(state)
@@ -225,6 +248,7 @@ async def save_runtime_state(
         state.initial_balance_usdt = trading_settings.initial_balance_usdt
         state.stake_usdt = trading_settings.stake_usdt
         state.max_open_trades = trading_settings.max_open_trades
+        state.default_leverage = trading_settings.leverage
         state.initialized = initialized
         await session.commit()
 
@@ -246,6 +270,8 @@ async def save_trades(
                 for key in (
                     "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
                     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
+                    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
+                    "gross_pnl_usdt", "fee_rate", "accounting_version",
                     "stop_loss", "take_profit", "exit_price", "profit_usdt", "close_reason",
                     "profit_percent", "created_at", "opened_at", "closed_at",
                 )
@@ -275,6 +301,7 @@ async def save_pair_settings(settings: PairSettings) -> None:
                 "consumed_ratio", "entry_distance_bps", "stop_distance_bps", "max_open_trades",
                 "bounce_reversal_bps", "breakout_confirm_seconds", "breakout_buffer_bps",
                 "breakout_max_update_gap_seconds",
+                "leverage", "maker_fee_rate", "taker_fee_rate",
             ):
                 setattr(row, key, getattr(values, key))
         await session.commit()
@@ -362,6 +389,8 @@ async def save_enabled_strategies_with_trades(
                 for key in (
                     "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
                     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
+                    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
+                    "gross_pnl_usdt", "fee_rate", "accounting_version",
                     "stop_loss", "take_profit", "exit_price", "profit_usdt", "close_reason",
                     "profit_percent", "created_at", "opened_at", "closed_at",
                 )
@@ -396,6 +425,8 @@ async def save_pair_settings_with_trades(
                 for key in (
                     "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
                     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
+                    "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
+                    "gross_pnl_usdt", "fee_rate", "accounting_version",
                     "stop_loss", "take_profit", "exit_price", "profit_usdt", "close_reason",
                     "profit_percent", "created_at", "opened_at", "closed_at",
                 )
@@ -417,6 +448,7 @@ async def save_pair_settings_with_trades(
                 "stop_distance_bps", "max_open_trades", "bounce_reversal_bps",
                 "breakout_confirm_seconds", "breakout_buffer_bps",
                 "breakout_max_update_gap_seconds",
+                "leverage", "maker_fee_rate", "taker_fee_rate",
             ):
                 setattr(pair_row, key, getattr(values, key))
 
@@ -437,12 +469,14 @@ async def save_trading_settings(settings: TradingSettings) -> None:
                 initial_balance_usdt=settings.initial_balance_usdt,
                 stake_usdt=settings.stake_usdt,
                 max_open_trades=settings.max_open_trades,
+                default_leverage=settings.leverage,
             )
             session.add(state)
         else:
             state.stake_usdt = settings.stake_usdt
             state.initial_balance_usdt = settings.initial_balance_usdt
             state.max_open_trades = settings.max_open_trades
+            state.default_leverage = settings.leverage
         await session.commit()
 
 
