@@ -97,6 +97,22 @@ class MarketPrice(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
 
 
+class ManualPlanBlock(Base):
+    """Active manual PENDING suppressions; deleted when their wall disappears."""
+
+    __tablename__ = "manual_plan_blocks"
+
+    signal_id: Mapped[str] = mapped_column(
+        String(200), ForeignKey("virtual_trades.signal_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    strategy_id: Mapped[str] = mapped_column(String(60), nullable=False)
+    wall_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    wall_side: Mapped[str] = mapped_column(String(10), nullable=False)
+    wall_price: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
+
+
 class VirtualTrade(Base):
     __tablename__ = "virtual_trades"
     __table_args__ = (

@@ -73,6 +73,8 @@ from app.admin import (
     navigate_stable_walls,
     WALLS_PAGE_SIZE,
     TELEGRAM_TEXT_LIMIT,
+    _deal_card,
+    _deal_list_text,
     _save_pair_leverage,
     close_open_trades as close_open_trades_callback,
     edit_message_if_changed,
@@ -140,6 +142,8 @@ class FakeRepository:
         self.saved_enabled_strategies = []
         self.saved_admin_user_ids = []
         self.fail_strategy_saves = False
+        self.released_manual_blocks = []
+        self.fail_manual_block_releases = False
 
     async def save_trades(self, trades, balance_usdt, engine_mode=None):
         if self.fail_trade_saves:
@@ -148,6 +152,11 @@ class FakeRepository:
 
     async def save_market_price(self, symbol, price):
         self.saved_prices.append((symbol, price))
+
+    async def release_manual_plan_blocks(self, signal_ids):
+        if self.fail_manual_block_releases:
+            raise OSError("temporary manual block release failure")
+        self.released_manual_blocks.extend(signal_ids)
 
     async def save_pair_settings(self, settings):
         if self.fail_pair_saves:
@@ -1572,6 +1581,56 @@ class TradeLevelTelegramTests(unittest.TestCase):
         self.assertIn("levels_reset:BTCUSDT:sl", pair_callbacks)
 
 
+class DealManagerTelegramTests(unittest.TestCase):
+    def make_runtime(self):
+        settings = TradingSettings(stake_usdt=10, initial_balance_usdt=100, max_open_trades=10)
+        manager = TradeManager(settings)
+        engine = TradingEngine(
+            {"BTCUSDT": PairSettings("BTCUSDT")}, settings, trade_manager=manager
+        )
+        runtime = RuntimeController(engine)
+        common = {
+            "strategy_id": "bounce", "symbol": "BTCUSDT", "wall_side": "buy",
+            "wall_price": 100, "wall_size": 5000, "wall_ratio": 900,
+            "wall_id": "BTCUSDT:buy:100:lifecycle-1", "entry_price": 100.01,
+            "stop_loss": 99.9, "take_profit": 100.2,
+        }
+        opened = manager.create_trade({**common, "signal_id": "deal-open-1", "entry_mode": "market"}, engine.pair_settings["BTCUSDT"])
+        pending = manager.create_trade({**common, "wall_id": "BTCUSDT:buy:99:lifecycle-2", "wall_price": 99, "signal_id": "deal-pending-1"}, engine.pair_settings["BTCUSDT"])
+        manager.on_price("BTCUSDT", 100.05, process_open=False)
+        return runtime, opened, pending
+
+    def test_open_and_pending_cards_show_required_virtual_trade_fields(self):
+        runtime, opened, pending = self.make_runtime()
+        open_text, open_keyboard = _deal_card(runtime, opened)
+        pending_text, pending_keyboard = _deal_card(runtime, pending)
+        self.assertIn("OPEN", open_text)
+        self.assertIn("PnL", open_text)
+        expected_pnl = runtime.engine.trade_manager.trade_unrealized_pnl(
+            opened, runtime.engine.trade_manager.last_prices["BTCUSDT"]
+        )
+        self.assertIn(f"{expected_pnl:+.4f} USDT", open_text)
+        self.assertIn("Номинал", open_text)
+        self.assertIn("PENDING", pending_text)
+        self.assertIn("Резерв маржи", pending_text)
+        self.assertIn("ARMED", pending_text)
+        self.assertLessEqual(len(open_text), 4096)
+        self.assertLessEqual(len(pending_text), 4096)
+        self.assertTrue(all(len(button.callback_data) <= 64 for row in open_keyboard.inline_keyboard for button in row))
+        self.assertTrue(all(len(button.callback_data) <= 64 for row in pending_keyboard.inline_keyboard for button in row))
+
+    def test_lists_paginate_and_keep_telegram_payloads_compact(self):
+        runtime, opened, _ = self.make_runtime()
+        manager = runtime.engine.trade_manager
+        for index in range(8):
+            item = dict(opened, signal_id=f"open-extra-{index}", symbol="BTCUSDT")
+            manager.trades.append(item)
+        page_text, keyboard = _deal_list_text(runtime, "open", 1)
+        self.assertIn("стр.", page_text)
+        self.assertLessEqual(len(page_text), 4096)
+        self.assertTrue(all(len(button.callback_data) <= 64 for row in keyboard.inline_keyboard for button in row))
+
+
 class StableWallTelegramTests(unittest.TestCase):
     def setUp(self):
         self.runtime = RuntimeController(TradingEngine({
@@ -2048,6 +2107,160 @@ class VirtualTradeTests(unittest.TestCase):
 
 
 class EngineControlTests(unittest.TestCase):
+    def test_manual_pending_cancel_suppresses_same_wall_until_new_lifecycle(self):
+        class FixedStrategy:
+            strategy_id = "manual_cancel_test"
+
+            def evaluate(self, context):
+                return [TradeSignal(
+                    strategy_id=self.strategy_id, symbol=context.symbol,
+                    wall_side="buy", wall_price=100.0,
+                    wall_id="BTCUSDT:buy:100:lifecycle-old", wall_size=1000.0,
+                    wall_ratio=900.0, side="long", entry_price=100.05,
+                    stop_loss=99.9, take_profit=100.2, entry_mode="cross",
+                    entry_trigger_direction="cross_down",
+                )]
+
+        registry = StrategyRegistry()
+        registry.register(FixedStrategy())
+        settings = PairSettings("BTCUSDT")
+        engine = TradingEngine(
+            {"BTCUSDT": settings}, TradingSettings(initial_balance_usdt=100),
+            strategy_registry=registry,
+            enabled_strategies={"BTCUSDT": {"manual_cancel_test"}},
+        )
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        wall = {"side": "buy", "price": 100.0, "notional": 1000.0, "age": 50.0}
+        MarketFreshnessTests.record_market_health(engine, price_value=100.1)
+        events = engine.on_market_update("BTCUSDT", 100.1, [wall])
+        pending = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
+        run_immediate(engine.cancel_pending_trade(pending["signal_id"]))
+        self.assertEqual(engine.on_market_update("BTCUSDT", 100.1, [wall]), [])
+        self.assertEqual(engine.trade_manager.get_pending_trades(), [])
+        self.assertTrue(engine.trade_manager.is_wall_manually_cancelled(
+            "BTCUSDT", "manual_cancel_test", "BTCUSDT:buy:100:lifecycle-old"
+        ))
+
+    def test_single_manual_close_uses_trade_manager_and_persists_balance(self):
+        repository = FakeRepository()
+        engine = MarketFreshnessTests.make_engine()
+        engine.repository = repository
+        MarketFreshnessTests.record_market_health(engine, price_value=100.0)
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
+        MarketFreshnessTests.record_market_health(engine, price_value=100.25)
+        engine.trade_manager.on_price("BTCUSDT", 100.25, process_open=False)
+        event = run_immediate(engine.close_virtual_trade(trade["signal_id"]))
+
+        self.assertEqual(event["event"], "TRADE_CLOSED")
+        self.assertEqual(trade["status"], "closed")
+        self.assertEqual(trade["close_reason"], "ADMIN_CLOSED")
+        self.assertEqual(trade["exit_price"], 100.25)
+        self.assertEqual(repository.saved_trade_batches[-1][0][0]["status"], "closed")
+
+    def test_manual_open_level_edit_is_tick_validated_and_persisted(self):
+        repository = FakeRepository()
+        engine = MarketFreshnessTests.make_engine()
+        engine.repository = repository
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        MarketFreshnessTests.record_market_health(engine, price_value=100.0)
+        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
+
+        run_immediate(engine.update_open_trade_level(
+            trade["signal_id"], field="tp", value=101.25
+        ))
+        self.assertEqual(trade["take_profit"], 101.25)
+        self.assertEqual(trade["stop_loss"], 99.0)
+        self.assertEqual(repository.saved_trade_batches[-1][0][0]["take_profit"], 101.25)
+        with self.assertRaisesRegex(ValueError, "tickSize"):
+            run_immediate(engine.update_open_trade_level(
+                trade["signal_id"], field="tp", value=101.251
+            ))
+        with self.assertRaisesRegex(ValueError, "правильную сторону"):
+            run_immediate(engine.update_open_trade_level(
+                trade["signal_id"], field="tp", value=99.5
+            ))
+
+    def test_failed_manual_cancel_rolls_back_and_success_releases_reserve(self):
+        repository = FakeRepository()
+        settings = PairSettings("BTCUSDT")
+        manager = TradeManager(TradingSettings(stake_usdt=10, initial_balance_usdt=100))
+        trade = manager.create_trade({
+            "signal_id": "manual-pending-1", "strategy_id": "bounce",
+            "symbol": "BTCUSDT", "wall_side": "buy", "wall_price": 100,
+            "wall_id": "BTCUSDT:buy:100:lifecycle-1", "wall_size": 1000,
+            "wall_ratio": 900, "entry_price": 100.01, "stop_loss": 99.9,
+            "take_profit": 100.2,
+        }, settings)
+        engine = TradingEngine({"BTCUSDT": settings}, manager.trading_settings,
+                               trade_manager=manager, repository=repository)
+        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 90)
+        repository.fail_trade_saves = True
+        with self.assertRaisesRegex(RuntimeError, "восстановлено"):
+            run_immediate(engine.cancel_pending_trade(trade["signal_id"]))
+        trade = manager.find_trade("manual-pending-1")
+        self.assertEqual(trade["status"], "pending")
+        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 90)
+
+        repository.fail_trade_saves = False
+        run_immediate(engine.cancel_pending_trade(trade["signal_id"]))
+        self.assertEqual(trade["status"], "cancelled")
+        self.assertEqual(trade["close_reason"], "MANUAL_CANCELLED")
+        self.assertEqual(
+            repository.saved_trade_batches[-1][0][0]["close_reason"],
+            "MANUAL_CANCELLED",
+        )
+        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 100)
+        self.assertTrue(manager.is_wall_manually_cancelled(
+            "BTCUSDT", "bounce", trade["wall_id"]
+        ))
+        restored = TradeManager(manager.trading_settings)
+        restored.restore_state([trade], 100)
+        self.assertTrue(restored.is_wall_manually_cancelled(
+            "BTCUSDT", "bounce", trade["wall_id"]
+        ))
+
+    def test_manual_cancel_block_is_scoped_to_wall_lifecycle(self):
+        manager = TradeManager(TradingSettings())
+        cancelled = {
+            "signal_id": "manual-cancel", "symbol": "BTCUSDT", "strategy_id": "bounce",
+            "wall_id": "wall-lifecycle-old", "wall_side": "buy", "wall_price": 100,
+            "status": "cancelled",
+            "close_reason": "MANUAL_CANCELLED",
+        }
+        manager.restore_state([cancelled], 1000)
+        self.assertTrue(manager.is_wall_manually_cancelled(
+            "BTCUSDT", "bounce", "wall-lifecycle-old"
+        ))
+        self.assertFalse(manager.is_wall_manually_cancelled(
+            "BTCUSDT", "bounce", "wall-lifecycle-next"
+        ))
+
+    def test_manual_wall_block_releases_only_after_complete_scan_sees_disappearance(self):
+        repository = FakeRepository()
+        settings = PairSettings("BTCUSDT")
+        manager = TradeManager(TradingSettings(stake_usdt=10, initial_balance_usdt=100))
+        trade = manager.create_trade({
+            "signal_id": "manual-release-plan", "strategy_id": "bounce",
+            "symbol": "BTCUSDT", "wall_side": "buy", "wall_price": 100,
+            "wall_id": "wall-life", "wall_size": 1000, "wall_ratio": 900,
+            "entry_price": 100.01, "stop_loss": 99.9, "take_profit": 100.2,
+        }, settings)
+        engine = TradingEngine({"BTCUSDT": settings}, manager.trading_settings,
+                               trade_manager=manager, repository=repository)
+        run_immediate(engine.cancel_pending_trade(trade["signal_id"]))
+        self.assertTrue(manager.is_wall_manually_cancelled(
+            "BTCUSDT", "bounce", "wall-life", "buy", 100
+        ))
+
+        run_immediate(engine.process_market_update("BTCUSDT", 100, [], wall_candidates=[]))
+        self.assertEqual(repository.released_manual_blocks, [trade["signal_id"]])
+        self.assertFalse(manager.is_wall_manually_cancelled(
+            "BTCUSDT", "bounce", "wall-life", "buy", 100
+        ))
+
     def test_pair_leverage_update_is_independent_and_only_changes_future_trades(self):
         repository = FakeRepository()
         btc = PairSettings("BTCUSDT", min_wall_ratio=999)

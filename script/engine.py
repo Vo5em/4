@@ -677,6 +677,120 @@ class TradingEngine:
                 raise
             return events
 
+    async def close_virtual_trade(self, signal_id: str) -> dict:
+        """Close one OPEN position under the same lock and persistence path as market events."""
+        async with self.state_lock:
+            trade = self.trade_manager.find_trade(signal_id)
+            if trade is None or trade.get("status") != "open":
+                raise RuntimeError("Сделка больше не находится в статусе OPEN")
+            symbol = trade["symbol"].upper()
+            self._require_fresh_exit_price(symbol)
+            previous_trades = [dict(item) for item in self.trade_manager.trades]
+            previous_balance = self.trade_manager.balance_usdt
+            previous_pending = {key: dict(value) for key, value in self._pending_persistence.items()}
+            event = self.trade_manager.close_trade(
+                signal_id, self.trade_manager.last_prices[symbol]
+            )
+            if event is None:
+                raise RuntimeError("Статус сделки изменился; обновите карточку")
+            if not await self.persist_events([event]):
+                self.restore_trade_state(previous_trades, previous_balance, previous_pending)
+                raise RuntimeError("PostgreSQL не сохранил закрытие; состояние сделки восстановлено")
+            return event
+
+    async def cancel_pending_trade(self, signal_id: str) -> dict:
+        """Cancel one PENDING without racing market entry or plan replacement."""
+        async with self.state_lock:
+            trade = self.trade_manager.find_trade(signal_id)
+            if trade is None or trade.get("status") != "pending":
+                raise RuntimeError("Сделка больше не находится в статусе PENDING")
+            previous_trades = [dict(item) for item in self.trade_manager.trades]
+            previous_balance = self.trade_manager.balance_usdt
+            previous_pending = {key: dict(value) for key, value in self._pending_persistence.items()}
+            event = self.trade_manager.cancel_pending_trade(signal_id)
+            if event is None:
+                raise RuntimeError("Статус сделки изменился; обновите карточку")
+            if not await self.persist_events([event]):
+                self.restore_trade_state(previous_trades, previous_balance, previous_pending)
+                raise RuntimeError("PostgreSQL не сохранил отмену; состояние сделки восстановлено")
+            return event
+
+    async def update_open_trade_levels(
+        self, signal_id: str, *, take_profit: float, stop_loss: float
+    ) -> dict:
+        """Edit only one OPEN trade's levels; settings and other trades are untouched."""
+        async with self.state_lock:
+            trade = self.trade_manager.find_trade(signal_id)
+            if trade is None or trade.get("status") != "open":
+                raise RuntimeError("Сделка больше не находится в статусе OPEN")
+            symbol = trade["symbol"].upper()
+            self._require_fresh_exit_price(symbol)
+            tick_size = self.instrument_tick_sizes.get(symbol)
+            if tick_size is None or tick_size <= 0:
+                raise RuntimeError(f"Для {symbol} недоступен актуальный tickSize Bybit")
+            previous_trades = [dict(item) for item in self.trade_manager.trades]
+            previous_balance = self.trade_manager.balance_usdt
+            previous_pending = {key: dict(value) for key, value in self._pending_persistence.items()}
+            event = self.trade_manager.update_open_trade_levels(
+                signal_id,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                current_price=self.trade_manager.last_prices[symbol],
+                tick_size=tick_size,
+            )
+            if event is None:
+                raise RuntimeError("Статус сделки изменился; обновите карточку")
+            if not await self.persist_events([event]):
+                self.restore_trade_state(previous_trades, previous_balance, previous_pending)
+                raise RuntimeError("PostgreSQL не сохранил TP/SL; изменения отменены")
+            return event
+
+    async def update_open_trade_level(
+        self, signal_id: str, *, field: str, value: float
+    ) -> dict:
+        """Update one level using the other level read while holding state_lock."""
+        if field not in {"tp", "sl"}:
+            raise ValueError("field must be tp or sl")
+        async with self.state_lock:
+            trade = self.trade_manager.find_trade(signal_id)
+            if trade is None or trade.get("status") != "open":
+                raise RuntimeError("Сделка больше не находится в статусе OPEN")
+            symbol = trade["symbol"].upper()
+            self._require_fresh_exit_price(symbol)
+            tick_size = self.instrument_tick_sizes.get(symbol)
+            if tick_size is None or tick_size <= 0:
+                raise RuntimeError(f"Для {symbol} недоступен актуальный tickSize Bybit")
+            take_profit = value if field == "tp" else float(trade["take_profit"])
+            stop_loss = value if field == "sl" else float(trade["stop_loss"])
+            previous_trades = [dict(item) for item in self.trade_manager.trades]
+            previous_balance = self.trade_manager.balance_usdt
+            previous_pending = {key: dict(item) for key, item in self._pending_persistence.items()}
+            event = self.trade_manager.update_open_trade_levels(
+                signal_id,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                current_price=self.trade_manager.last_prices[symbol],
+                tick_size=tick_size,
+            )
+            if event is None:
+                raise RuntimeError("Статус сделки изменился; обновите карточку")
+            if not await self.persist_events([event]):
+                self.restore_trade_state(previous_trades, previous_balance, previous_pending)
+                raise RuntimeError("PostgreSQL не сохранил TP/SL; изменения отменены")
+            return event
+
+    def _require_fresh_exit_price(self, symbol: str) -> None:
+        health = self.get_market_data_health(symbol)
+        manager_price = self.trade_manager.last_prices.get(symbol)
+        if (
+            not self._has_market_data_metadata(symbol)
+            or not health["price_fresh"]
+            or manager_price is None
+            or health.get("price_value") is None
+            or Decimal(str(manager_price)) != Decimal(str(health["price_value"]))
+        ):
+            raise RuntimeError(f"Для {symbol} нет актуальной цены; сделка не изменена")
+
     async def _stop_all_locked(self) -> list[dict]:
         if self.mode == EngineMode.STOPPED:
             return []
@@ -962,6 +1076,39 @@ class TradingEngine:
         """Serialize a market-state transition and its persistence as one unit."""
         async with self.state_lock:
             symbol = symbol.upper()
+            # A manual plan suppression is released only after a complete,
+            # synchronized scanner snapshot no longer contains that wall.
+            if wall_candidates is not None:
+                health = self.get_market_data_health(symbol)
+                try:
+                    price_matches = (
+                        health.get("price_value") is None
+                        or Decimal(str(last_price)) == Decimal(str(health["price_value"]))
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    price_matches = False
+                snapshot_current = (
+                    not self._has_market_data_metadata(symbol)
+                    or (health["fresh"] and health["book_synchronized"] and price_matches)
+                )
+                if snapshot_current:
+                    expired_blocks = self.trade_manager.get_expired_manual_wall_block_ids(
+                        symbol, tuple(stable_walls) + tuple(wall_candidates)
+                    )
+                    if expired_blocks:
+                        try:
+                            release = getattr(self.repository, "release_manual_plan_blocks", None)
+                            if self.repository is not None:
+                                if not callable(release):
+                                    raise RuntimeError("Repository does not support manual plan block release")
+                                await release(expired_blocks)
+                            self.trade_manager.release_manual_wall_blocks(expired_blocks)
+                        except Exception as error:
+                            self.record_database_error(error)
+                            logger.warning(
+                                "%s could not release disappeared manual wall suppressions: %s",
+                                symbol, type(error).__name__,
+                            )
             previous_trades = [
                 dict(trade) for trade in self.trade_manager.trades
             ]
@@ -1299,6 +1446,14 @@ class TradingEngine:
                     self.strategy_errors.pop(symbol, None)
             desired_slots = {"buy": None, "sell": None}
             for signal in signals:
+                if self.trade_manager.is_wall_manually_cancelled(
+                    symbol, strategy.strategy_id, signal.wall_id,
+                    signal.wall_side, signal.wall_price,
+                ):
+                    trade_rejections.append(
+                        f"{signal.wall_side.upper()} {signal.wall_price}: план вручную отменён до завершения жизненного цикла стены."
+                    )
+                    continue
                 desired_slots[signal.wall_side] = signal
             tick_size = self.instrument_tick_sizes.get(symbol)
             for wall_side in ("buy", "sell"):

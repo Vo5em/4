@@ -1,4 +1,5 @@
 import os
+import hashlib
 from math import isfinite
 from datetime import timezone
 from html import escape
@@ -63,6 +64,7 @@ class SettingsInput(StatesGroup):
     waiting_for_pair_statistics = State()
     waiting_for_pair_leverage = State()
     waiting_for_trade_level = State()
+    waiting_for_open_trade_level = State()
 
 
 class Admin(Filter):
@@ -1003,6 +1005,322 @@ async def show_statistics(
             reply_markup=kb.back,
         )
     await callback.answer()
+
+
+_DEALS_PAGE_SIZE = 5
+
+
+def _deal_token(trade: dict) -> str:
+    return hashlib.sha256(str(trade.get("signal_id", "")).encode()).hexdigest()[:20]
+
+
+def _trade_for_token(runtime: RuntimeController, token: str) -> dict | None:
+    matches = [
+        trade for trade in runtime.engine.trade_manager.trades
+        if _deal_token(trade) == token
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _strategy_name(strategy_id: str) -> str:
+    return {"bounce": "Bounce", "breakout": "Breakout"}.get(
+        strategy_id, strategy_id or "нет данных"
+    )
+
+
+def _wall_side_label(wall_side: str) -> str:
+    return {"buy": "BID", "sell": "ASK"}.get(str(wall_side).lower(), str(wall_side).upper())
+
+
+def _deal_list_text(runtime: RuntimeController, section: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    manager = runtime.engine.trade_manager
+    trades = manager.get_open_trades() if section == "open" else manager.get_pending_trades()
+    trades = sorted(trades, key=lambda item: (str(item.get("created_at") or ""), item.get("signal_id", "")))
+    page_count = max(1, (len(trades) + _DEALS_PAGE_SIZE - 1) // _DEALS_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    title = "Открытые · OPEN" if section == "open" else "Запланированные · PENDING"
+    lines = [f"<b>Менеджер сделок · {title}</b> · стр. {page + 1}/{page_count}", f"Всего: {len(trades)}"]
+    start = page * _DEALS_PAGE_SIZE
+    for trade in trades[start:start + _DEALS_PAGE_SIZE]:
+        token = _deal_token(trade)
+        price = manager.last_prices.get(trade["symbol"])
+        if section == "open":
+            pnl = manager.trade_unrealized_pnl(trade, price) if price is not None else None
+            measure = f"PnL {pnl:+.2f} USDT" if pnl is not None else "PnL нет данных"
+        else:
+            measure = f"Entry {float(trade['entry_price']):g} · маржа {float(trade['stake_usdt']):.2f}"
+        lines.append(
+            f"• <code>{escape(trade['symbol'])}</code> {_strategy_name(trade.get('strategy_id'))} "
+            f"{trade.get('side', '').upper()} · {measure}"
+        )
+    if not trades:
+        lines.append("Сделок в этом разделе нет.")
+    rows = [
+        [InlineKeyboardButton(text=f"{escape(t['symbol'])} · {_strategy_name(t.get('strategy_id'))} · {t.get('side','').upper()}", callback_data=f"deal:view:{_deal_token(t)}")]
+        for t in trades[start:start + _DEALS_PAGE_SIZE]
+    ]
+    rows.append([
+        InlineKeyboardButton(text="OPEN", callback_data="deals:open:0"),
+        InlineKeyboardButton(text="PENDING", callback_data="deals:pending:0"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="Назад", callback_data=f"deals:{section}:{max(0, page - 1)}"),
+        InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data=f"deals:{section}:{page}"),
+        InlineKeyboardButton(text="Вперёд", callback_data=f"deals:{section}:{min(page_count - 1, page + 1)}"),
+    ])
+    rows.append([InlineKeyboardButton(text="На главную", callback_data="dashboard")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _deal_card(runtime: RuntimeController, trade: dict) -> tuple[str, InlineKeyboardMarkup]:
+    manager = runtime.engine.trade_manager
+    status = str(trade.get("status", "unknown")).upper()
+    symbol = escape(str(trade.get("symbol", "нет данных")))
+    strategy = _strategy_name(str(trade.get("strategy_id", "")))
+    side = str(trade.get("side", "нет данных")).upper()
+    price = manager.last_prices.get(str(trade.get("symbol", "")).upper())
+    lines = [
+        f"<b>{symbol} · {strategy} · {side}</b>",
+        f"ID: <code>{escape(str(trade.get('signal_id', 'нет данных')))}</code>",
+        f"Статус: <b>{status}</b>",
+        f"Создана: {_date_label(trade.get('created_at'))}",
+        f"Entry: {float(trade.get('entry_price') or 0):g} · текущая цена: {price if price is not None else 'нет данных'}",
+        f"TP: {float(trade.get('take_profit') or 0):g} · SL: {float(trade.get('stop_loss') or 0):g}",
+    ]
+    if status == "OPEN":
+        notional = float(trade.get("position_notional_usdt") or trade.get("stake_usdt") or 0)
+        pnl = manager.trade_unrealized_pnl(trade, price) if price is not None else None
+        lines.extend([
+            f"Плечо: {float(trade.get('leverage') or 1):g}x · маржа: {float(trade.get('stake_usdt') or 0):.2f} USDT",
+            f"Номинал: {notional:.2f} USDT · плавающий PnL: {f'{pnl:+.4f} USDT' if pnl is not None else 'нет данных'}",
+            f"Комиссия входа: {float(trade.get('entry_fee_usdt') or 0):.6f} USDT · ожидаемая комиссия выхода: "
+            + (f"{notional * float(price) / float(trade.get('entry_fill_price') or trade.get('entry_price')) * float(trade.get('taker_fee_rate', trade.get('fee_rate') or 0)):.6f} USDT" if price is not None else "нет данных"),
+            f"Wall: {_wall_side_label(trade.get('wall_side', ''))} {float(trade.get('wall_price') or 0):g} · {escape(str(trade.get('wall_id') or 'нет ID'))}",
+        ])
+        rows = [
+            [InlineKeyboardButton(text="Закрыть сделку", callback_data=f"deal:confirm_close:{_deal_token(trade)}")],
+            [InlineKeyboardButton(text="Изменить TP", callback_data=f"deal:edit_tp:{_deal_token(trade)}"), InlineKeyboardButton(text="Изменить SL", callback_data=f"deal:edit_sl:{_deal_token(trade)}")],
+            [InlineKeyboardButton(text="К OPEN", callback_data="deals:open:0")],
+        ]
+    elif status == "PENDING":
+        distance = abs(float(price) - float(trade["entry_price"])) / float(trade["entry_price"]) * 10000 if price is not None else None
+        lines.extend([
+            f"Стабильная стена: {_wall_side_label(trade.get('wall_side', ''))} {float(trade.get('wall_price') or 0):g} · объём {float(trade.get('wall_size') or 0):g} · ratio {float(trade.get('wall_ratio') or 0):g}x",
+            f"Расстояние до Entry: {f'{distance:.2f} bps' if distance is not None else 'нет данных'}",
+            f"Триггер: {'ARMED' if trade.get('entry_armed') else 'WAITING'} · направление: {escape(str(trade.get('entry_trigger_direction') or 'нет данных'))}",
+            f"Резерв маржи: {float(trade.get('stake_usdt') or 0):.2f} USDT · плечо {float(trade.get('leverage') or 1):g}x",
+            f"Диагностика: reference={trade.get('entry_previous_price') if trade.get('entry_previous_price') is not None else 'нет данных'}; wall_id={escape(str(trade.get('wall_id') or 'нет данных'))}",
+        ])
+        rows = [[InlineKeyboardButton(text="Отменить план", callback_data=f"deal:confirm_cancel:{_deal_token(trade)}")], [InlineKeyboardButton(text="К PENDING", callback_data="deals:pending:0")]]
+    else:
+        lines.extend([
+            f"Стена: {escape(str(trade.get('wall_side', '')).upper())} {float(trade.get('wall_price') or 0):g}",
+            f"Финансовый результат: {float(trade.get('profit_usdt') or 0):+.4f} USDT",
+            f"Причина завершения: {escape(str(trade.get('close_reason') or 'нет данных'))}",
+            f"Закрыта: {_date_label(trade.get('closed_at'))}",
+        ])
+        rows = [[InlineKeyboardButton(text="К OPEN", callback_data="deals:open:0")], [InlineKeyboardButton(text="К PENDING", callback_data="deals:pending:0")]]
+    rows.append([InlineKeyboardButton(text="Обновить карточку", callback_data=f"deal:view:{_deal_token(trade)}")])
+    rows.append([InlineKeyboardButton(text="В менеджер", callback_data="deals:home")])
+    text = "\n".join(lines)
+    if len(text) > 4096:
+        raise ValueError("Trade card exceeded Telegram message limit")
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _refresh_deal_after_stale(callback: CallbackQuery, runtime: RuntimeController, token: str) -> None:
+    if callback.message is None:
+        return
+    trade = _trade_for_token(runtime, token)
+    if trade is not None:
+        text, keyboard = _deal_card(runtime, trade)
+    else:
+        text, keyboard = _deal_list_text(runtime, "open", 0)
+    await edit_message_if_changed(callback.message, text, keyboard)
+
+
+@admin.callback_query(Admin(), F.data == "deals:home")
+async def show_deal_manager(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    await state.clear()
+    if callback.message is not None:
+        text, keyboard = _deal_list_text(runtime, "open", 0)
+        await edit_message_if_changed(callback.message, text, keyboard)
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("deals:"))
+async def show_deal_list(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[1] not in {"open", "pending"}:
+        await callback.answer("Некорректный раздел", show_alert=True)
+        return
+    try:
+        page = max(0, int(parts[2]))
+    except ValueError:
+        page = 0
+    await state.clear()
+    if callback.message is not None:
+        text, keyboard = _deal_list_text(runtime, parts[1], page)
+        await edit_message_if_changed(callback.message, text, keyboard)
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("deal:view:"))
+async def show_deal_card(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    await state.clear()
+    trade = _trade_for_token(runtime, callback.data.rsplit(":", 1)[-1])
+    if trade is None:
+        await callback.answer("Сделка не найдена. Обновите список.", show_alert=True)
+        return
+    if callback.message is not None:
+        text, keyboard = _deal_card(runtime, trade)
+        await edit_message_if_changed(callback.message, text, keyboard)
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("deal:confirm_close:"))
+async def confirm_close_deal(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    token = callback.data.rsplit(":", 1)[-1]
+    trade = _trade_for_token(runtime, token)
+    if trade is None or trade.get("status") != "open":
+        await _refresh_deal_after_stale(callback, runtime, token)
+        await callback.answer("Сделка уже изменилась. Обновите список.", show_alert=True)
+        return
+    token = _deal_token(trade)
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"Закрыть виртуальную сделку <code>{escape(str(trade['symbol']))}</code> "
+            f"{trade['side'].upper()} по текущей цене {runtime.engine.trade_manager.last_prices.get(trade['symbol'], 'нет данных')}? "
+            "PnL и комиссия будут рассчитаны штатным механизмом TradeManager.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Подтвердить закрытие", callback_data=f"deal:close:{token}")],
+                [InlineKeyboardButton(text="Отмена", callback_data=f"deal:view:{token}")],
+            ]),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("deal:close:"))
+async def close_one_deal(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    token = callback.data.rsplit(":", 1)[-1]
+    trade = _trade_for_token(runtime, token)
+    if trade is None or trade.get("status") != "open":
+        await _refresh_deal_after_stale(callback, runtime, token)
+        await callback.answer("Сделка уже изменилась; список обновлён", show_alert=True)
+        return
+    signal_id = trade["signal_id"]
+    try:
+        await runtime.close_virtual_trade(signal_id)
+    except Exception as error:
+        logger.exception("Manual virtual close failed for %s", signal_id)
+        trade = _trade_for_token(runtime, _deal_token(trade))
+        if callback.message is not None and trade is not None:
+            text, keyboard = _deal_card(runtime, trade)
+            await edit_message_if_changed(callback.message, f"{escape(str(error))}\n\n{text}", keyboard)
+        await callback.answer("Не удалось закрыть; показано актуальное состояние", show_alert=True)
+        return
+    await callback.answer("Сделка закрыта по доступной виртуальной цене")
+    if callback.message is not None:
+        text, keyboard = _deal_list_text(runtime, "open", 0)
+        await edit_message_if_changed(callback.message, text, keyboard)
+
+
+@admin.callback_query(Admin(), F.data.startswith("deal:confirm_cancel:"))
+async def confirm_cancel_plan(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    token = callback.data.rsplit(":", 1)[-1]
+    trade = _trade_for_token(runtime, token)
+    if trade is None or trade.get("status") != "pending":
+        await _refresh_deal_after_stale(callback, runtime, token)
+        await callback.answer("План уже изменился. Обновите список.", show_alert=True)
+        return
+    token = _deal_token(trade)
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"Отменить PENDING <code>{escape(str(trade['symbol']))}</code> на стену "
+            f"{float(trade['wall_price']):g}? Резерв маржи освободится. Эта стена не будет "
+            "снова запланирована в рамках текущего жизненного цикла.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Подтвердить отмену", callback_data=f"deal:cancel:{token}")],
+                [InlineKeyboardButton(text="Назад", callback_data=f"deal:view:{token}")],
+            ]),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("deal:cancel:"))
+async def cancel_one_plan(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    token = callback.data.rsplit(":", 1)[-1]
+    trade = _trade_for_token(runtime, token)
+    if trade is None or trade.get("status") != "pending":
+        await _refresh_deal_after_stale(callback, runtime, token)
+        await callback.answer("План уже изменился; список обновлён", show_alert=True)
+        return
+    signal_id = trade["signal_id"]
+    try:
+        await runtime.cancel_pending_trade(signal_id)
+    except Exception as error:
+        logger.exception("Manual PENDING cancellation failed for %s", signal_id)
+        await callback.answer(f"Отмена не сохранена: {str(error)[:160]}", show_alert=True)
+        return
+    await callback.answer("PENDING отменён; резерв маржи освобождён")
+    if callback.message is not None:
+        text, keyboard = _deal_list_text(runtime, "pending", 0)
+        await edit_message_if_changed(callback.message, text, keyboard)
+
+
+@admin.callback_query(Admin(), F.data.regexp(r"^deal:edit_(tp|sl):[0-9a-f]{20}$"))
+async def request_open_trade_level(callback: CallbackQuery, runtime: RuntimeController, state: FSMContext) -> None:
+    action, token = callback.data.rsplit(":", 2)[1:]
+    trade = _trade_for_token(runtime, token)
+    if trade is None or trade.get("status") != "open":
+        await _refresh_deal_after_stale(callback, runtime, token)
+        await callback.answer("Сделка больше не OPEN", show_alert=True)
+        return
+    await state.update_data(open_trade_signal_id=trade["signal_id"], open_trade_level=action)
+    await state.set_state(SettingsInput.waiting_for_open_trade_level)
+    if callback.message is not None:
+        await callback.message.answer(
+            f"Введите новый {action.upper()} цены для <code>{escape(trade['symbol'])}</code>. "
+            "Значение должно соответствовать tickSize Bybit и оставаться по правильную сторону текущей цены.",
+            reply_markup=kb.cancel_input,
+        )
+    await callback.answer()
+
+
+@admin.message(Admin(), StateFilter(SettingsInput.waiting_for_open_trade_level))
+async def update_open_trade_level(message: Message, state: FSMContext, runtime: RuntimeController) -> None:
+    data = await state.get_data()
+    signal_id = data.get("open_trade_signal_id")
+    field = data.get("open_trade_level")
+    try:
+        value = float((message.text or "").strip())
+        if not isfinite(value) or value <= 0:
+            raise ValueError("Введите положительную цену")
+        trade = runtime.engine.trade_manager.find_trade(signal_id)
+        if trade is None or trade.get("status") != "open":
+            await state.clear()
+            if trade is not None:
+                text, keyboard = _deal_card(runtime, trade)
+                await message.answer("Сделка уже изменилась.\n\n" + text, reply_markup=keyboard)
+            else:
+                await message.answer("Сделка уже изменилась и больше не OPEN. Откройте менеджер и обновите список.")
+            return
+        await runtime.update_open_trade_level(signal_id, field=field, value=value)
+    except ValueError as error:
+        await message.answer(f"Значение не принято: {escape(str(error))}. Повторите ввод или нажмите «Отмена».")
+        return
+    except Exception as error:
+        logger.exception("Could not edit levels for virtual trade %s", signal_id)
+        await state.clear()
+        await message.answer(f"Уровни не изменены: {escape(str(error))}")
+        return
+    await state.clear()
+    trade = runtime.engine.trade_manager.find_trade(signal_id)
+    if trade is not None:
+        text, keyboard = _deal_card(runtime, trade)
+        await message.answer("TP/SL сохранены в PostgreSQL.\n\n" + text, reply_markup=keyboard)
 
 
 @admin.callback_query(Admin(), F.data == "pair_statistics")

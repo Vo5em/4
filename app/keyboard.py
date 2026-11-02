@@ -6,6 +6,7 @@ main = InlineKeyboardMarkup(
         [InlineKeyboardButton(text="Пауза входов · отменить ожидание", callback_data="entries_pause")],
         [InlineKeyboardButton(text="Продолжить входы", callback_data="entries_resume")],
         [InlineKeyboardButton(text="Закрыть только открытые сделки", callback_data="close_open_trades")],
+        [InlineKeyboardButton(text="Менеджер сделок", callback_data="deals:home")],
         [InlineKeyboardButton(text="Полная остановка · закрыть сделки", callback_data="engine_stop")],
         [InlineKeyboardButton(text="Обновить панель", callback_data="dashboard")],
         [InlineKeyboardButton(text="Настройки", callback_data="settings")],

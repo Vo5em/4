@@ -18,13 +18,17 @@ class TradeManager:
         self.balance_usdt = self.trading_settings.initial_balance_usdt
         self.last_create_rejection_reason: str | None = None
         self._deferred_entry_ticks: dict[str, float | None] = {}
+        self._manual_cancelled_wall_blocks: dict[str, tuple[str, str, str, float]] = {}
+        self._manual_block_state_initialized = False
 
     def restore_state(
         self,
         trades: list[dict],
         balance_usdt: float,
         last_prices: dict[str, float] | None = None,
+        manual_plan_blocks: list[dict] | None = None,
     ) -> None:
+        current_manual_blocks = dict(self._manual_cancelled_wall_blocks)
         self.trades = [dict(trade) for trade in trades]
         for trade in self.trades:
             if trade.get("accounting_version") is None:
@@ -62,6 +66,34 @@ class TradeManager:
             trade.setdefault("entry_fill_price", None)
             trade["entry_previous_price"] = None
         self._used_signal_ids = {trade["signal_id"] for trade in self.trades}
+        cancelled_manual_trades = {
+            trade["signal_id"]: (
+                str(trade.get("symbol", "")).upper(),
+                str(trade.get("strategy_id", "")),
+                str(trade.get("wall_side", "")),
+                float(trade.get("wall_price", 0)),
+            )
+            for trade in self.trades
+            if trade.get("status") == "cancelled"
+            and trade.get("close_reason") == "MANUAL_CANCELLED"
+            and trade.get("wall_price") is not None
+        }
+        if manual_plan_blocks is not None:
+            self._manual_cancelled_wall_blocks = {
+                str(block["signal_id"]): (
+                    str(block["symbol"]).upper(), str(block["strategy_id"]),
+                    str(block["wall_side"]), float(block["wall_price"]),
+                )
+                for block in manual_plan_blocks
+            }
+        elif self._manual_block_state_initialized:
+            self._manual_cancelled_wall_blocks = {
+                signal_id: key for signal_id, key in current_manual_blocks.items()
+                if signal_id in cancelled_manual_trades
+            }
+        else:
+            self._manual_cancelled_wall_blocks = cancelled_manual_trades
+        self._manual_block_state_initialized = True
         self.balance_usdt = float(balance_usdt)
         if last_prices is not None:
             self.last_prices = {
@@ -476,6 +508,125 @@ class TradeManager:
                      and trade["wall_side"] == wall_side
                      and trade["status"] == "pending"), None)
 
+    def find_trade(self, signal_id: str) -> dict | None:
+        return next(
+            (trade for trade in self.trades if trade.get("signal_id") == signal_id),
+            None,
+        )
+
+    def is_wall_manually_cancelled(
+        self, symbol: str, strategy_id: str, wall_id: str,
+        wall_side: str | None = None, wall_price: float | None = None,
+    ) -> bool:
+        """Keep an explicitly cancelled wall plan suppressed for its lifecycle."""
+        if wall_side is None or wall_price is None:
+            return any(
+                trade.get("signal_id") in self._manual_cancelled_wall_blocks
+                and trade.get("wall_id") == wall_id
+                and trade.get("symbol", "").upper() == symbol.upper()
+                and trade.get("strategy_id") == strategy_id
+                for trade in self.trades
+            )
+        return any(
+            key == (
+                symbol.upper(), strategy_id, wall_side or "",
+                float(wall_price or 0),
+            )
+            for key in self._manual_cancelled_wall_blocks.values()
+        )
+
+    def get_expired_manual_wall_block_ids(
+        self, symbol: str, observed_walls: list[dict] | tuple[dict, ...]
+    ) -> list[str]:
+        """Identify blocks whose wall is absent from a complete scanner result."""
+        symbol = symbol.upper()
+        observed = set()
+        for wall in observed_walls:
+            side = str(wall.get("side", "")).lower()
+            try:
+                price = float(wall.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if side in {"buy", "sell"} and isfinite(price):
+                observed.add((side, price))
+        return [
+            signal_id for signal_id, key in self._manual_cancelled_wall_blocks.items()
+            if key[0] == symbol and (key[2], key[3]) not in observed
+        ]
+
+    def release_manual_wall_blocks(self, signal_ids: list[str]) -> None:
+        for signal_id in signal_ids:
+            self._manual_cancelled_wall_blocks.pop(signal_id, None)
+
+    def cancel_pending_trade(self, signal_id: str) -> dict | None:
+        trade = self.find_trade(signal_id)
+        if trade is None or trade.get("status") != "pending":
+            return None
+        trade.update(
+            status="cancelled",
+            closed_at=datetime.now(timezone.utc),
+            close_reason="MANUAL_CANCELLED",
+        )
+        self._manual_cancelled_wall_blocks[trade["signal_id"]] = (
+            str(trade["symbol"]).upper(), str(trade["strategy_id"]),
+            str(trade["wall_side"]), float(trade["wall_price"]),
+        )
+        return {"event": "ENTRY_CANCELLED", "trade": trade}
+
+    def close_trade(self, signal_id: str, price: float) -> dict | None:
+        trade = self.find_trade(signal_id)
+        if trade is None or trade.get("status") != "open":
+            return None
+        return self._close_trade(trade, price, "ADMIN_CLOSED")
+
+    def update_open_trade_levels(
+        self,
+        signal_id: str,
+        *,
+        take_profit: float,
+        stop_loss: float,
+        current_price: float,
+        tick_size: float,
+    ) -> dict | None:
+        trade = self.find_trade(signal_id)
+        if trade is None or trade.get("status") != "open":
+            return None
+        try:
+            tp, sl, price, tick = map(
+                lambda value: Decimal(str(value)),
+                (take_profit, stop_loss, current_price, tick_size),
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("TP, SL, цена и tickSize должны быть числами") from None
+        if any(not value.is_finite() or value <= 0 for value in (tp, sl, price, tick)):
+            raise ValueError("TP, SL, цена и tickSize должны быть положительными")
+        if tp % tick != 0 or sl % tick != 0:
+            raise ValueError(f"TP и SL должны соответствовать tickSize {tick}")
+        if trade["side"] == "long":
+            valid = sl < price < tp
+        else:
+            valid = tp < price < sl
+        if not valid:
+            raise ValueError("Для текущей цены TP и SL должны оставаться по правильную сторону сделки")
+        trade["take_profit"] = float(tp)
+        trade["stop_loss"] = float(sl)
+        return {"event": "TRADE_LEVELS_UPDATED", "trade": trade}
+
+    def trade_unrealized_pnl(self, trade: dict, current_price: float) -> float:
+        entry_fill = float(trade.get("entry_fill_price") or trade["entry_price"])
+        notional = float(trade.get("position_notional_usdt") or trade["stake_usdt"])
+        price = float(current_price)
+        gross = (
+            notional * (price - entry_fill) / entry_fill
+            * (1 if trade["side"] == "long" else -1)
+        )
+        entry_fee = float(trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0))
+        exit_fee = (
+            notional * price / entry_fill
+            * float(trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0))
+        )
+        return gross - entry_fee - exit_fee
+
     def cancel_pending_for_slot(
         self, symbol: str, strategy_id: str, wall_side: str, reason: str
     ) -> list[dict]:
@@ -666,13 +817,7 @@ class TradeManager:
         weekly_losses = sum(trade["profit_usdt"] < 0 for trade in weekly)
         open_trades = self.get_open_trades()
         unrealized_profit = sum(
-            ((self.last_prices[trade["symbol"]] - (trade.get("entry_fill_price") or trade["entry_price"]))
-            / (trade.get("entry_fill_price") or trade["entry_price"]) * (trade.get("position_notional_usdt") or trade["stake_usdt"])
-            * (1 if trade["side"] == "long" else -1)
-            - trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0)
-            - (trade.get("position_notional_usdt") or trade["stake_usdt"])
-            * self.last_prices[trade["symbol"]] / (trade.get("entry_fill_price") or trade["entry_price"])
-            * trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0))
+            self.trade_unrealized_pnl(trade, self.last_prices[trade["symbol"]])
             for trade in open_trades
             if trade["symbol"] in self.last_prices
         )

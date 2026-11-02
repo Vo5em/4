@@ -50,7 +50,8 @@ async def build_runtime() -> tuple[RuntimeController, bool]:
     )
     engine.record_database_success()
     engine.trade_manager.restore_state(
-        state["trades"], state["balance_usdt"], state["last_prices"]
+        state["trades"], state["balance_usdt"], state["last_prices"],
+        state.get("manual_plan_blocks", []),
     )
 
     mode = state["engine_mode"]

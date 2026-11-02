@@ -1,7 +1,8 @@
-from sqlalchemy import MetaData, Table, inspect, select
+from sqlalchemy import MetaData, Table, delete, inspect, select
 
 from database.models import (
     MarketPrice,
+    ManualPlanBlock,
     PairStrategyConfig,
     StrategyChangeEvent,
     RuntimeState,
@@ -68,6 +69,7 @@ async def initialize_database(
             strategy_rows = (await session.scalars(select(PairStrategyConfig))).all()
         trade_rows = (await session.scalars(select(VirtualTrade))).all()
         market_price_rows = (await session.scalars(select(MarketPrice))).all()
+        manual_plan_block_rows = (await session.scalars(select(ManualPlanBlock))).all()
         configured_strategies = {
             row.symbol: set(row.enabled_strategy_ids)
             for row in strategy_rows
@@ -129,6 +131,17 @@ async def initialize_database(
             "last_prices": {
                 row.symbol: row.last_price for row in market_price_rows
             },
+            "manual_plan_blocks": [
+                {
+                    "signal_id": row.signal_id,
+                    "symbol": row.symbol,
+                    "strategy_id": row.strategy_id,
+                    "wall_id": row.wall_id,
+                    "wall_side": row.wall_side,
+                    "wall_price": row.wall_price,
+                }
+                for row in manual_plan_block_rows
+            ],
             "last_price_observed_at": {
                 row.symbol: row.observed_at for row in market_price_rows
             },
@@ -315,11 +328,33 @@ async def save_trades(
             else:
                 for key, value in values.items():
                     setattr(row, key, value)
+            if trade.get("status") == "cancelled" and trade.get("close_reason") == "MANUAL_CANCELLED":
+                block = await session.get(ManualPlanBlock, trade["signal_id"])
+                if block is None:
+                    session.add(ManualPlanBlock(
+                        signal_id=trade["signal_id"],
+                        symbol=trade["symbol"],
+                        strategy_id=trade["strategy_id"],
+                        wall_id=trade.get("wall_id"),
+                        wall_side=trade["wall_side"],
+                        wall_price=trade["wall_price"],
+                    ))
         state = await session.get(RuntimeState, 1)
         if state is not None:
             state.balance_usdt = balance_usdt
             if engine_mode is not None:
                 state.engine_mode = engine_mode
+        await session.commit()
+
+
+async def release_manual_plan_blocks(signal_ids: list[str]) -> None:
+    """Remove active suppressions while preserving their cancelled trade history."""
+    if not signal_ids:
+        return
+    async with async_session() as session:
+        await session.execute(
+            delete(ManualPlanBlock).where(ManualPlanBlock.signal_id.in_(signal_ids))
+        )
         await session.commit()
 
 

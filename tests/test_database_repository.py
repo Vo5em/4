@@ -12,6 +12,7 @@ from database import request as repository
 from config import validate_database_url
 from database.models import (
     MarketPrice,
+    ManualPlanBlock,
     PairStrategyConfig,
     RuntimeState,
     StrategyChangeEvent,
@@ -19,6 +20,7 @@ from database.models import (
     VirtualTrade,
 )
 from script.settings import PairSettings, TradingSettings
+from script.trade_manager import TradeManager
 
 
 def run_immediate(coroutine):
@@ -43,6 +45,7 @@ class FakeSession:
     def __init__(self, rows=None):
         self.rows = {model: list(values) for model, values in (rows or {}).items()}
         self.commits = 0
+        self.executed = []
 
     async def __aenter__(self):
         return self
@@ -56,6 +59,8 @@ class FakeSession:
                 return row
             if model in {TradingPairSetting, MarketPrice, PairStrategyConfig} and row.symbol == key:
                 return row
+            if model is ManualPlanBlock and row.signal_id == key:
+                return row
         return None
 
     async def scalar(self, statement):
@@ -67,6 +72,16 @@ class FakeSession:
 
     def add(self, row):
         self.rows.setdefault(type(row), []).append(row)
+
+    async def execute(self, statement):
+        self.executed.append(statement)
+        values = list(statement.compile().params.values())
+        signal_ids = next((value for value in values if isinstance(value, (list, tuple, set))), ())
+        if getattr(getattr(statement, "table", None), "name", None) == ManualPlanBlock.__tablename__:
+            self.rows[ManualPlanBlock] = [
+                row for row in self.rows.get(ManualPlanBlock, [])
+                if row.signal_id not in set(signal_ids)
+            ]
 
     async def commit(self):
         self.commits += 1
@@ -173,6 +188,11 @@ class DatabaseRepositoryTests(unittest.TestCase):
                 PairStrategyConfig: [strategy_row],
                 MarketPrice: [market_price],
                 VirtualTrade: [trade],
+                ManualPlanBlock: [ManualPlanBlock(
+                    signal_id=trade.signal_id, symbol="BTCUSDT",
+                    strategy_id="stable_wall_v1", wall_id="BTCUSDT:buy:100:restore-test",
+                    wall_side="buy", wall_price=100,
+                )],
             }
         )
 
@@ -201,6 +221,15 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertIsNone(state["pair_settings"]["BTCUSDT"].stop_loss_bps)
         self.assertEqual(len(state["trades"]), 1)
         self.assertEqual(state["trades"][0]["status"], "open")
+        self.assertEqual(state["manual_plan_blocks"][0]["signal_id"], trade.signal_id)
+        manager = TradeManager(state["trading_settings"])
+        manager.restore_state(
+            state["trades"], state["balance_usdt"], state["last_prices"],
+            state["manual_plan_blocks"],
+        )
+        self.assertTrue(manager.is_wall_manually_cancelled(
+            "BTCUSDT", "stable_wall_v1", trade.wall_id, "buy", trade.wall_price
+        ))
         self.assertEqual(state["trades"][0]["signal_id"], trade.signal_id)
 
     def test_initialize_imports_legacy_bybit_pair_without_overwriting_existing(self):
@@ -600,6 +629,47 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(row.entry_trigger_direction, "cross_down")
         self.assertTrue(row.entry_armed)
         self.assertEqual(row.entry_fill_price, 100.01)
+
+    def test_manual_pending_cancellation_is_persisted_as_history(self):
+        session = FakeSession()
+        trade = {
+            "signal_id": "manual-cancel-plan", "strategy_id": "bounce",
+            "symbol": "BTCUSDT", "side": "long", "wall_side": "buy",
+            "status": "cancelled", "wall_id": "BTCUSDT:buy:100:lifecycle-1",
+            "wall_price": 100, "wall_size": 1000, "wall_ratio": 900,
+            "stake_usdt": 10, "entry_price": 100.01, "stop_loss": 99.9,
+            "take_profit": 100.2, "close_reason": "MANUAL_CANCELLED",
+            "accounting_version": 1,
+        }
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_trades([trade], 100.0))
+
+        saved = session.rows[VirtualTrade][0]
+        self.assertEqual(saved.status, "cancelled")
+        self.assertEqual(saved.close_reason, "MANUAL_CANCELLED")
+        self.assertEqual(saved.wall_id, trade["wall_id"])
+        block = session.rows[ManualPlanBlock][0]
+        self.assertEqual(block.signal_id, trade["signal_id"])
+        self.assertEqual(block.wall_price, trade["wall_price"])
+
+    def test_releasing_manual_plan_block_keeps_cancelled_trade_row(self):
+        trade = VirtualTrade(
+            signal_id="released-block-plan", strategy_id="bounce", symbol="BTCUSDT",
+            side="long", wall_side="buy", status="cancelled", wall_price=100,
+            wall_size=1000, stake_usdt=10, entry_price=100.01, stop_loss=99.9,
+            take_profit=100.2, close_reason="MANUAL_CANCELLED",
+        )
+        block = ManualPlanBlock(
+            signal_id=trade.signal_id, symbol="BTCUSDT", strategy_id="bounce",
+            wall_id="wall-life", wall_side="buy", wall_price=100,
+        )
+        session = FakeSession({VirtualTrade: [trade], ManualPlanBlock: [block]})
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.release_manual_plan_blocks([trade.signal_id]))
+
+        self.assertEqual(session.rows[VirtualTrade], [trade])
+        self.assertEqual(session.rows[ManualPlanBlock], [])
+        self.assertEqual(session.commits, 1)
 
     def test_partial_trade_update_preserves_accounting_version_and_insert_defaults_it(self):
         existing = VirtualTrade(

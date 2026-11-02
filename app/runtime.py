@@ -380,6 +380,26 @@ class RuntimeController:
         async with self._lifecycle_lock:
             return await self.engine.close_open_trades()
 
+    async def close_virtual_trade(self, signal_id: str) -> dict:
+        return await self.engine.close_virtual_trade(signal_id)
+
+    async def cancel_pending_trade(self, signal_id: str) -> dict:
+        return await self.engine.cancel_pending_trade(signal_id)
+
+    async def update_open_trade_levels(
+        self, signal_id: str, *, take_profit: float, stop_loss: float
+    ) -> dict:
+        return await self.engine.update_open_trade_levels(
+            signal_id, take_profit=take_profit, stop_loss=stop_loss
+        )
+
+    async def update_open_trade_level(
+        self, signal_id: str, *, field: str, value: float
+    ) -> dict:
+        return await self.engine.update_open_trade_level(
+            signal_id, field=field, value=value
+        )
+
     async def shutdown(self) -> None:
         """Stop feeds and persist state without closing virtual trades."""
         async with self._lifecycle_lock, self.engine.state_lock:
