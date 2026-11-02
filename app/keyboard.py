@@ -10,6 +10,7 @@ main = InlineKeyboardMarkup(
         [InlineKeyboardButton(text="Обновить панель", callback_data="dashboard")],
         [InlineKeyboardButton(text="Настройки", callback_data="settings")],
         [InlineKeyboardButton(text="Статистика пар", callback_data="pair_statistics")],
+        [InlineKeyboardButton(text="Стабильные стены", callback_data="stable_walls")],
         [InlineKeyboardButton(text="Подробная статистика", callback_data="moreinfo")],
     ]
 )
@@ -31,6 +32,7 @@ settings = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="Изменить ставку", callback_data="settings_stake")],
         [InlineKeyboardButton(text="Настроить пару", callback_data="settings_pair")],
+        [InlineKeyboardButton(text="Плечо по парам", callback_data="settings_leverage")],
         [InlineKeyboardButton(text="Стратегии по парам", callback_data="settings_strategy")],
         [InlineKeyboardButton(text="Добавить USDT-пару", callback_data="settings_add_pair")],
         [InlineKeyboardButton(text="На главную", callback_data="dashboard")],

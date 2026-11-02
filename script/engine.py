@@ -51,6 +51,8 @@ class TradingEngine:
         trade_manager: ExecutionBackend | None = None,
         repository=None,
         last_market_update_at: dict[str, datetime] | None = None,
+        diagnostic_only: bool = False,
+        diagnostic_symbols: set[str] | None = None,
     ) -> None:
         self.pair_settings = {key.upper(): value for key, value in pair_settings.items()}
         self.trading_settings = trading_settings or TradingSettings()
@@ -80,6 +82,10 @@ class TradingEngine:
         self.strategy_errors: dict[str, dict[str, str]] = {}
         self.trade_manager = trade_manager or TradeManager(self.trading_settings)
         self.repository = repository
+        self.diagnostic_only = diagnostic_only
+        self.diagnostic_symbols = {
+            symbol.upper() for symbol in (diagnostic_symbols or set())
+        }
         self._pending_persistence: dict[str, dict] = {}
         self.state_lock = asyncio.Lock()
         self._persistence_lock = asyncio.Lock()
@@ -136,6 +142,21 @@ class TradingEngine:
             }
             for symbol in self.pair_settings
         }
+        self.wall_diagnostics = {
+            symbol: {
+                "feed_state": "stopped",
+                "book_synchronized": False,
+                "last_update_at": None,
+                "price": None,
+                "bid": [],
+                "ask": [],
+                "stable_count": 0,
+                "rejected": {},
+                "reason": "Ожидание синхронизированного стакана.",
+                "planner_decision": "нет данных",
+            }
+            for symbol in self.pair_settings
+        }
         self.database_status = "unknown" if repository is not None else "not_configured"
         self.database_last_success_at: datetime | None = None
         self.database_last_error: dict | None = None
@@ -164,6 +185,13 @@ class TradingEngine:
     def set_feed_status(self, symbol: str, status: str, error: Exception | None = None) -> None:
         symbol = symbol.upper()
         self.feed_status[symbol] = status
+        self.wall_diagnostics.setdefault(symbol, {})["feed_state"] = status
+        if status != "connected":
+            self._market_health(symbol)["book_synchronized"] = False
+            self.wall_diagnostics[symbol]["book_synchronized"] = False
+            self.wall_diagnostics[symbol]["reason"] = (
+                "WebSocket не подключён; прежний стакан помечен недействительным."
+            )
         if error is not None:
             self.feed_errors[symbol] = {
                 "message": str(error),
@@ -329,8 +357,70 @@ class TradingEngine:
     ) -> None:
         health = self._market_health(symbol)
         health["book_synchronized"] = False
+        diagnostics = self.wall_diagnostics.setdefault(symbol.upper(), {})
+        diagnostics["book_synchronized"] = False
+        diagnostics["reason"] = "Стакан не синхронизирован; анализ стен заблокирован."
         if generation is not None:
             health["active_connection_generation"] = generation
+
+    def record_wall_analysis(self, symbol: str, last_price: float, result: dict) -> None:
+        """Expose the live scanner/tracker result to diagnostics and Telegram."""
+        symbol = symbol.upper()
+        tracked = result.get("tracked_walls", [])
+        rejected = {
+            key: value for key, value in result.get("filter_counts", {}).items()
+            if key not in {"input_levels", "candidates"} and value
+        }
+        if not result.get("nearby_levels"):
+            rejected["no_levels_within_search_distance"] = 1
+        stable = result.get("stable_walls", [])
+        if not result.get("nearby_levels"):
+            reason = "Нет уровней в дистанции поиска."
+        elif not result.get("candidates"):
+            reason = "Кандидаты отклонены текущими фильтрами."
+        elif not stable:
+            reason = "Кандидаты ещё не набрали время устойчивости."
+        else:
+            reason = "Есть стабильные стены."
+        self.wall_diagnostics[symbol] = {
+            "feed_state": self.feed_status.get(symbol, "нет данных"),
+            "book_synchronized": bool(self.get_market_data_health(symbol)["book_synchronized"]),
+            "last_update_at": self._utc_now(),
+            "updated_monotonic": monotonic(),
+            "price": float(last_price),
+            "bid": [dict(item) for item in tracked if item.get("side") == "buy"],
+            "ask": [dict(item) for item in tracked if item.get("side") == "sell"],
+            "stable_count": len(stable),
+            "rejected": rejected,
+            "reason": reason,
+            "planner_decision": "обрабатывается",
+        }
+
+    def get_wall_diagnostics(self, symbol: str | None = None) -> dict:
+        symbols = [symbol.upper()] if symbol else list(self.pair_settings)
+        result = {}
+        now = monotonic()
+        for pair in symbols:
+            current = self.wall_diagnostics.get(pair)
+            if current is None:
+                continue
+            snapshot = dict(current)
+            updated_monotonic = snapshot.pop("updated_monotonic", None)
+            elapsed = max(0.0, now - updated_monotonic) if updated_monotonic is not None else 0.0
+            for side in ("bid", "ask"):
+                snapshot[side] = [
+                    {
+                        **wall,
+                        "age_seconds": wall["age_seconds"] + elapsed,
+                        "progress_percent": min(
+                            100.0,
+                            (wall["age_seconds"] + elapsed) / wall["stability_seconds"] * 100,
+                        ),
+                    }
+                    for wall in snapshot.get(side, [])
+                ]
+            result[pair] = snapshot
+        return result
 
     def get_market_data_health(self, symbol: str) -> dict:
         health = dict(self._market_health(symbol))
@@ -687,6 +777,13 @@ class TradingEngine:
             self.last_market_update_at[symbol] = now
             self.last_algorithm_update_at[symbol] = now
             self._record_market_analysis(symbol, stable_walls, wall_candidates)
+            diagnostics = self.wall_diagnostics.get(symbol)
+            if diagnostics is not None and not self.diagnostic_only:
+                created = [event for event in events if event.get("event") == "TRADE_CREATED"]
+                diagnostics["planner_decision"] = (
+                    f"PENDING создан: {created[0]['trade']['signal_id']}"
+                    if created else self.get_entry_block_reason(symbol)
+                )
             await self.persist_events(events)
             await self.persist_market_price(symbol, last_price)
             return events
@@ -712,6 +809,46 @@ class TradingEngine:
             return []
         if not isfinite(numeric_price) or decimal_price <= 0:
             logger.warning("%s ignoring invalid market price %r", symbol, last_price)
+            return []
+
+        if self.diagnostic_only:
+            diagnostics = self.wall_diagnostics.setdefault(symbol, {})
+            settings = self.pair_settings.get(symbol)
+            if settings is None:
+                diagnostics["planner_decision"] = "Пара не настроена."
+                return []
+            if not settings.enabled:
+                diagnostics["planner_decision"] = "Пара выключена; стратегии не оценивались."
+                return []
+            strategy_ids = self.get_enabled_strategy_ids(symbol)
+            if not strategy_ids:
+                diagnostics["planner_decision"] = "Для пары не выбраны стратегии."
+                return []
+            context = StrategyContext(
+                symbol=symbol,
+                last_price=last_price,
+                stable_walls=tuple(stable_walls),
+                wall_events=tuple(wall_events),
+                settings=settings,
+                now=monotonic(),
+                price_updated=price_updated,
+            )
+            planned = 0
+            for strategy in self.strategy_registry.get_enabled(strategy_ids):
+                try:
+                    planned += len(strategy.evaluate(context))
+                except Exception as error:
+                    diagnostics["planner_decision"] = (
+                        f"Ошибка стратегии {strategy.strategy_id}: {type(error).__name__}"
+                    )
+                    break
+            else:
+                diagnostics["planner_decision"] = (
+                    f"Стратегия сформировала бы {planned} сигнал(ов); "
+                    "создание сделок отключено в диагностическом режиме."
+                    if planned else
+                    "Стабильная стена передана стратегиям, но условие сигнала не выполнено."
+                )
             return []
 
         events = []
@@ -906,6 +1043,7 @@ class TradingEngine:
                 symbol: dict(metrics)
                 for symbol, metrics in self.market_analysis.items()
             },
+            "wall_diagnostics": self.get_wall_diagnostics(),
             "market_data_health": {
                 symbol: self.get_market_data_health(symbol)
                 for symbol in self.pair_settings
@@ -1031,6 +1169,8 @@ class TradingEngine:
         settings = self.pair_settings.get(symbol)
         if settings is None:
             return False
+        if self.diagnostic_only:
+            return symbol in self.diagnostic_symbols
         return self.trade_manager.has_active_symbol(symbol) or (
             settings.enabled and bool(self.get_enabled_strategy_ids(symbol))
         )

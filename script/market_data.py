@@ -396,12 +396,33 @@ def analyze_synced_orderbook(
     )
     wall_events = wall_tracker.update(candidates, orderbook, flow)
     stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
+    observed_at = monotonic()
+    tracked_walls = []
+    for wall in wall_tracker.walls.values():
+        current_notional = float(wall.get("current_size", 0.0))
+        initial_notional = float(wall.get("initial_size", current_notional))
+        age_seconds = max(0.0, observed_at - float(wall.get("first_seen", observed_at)))
+        stability_seconds = max(40.0, pair_settings.min_wall_age_seconds)
+        tracked_walls.append({
+            "side": wall["side"],
+            "price": float(wall["price"]),
+            "notional": current_notional,
+            "initial_notional": initial_notional,
+            "change_notional": current_notional - initial_notional,
+            "distance_bps": abs(float(wall["price"]) - last_price) / last_price * 10000,
+            "age_seconds": age_seconds,
+            "stability_seconds": stability_seconds,
+            "progress_percent": min(100.0, age_seconds / stability_seconds * 100),
+            "status": str(wall["status"]).upper() if wall.get("qualifies", True) else "BELOW_FILTER",
+            "qualifies": bool(wall.get("qualifies", True)),
+        })
     return {
         "nearby_levels": nearby,
         "candidates": candidates,
         "filter_counts": filter_counts,
         "wall_events": wall_events,
         "stable_walls": stable_walls,
+        "tracked_walls": tracked_walls,
     }
 
 
@@ -735,6 +756,7 @@ async def _run_connection(
             result = analyze_synced_orderbook(
                 orderbook, last_price, flow, pair_settings, wall_tracker
             )
+            engine.record_wall_analysis(symbol, last_price, result)
             stable_walls = result["stable_walls"]
             last_analysis_log_at = _log_analysis_if_due(
                 symbol, orderbook, last_price, result, last_analysis_log_at
@@ -778,6 +800,7 @@ async def _run_connection(
                 result = analyze_synced_orderbook(
                     orderbook, last_price, flow, pair_settings, wall_tracker
                 )
+                engine.record_wall_analysis(symbol, last_price, result)
                 stable_walls = result["stable_walls"]
                 last_analysis_log_at = _log_analysis_if_due(
                     symbol, orderbook, last_price, result, last_analysis_log_at
@@ -838,6 +861,7 @@ async def _run_connection(
             result = analyze_synced_orderbook(
                 orderbook, last_price, flow, pair_settings, wall_tracker
             )
+            engine.record_wall_analysis(symbol, last_price, result)
             walls = result["candidates"]
             wall_events = result["wall_events"]
             stable_walls = result["stable_walls"]

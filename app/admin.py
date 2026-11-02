@@ -55,6 +55,7 @@ class SettingsInput(StatesGroup):
     waiting_for_new_pair = State()
     waiting_for_strategy = State()
     waiting_for_pair_statistics = State()
+    waiting_for_pair_leverage = State()
 
 
 class Admin(Filter):
@@ -338,6 +339,7 @@ def pair_settings_text(runtime: RuntimeController) -> str:
             f"стоп за стеной {settings.stop_distance_bps:g} б.п.; "
             f"устойчивость {max(40.0, settings.min_wall_age_seconds):g} с; "
             f"порог потребления {settings.consumed_ratio:.0%}; "
+            f"плечо {settings.leverage if settings.leverage is not None else runtime.engine.trading_settings.leverage:g}x; "
             f"стратегии {escape(strategies)}"
         )
     return "\n".join(pairs) or "Торговые пары не настроены."
@@ -378,8 +380,9 @@ async def show_settings(
             f"Ставка на сделку: {runtime.engine.trading_settings.stake_usdt:.2f} USDT\n"
             f"Начальный баланс: {runtime.engine.trading_settings.initial_balance_usdt:.2f} USDT\n\n"
             f"<b>Пары</b>\n{pair_text}\n\n"
-            "Настройки сохраняются в PostgreSQL. Пороги и дистанции "
-            "настраиваются отдельно для каждой пары; стратегии пары можно "
+            "Настройки сохраняются в PostgreSQL. Пороги, дистанции и плечо "
+            "настраиваются отдельно для каждой пары; плечо новых сделок "
+            "не меняет уже созданные. Стратегии пары можно "
             "включить или отключить отдельной кнопкой.",
             reply_markup=kb.settings,
         )
@@ -847,4 +850,164 @@ async def show_dashboard(
     await state.clear()
     if callback.message is not None:
         await edit_message_if_changed(callback.message, dashboard_text(runtime), reply_markup=kb.main)
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data == "settings_leverage")
+async def request_pair_leverage(callback: CallbackQuery, state: FSMContext, runtime: RuntimeController) -> None:
+    await state.clear()
+    rows = []
+    for symbol, settings in runtime.engine.pair_settings.items():
+        leverage = settings.leverage or runtime.engine.trading_settings.leverage or 25.0
+        rows.append([InlineKeyboardButton(
+            text=f"{symbol} · {leverage:g}x",
+            callback_data=f"leverage_pair:{symbol}",
+        )])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="settings")])
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            "<b>Плечо по торговым парам</b>\n\n"
+            "Изменение применяется только к новым сделкам; у созданных сделок "
+            "параметры позиции остаются зафиксированными.",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("leverage_pair:"))
+async def choose_pair_leverage(callback: CallbackQuery, state: FSMContext, runtime: RuntimeController) -> None:
+    symbol = callback.data.split(":", 1)[1].strip().upper()
+    settings = runtime.engine.pair_settings.get(symbol)
+    if settings is None:
+        await callback.answer("Пара больше не настроена", show_alert=True)
+        return
+    current = settings.leverage or runtime.engine.trading_settings.leverage or 25.0
+    choices = (1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125)
+    rows = [
+        [InlineKeyboardButton(
+            text=("✓ " if float(value) == float(current) else "") + f"{value}x",
+            callback_data=f"leverage_set:{symbol}:{value}",
+        ) for value in choices[index:index + 3]]
+        for index in range(0, len(choices), 3)
+    ]
+    rows.append([InlineKeyboardButton(text="Ввести своё значение", callback_data=f"leverage_custom:{symbol}")])
+    rows.append([InlineKeyboardButton(text="К списку пар", callback_data="settings_leverage")])
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"<b>{escape(symbol)} · плечо {current:g}x</b>\n\nВыберите значение до 125x или введите своё.",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+async def _save_pair_leverage(symbol: str, raw_value: str, runtime: RuntimeController) -> float:
+    value = float(raw_value)
+    if not 0 < value <= 125:
+        raise ValueError("Плечо должно быть больше 0 и не больше 125x")
+    current = runtime.engine.pair_settings.get(symbol.upper())
+    if current is None:
+        raise ValueError("Пара больше не настроена")
+    await runtime.update_pair_settings(replace(current, leverage=value))
+    return value
+
+
+@admin.callback_query(Admin(), F.data.startswith("leverage_set:"))
+async def set_pair_leverage(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    _, symbol, raw_value = callback.data.split(":", 2)
+    try:
+        value = await _save_pair_leverage(symbol, raw_value, runtime)
+    except ValueError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Could not save leverage for %s", symbol)
+        await callback.answer("Не удалось сохранить плечо в PostgreSQL", show_alert=True)
+        return
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            f"Плечо {escape(symbol)} сохранено: <b>{value:g}x</b>. Применится к новым сделкам.",
+            InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="К списку пар", callback_data="settings_leverage")
+            ]]),
+        )
+    await callback.answer("Сохранено")
+
+
+@admin.callback_query(Admin(), F.data.startswith("leverage_custom:"))
+async def request_custom_leverage(callback: CallbackQuery, state: FSMContext) -> None:
+    symbol = callback.data.split(":", 1)[1].strip().upper()
+    await state.update_data(leverage_symbol=symbol)
+    await state.set_state(SettingsInput.waiting_for_pair_leverage)
+    if callback.message is not None:
+        await callback.message.answer(
+            f"Отправьте плечо для {escape(symbol)} числом от 0 до 125, например <code>17.5</code>.",
+            reply_markup=kb.cancel_input,
+        )
+    await callback.answer()
+
+
+@admin.message(Admin(), StateFilter(SettingsInput.waiting_for_pair_leverage))
+async def set_custom_pair_leverage(message: Message, state: FSMContext, runtime: RuntimeController) -> None:
+    data = await state.get_data()
+    symbol = str(data.get("leverage_symbol", "")).upper()
+    try:
+        value = await _save_pair_leverage(symbol, message.text or "", runtime)
+    except (ValueError, TypeError) as error:
+        await message.answer(f"Некорректное плечо: {escape(str(error))}")
+        return
+    except Exception:
+        logger.exception("Could not save custom leverage for %s", symbol)
+        await message.answer("Не удалось сохранить плечо в PostgreSQL.")
+        return
+    await state.clear()
+    await message.answer(
+        f"Плечо {escape(symbol)} сохранено: <b>{value:g}x</b>. Применится к новым сделкам.",
+        reply_markup=kb.main,
+    )
+
+
+def stable_walls_text(runtime: RuntimeController) -> str:
+    engine = runtime.engine
+    diagnostics = engine.get_wall_diagnostics()
+    sections = ["<b>Стабильные стены</b>"]
+    for symbol in engine.pair_settings:
+        data = diagnostics.get(symbol, {})
+        health = engine.get_market_data_health(symbol)
+        if not data.get("book_synchronized"):
+            sections.append(
+                f"\n<b>{escape(symbol)}</b> · стакан не синхронизирован\n"
+                f"Причина: {escape(str(data.get('reason', 'нет данных')))}"
+            )
+            continue
+        age_label = f"{health['book_age_seconds']:.2f} с назад" if health.get("book_age_seconds") is not None else "нет данных"
+        lines = [f"\n<b>{escape(symbol)}</b> · цена {data.get('price', 'нет данных')} · стакан обновлён {age_label}"]
+        for side, label in (("bid", "BID"), ("ask", "ASK")):
+            walls = data.get(side, [])
+            items = [
+                f"{wall['status']} {wall['price']:g} · {wall['notional']:,.0f} USDT · "
+                f"{wall['distance_bps']:.1f} б.п. · возраст {wall['age_seconds']:.1f}/"
+                f"{wall['stability_seconds']:.0f} с ({wall['progress_percent']:.0f}%) · "
+                f"изменение {wall['change_notional']:+,.0f} USDT"
+                for wall in walls
+            ]
+            lines.append(f"{label}: " + ("; ".join(items) if items else "нет кандидатов"))
+        lines.append(f"Стабильных стен: {data.get('stable_count', 0)} · {escape(str(data.get('reason', 'нет данных')))}")
+        lines.append(f"Планировщик: {escape(str(data.get('planner_decision', 'нет данных')))}")
+        if data.get("rejected"):
+            lines.append("Отклонено: " + escape(", ".join(f"{key}={value}" for key, value in data["rejected"].items())))
+        sections.append("\n".join(lines))
+    return "\n".join(sections)
+
+
+@admin.callback_query(Admin(), F.data == "stable_walls")
+async def show_stable_walls(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обновить", callback_data="stable_walls")],
+        [InlineKeyboardButton(text="На главную", callback_data="dashboard")],
+    ])
+    if callback.message is not None:
+        await edit_message_if_changed(callback.message, stable_walls_text(runtime), keyboard)
     await callback.answer()

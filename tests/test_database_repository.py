@@ -133,6 +133,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
             entry_distance_bps=1.5,
             stop_distance_bps=2,
             max_open_trades=1,
+            leverage=17.5,
         )
         strategy_row = PairStrategyConfig(
             symbol="BTCUSDT", enabled_strategy_ids=[]
@@ -189,6 +190,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertTrue(state["initialized"])
         self.assertEqual(state["enabled_strategies"], {"BTCUSDT": set()})
         self.assertEqual(state["last_prices"], {"BTCUSDT": 100.25})
+        self.assertEqual(state["pair_settings"]["BTCUSDT"].leverage, 17.5)
         self.assertEqual(len(state["trades"]), 1)
         self.assertEqual(state["trades"][0]["status"], "open")
         self.assertEqual(state["trades"][0]["signal_id"], trade.signal_id)

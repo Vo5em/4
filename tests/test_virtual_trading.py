@@ -62,6 +62,8 @@ from app.admin import (
     dayid,
     pair_settings_text,
     pair_statistics_text,
+    stable_walls_text,
+    _save_pair_leverage,
     close_open_trades as close_open_trades_callback,
     edit_message_if_changed,
     set_pair_strategy,
@@ -153,6 +155,28 @@ class WallTrackerTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["event"], "REMOVED")
         self.assertLess(events[0]["age"], 60)
+        self.assertEqual(tracker.get_stable_walls(), [])
+
+    def test_candidate_moves_to_stable_after_required_age(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=40)
+        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0}
+        tracker.update([tracked], book, {})
+        tracker.walls[("buy", 100.0)]["first_seen"] = monotonic() - 41
+        tracker.update([tracked], book, {})
+        self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
+
+    def test_candidate_disappearing_before_forty_seconds_never_becomes_stable(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=40)
+        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0}
+        tracker.update([tracked], book, {})
+        tracker.walls[("buy", 100.0)]["first_seen"] = monotonic() - 39
+        book.bids.clear()
+        events = tracker.update([], book, {})
+        self.assertEqual(events[0]["event"], "REMOVED")
         self.assertEqual(tracker.get_stable_walls(), [])
 
     def test_removed_and_consumed_events(self):
@@ -440,6 +464,56 @@ class BybitOrderbookSyncTests(unittest.TestCase):
         # A stable wall is market information only; the legacy strategy must
         # not turn stability alone into a pending entry.
         self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
+
+    def test_telegram_diagnostics_use_the_live_scanner_result(self):
+        settings = PairSettings(
+            "BTCUSDT", min_wall_ratio=50, max_wall_distance_bps=100,
+            min_wall_age_seconds=0,
+        )
+        book, _ = build_synchronized_orderbook(
+            {"seq": 100, "u": 10, "b": [[100, 1], [99.9, 1], [99.8, 1], [99.7, 1], [99.6, 100]], "a": []},
+            [{"seq": 100, "u": 10, "b": [], "a": []}],
+        )
+        flow = {
+            "buy_volume_per_second": 0, "sell_volume_per_second": 0,
+            "buy_volume_by_price_total": {}, "sell_volume_by_price_total": {},
+        }
+        result = analyze_synced_orderbook(book, 100, flow, settings, WallTracker(min_age_seconds=0))
+        engine = TradingEngine({"BTCUSDT": settings})
+        engine.market_data_health["BTCUSDT"]["book_synchronized"] = True
+        engine.record_wall_analysis("BTCUSDT", 100, result)
+        runtime = RuntimeController(engine)
+
+        diagnostic = engine.get_wall_diagnostics("BTCUSDT")["BTCUSDT"]
+        text = stable_walls_text(runtime)
+
+        self.assertEqual(diagnostic["stable_count"], len(result["stable_walls"]))
+        self.assertEqual(diagnostic["bid"][0]["price"], result["candidates"][0]["price"])
+        self.assertIn("99.6", text)
+        self.assertIn("STABLE", text)
+
+    def test_diagnostic_mode_reports_stable_wall_planner_rejection_without_creating_trade(self):
+        engine = TradingEngine(
+            {"BTCUSDT": PairSettings("BTCUSDT")},
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+            diagnostic_only=True,
+            diagnostic_symbols={"BTCUSDT"},
+        )
+        engine.start()
+        result = engine.on_market_update(
+            "BTCUSDT", 100,
+            [{"side": "buy", "price": 99.9, "age": 40, "wall_ratio": 900}],
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(engine.trade_manager.trades, [])
+        self.assertIn("Стабильная стена передана", engine.wall_diagnostics["BTCUSDT"]["planner_decision"])
+
+    def test_unsynchronized_status_is_explained_in_wall_panel(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        engine.mark_orderbook_unsynchronized("BTCUSDT", generation=4)
+        text = stable_walls_text(RuntimeController(engine))
+        self.assertIn("стакан не синхронизирован", text)
+        self.assertIn("анализ стен заблокирован", text)
 
     def test_valid_book_with_no_matching_walls_is_successful_analysis(self):
         settings = PairSettings("BTCUSDT", min_wall_ratio=888)
@@ -1666,6 +1740,32 @@ class VirtualTradeTests(unittest.TestCase):
 
 
 class EngineControlTests(unittest.TestCase):
+    def test_pair_leverage_update_is_independent_and_only_changes_future_trades(self):
+        repository = FakeRepository()
+        btc = PairSettings("BTCUSDT", min_wall_ratio=999)
+        eth = PairSettings("ETHUSDT", min_wall_ratio=777)
+        engine = TradingEngine({"BTCUSDT": btc, "ETHUSDT": eth}, repository=repository)
+        runtime = RuntimeController(engine)
+        changed = run_immediate(_save_pair_leverage("BTCUSDT", "17.5", runtime))
+
+        self.assertEqual(changed, 17.5)
+        self.assertEqual(engine.pair_settings["BTCUSDT"].leverage, 17.5)
+        self.assertEqual(engine.pair_settings["BTCUSDT"].min_wall_ratio, 999)
+        self.assertEqual(engine.pair_settings["ETHUSDT"], eth)
+        self.assertEqual(repository.saved_pair_settings[-1], engine.pair_settings["BTCUSDT"])
+        self.assertIn("плечо 17.5x", pair_settings_text(runtime))
+
+        btc_trade = engine.trade_manager.create_trade({
+            "strategy_id": "bounce", "symbol": "BTCUSDT", "wall_side": "buy",
+            "wall_price": 100, "wall_id": "btc-lev", "wall_size": 1000,
+        }, engine.pair_settings["BTCUSDT"])
+        eth_trade = engine.trade_manager.create_trade({
+            "strategy_id": "bounce", "symbol": "ETHUSDT", "wall_side": "buy",
+            "wall_price": 100, "wall_id": "eth-lev", "wall_size": 1000,
+        }, engine.pair_settings["ETHUSDT"])
+        self.assertEqual(btc_trade["leverage"], 17.5)
+        self.assertEqual(eth_trade["leverage"], engine.trading_settings.leverage)
+
     def test_pair_strategy_mode_switch_is_immediate_and_pair_scoped(self):
         repository = FakeRepository()
         engine = TradingEngine(

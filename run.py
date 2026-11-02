@@ -5,11 +5,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-
-from app.admin import admin
 from app.runtime import RuntimeController
 from script.engine import EngineMode, TradingEngine
 from script.settings import PairSettings, TradingSettings, normalize_pair_symbol
@@ -66,6 +61,11 @@ async def build_runtime() -> tuple[RuntimeController, bool]:
 
 
 async def main() -> None:
+    from aiogram import Bot, Dispatcher
+    from aiogram.client.default import DefaultBotProperties
+    from aiogram.enums import ParseMode
+    from app.admin import admin
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError(
