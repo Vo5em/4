@@ -192,6 +192,7 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "symbol": row.symbol,
         "side": row.side,
         "wall_side": row.wall_side,
+        "wall_id": getattr(row, "wall_id", None),
         "status": row.status,
         "wall_price": row.wall_price,
         "wall_size": row.wall_size,
@@ -212,6 +213,9 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "taker_fee_rate": getattr(row, "fee_rate", None) or 0.0,
         "fee_rate": getattr(row, "fee_rate", None),
         "entry_price": row.entry_price,
+        "entry_fill_price": getattr(row, "entry_fill_price", None),
+        "entry_trigger_direction": getattr(row, "entry_trigger_direction", None),
+        "entry_armed": bool(getattr(row, "entry_armed", False)),
         "stop_loss": row.stop_loss,
         "take_profit": row.take_profit,
         "exit_price": row.exit_price,
@@ -272,7 +276,8 @@ async def save_trades(
                     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
                     "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
                     "gross_pnl_usdt", "fee_rate", "accounting_version",
-                    "stop_loss", "take_profit", "exit_price", "profit_usdt", "close_reason",
+                    "stop_loss", "take_profit", "entry_fill_price", "wall_id",
+                    "entry_trigger_direction", "entry_armed", "exit_price", "profit_usdt", "close_reason",
                     "profit_percent", "created_at", "opened_at", "closed_at",
                 )
             }
@@ -391,7 +396,8 @@ async def save_enabled_strategies_with_trades(
                     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
                     "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
                     "gross_pnl_usdt", "fee_rate", "accounting_version",
-                    "stop_loss", "take_profit", "exit_price", "profit_usdt", "close_reason",
+                    "stop_loss", "take_profit", "entry_fill_price", "wall_id",
+                    "entry_trigger_direction", "entry_armed", "exit_price", "profit_usdt", "close_reason",
                     "profit_percent", "created_at", "opened_at", "closed_at",
                 )
             }
@@ -427,7 +433,8 @@ async def save_pair_settings_with_trades(
                     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
                     "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
                     "gross_pnl_usdt", "fee_rate", "accounting_version",
-                    "stop_loss", "take_profit", "exit_price", "profit_usdt", "close_reason",
+                    "stop_loss", "take_profit", "entry_fill_price", "wall_id",
+                    "entry_trigger_direction", "entry_armed", "exit_price", "profit_usdt", "close_reason",
                     "profit_percent", "created_at", "opened_at", "closed_at",
                 )
             }

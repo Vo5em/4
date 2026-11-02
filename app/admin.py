@@ -969,45 +969,284 @@ async def set_custom_pair_leverage(message: Message, state: FSMContext, runtime:
     )
 
 
-def stable_walls_text(runtime: RuntimeController) -> str:
+WALLS_PAGE_SIZE = 5
+TELEGRAM_TEXT_LIMIT = 4096
+
+
+def _wall_snapshot(runtime: RuntimeController, symbol: str) -> tuple[dict, dict]:
     engine = runtime.engine
-    diagnostics = engine.get_wall_diagnostics()
-    sections = ["<b>Стабильные стены</b>"]
-    for symbol in engine.pair_settings:
-        data = diagnostics.get(symbol, {})
-        health = engine.get_market_data_health(symbol)
-        if not data.get("book_synchronized"):
-            sections.append(
-                f"\n<b>{escape(symbol)}</b> · стакан не синхронизирован\n"
-                f"Причина: {escape(str(data.get('reason', 'нет данных')))}"
-            )
+    return (
+        engine.get_wall_diagnostics(symbol).get(symbol, {}),
+        engine.get_market_data_health(symbol),
+    )
+
+
+def _wall_counts(data: dict) -> tuple[list[dict], list[dict]]:
+    walls = [wall for side in ("bid", "ask") for wall in data.get(side, [])]
+    stable = [wall for wall in walls if wall.get("status") == "STABLE"]
+    candidates = [wall for wall in walls if wall.get("status") == "CANDIDATE"]
+    return stable, candidates
+
+
+def _compact_planner_decision(value: object) -> str:
+    decision = str(value or "нет данных")
+    if decision.startswith("PENDING создан:"):
+        return "PENDING создан"
+    if decision.startswith("Рыночные данные:"):
+        return "Планировщик ждёт рыночные данные (подробности на главной панели)."
+    if len(decision) > 180:
+        return "Планировщик вернул подробную причину; проверьте журнал приложения."
+    return decision
+
+
+def _wall_header(symbol: str, data: dict, health: dict, section: str, page: int) -> str:
+    stable, candidates = _wall_counts(data)
+    sync = "синхронизирован" if data.get("book_synchronized") else "не синхронизирован"
+    feed = _feed_label(str(data.get("feed_state", "нет данных")))
+    age = health.get("book_age_seconds")
+    age_text = f"{age:.2f} с назад" if age is not None else "нет данных"
+    label = {"stable": "STABLE", "candidate": "CANDIDATE", "diagnostics": "Диагностика"}[section]
+    page_label = f" · стр. {page + 1}" if section != "diagnostics" else ""
+    return (
+        f"<b>Стены · {escape(symbol)}</b> · <b>{label}</b>{page_label}\n"
+        f"STABLE: {len(stable)} · CANDIDATE: {len(candidates)}\n"
+        f"WebSocket: {escape(feed)} · стакан: {sync}\n"
+        f"Последнее обновление: {age_text} · цена: "
+        f"{data.get('price') if data.get('price') is not None else 'нет данных'}\n"
+    )
+
+
+def _planner_condition_line(condition: dict) -> str:
+    """Format recorded strategy facts; this function does not evaluate rules."""
+    names = {
+        "wall_age_at_least_40s": "возраст стены",
+        "entry_distance_bps": "дистанция входа",
+        "approach_from_valid_side": "сторона подхода",
+        "previous_approach_seen": "предыдущий подход",
+        "reversal_confirmed": "отскок",
+        "price_beyond_wall_buffer": "выход за стену",
+        "continuous_confirmation_started": "непрерывность",
+        "continuous_confirmation_time": "время подтверждения",
+        "risk_levels_valid": "валидность уровней",
+        "risk_distance_positive": "риск",
+        "stop_target_direction": "направление SL/TP",
+        "bounce_reward_to_risk_after_obstacle": "R:R до препятствия",
+        "nearest_wall_minimum_age": "минимальный возраст",
+        "wall_on_valid_side_of_price": "положение стены",
+        "nearest_wall_for_side": "ближайшая стена",
+    }
+    name = names.get(condition.get("condition"), str(condition.get("condition", "условие")))
+    status = "✓" if condition.get("passed") else "✗"
+    if "actual_bps" in condition:
+        actual = f"{condition['actual_bps']:.2f}/{condition.get('threshold_bps', '—')} bps"
+    elif "actual_seconds" in condition:
+        threshold = condition.get("threshold_seconds", "—")
+        actual = f"{condition['actual_seconds']:.1f}/{threshold} с"
+    elif "elapsed_seconds" in condition:
+        actual = (
+            f"{condition['elapsed_seconds']:.1f}/{condition.get('confirmation_seconds', '—')} с; "
+            f"gap {condition.get('actual_gap_seconds') if condition.get('actual_gap_seconds') is not None else '—'}"
+            f"/{condition.get('maximum_gap_seconds', '—')} с"
+        )
+    elif "actual_reward" in condition:
+        actual = f"{condition['actual_reward']:.4g}/{condition.get('minimum_reward', 0):.4g} USDT"
+    elif "actual_wall_price" in condition:
+        actual = (
+            f"стена {condition['actual_wall_price']:g}, "
+            f"цена {condition['current_price']:g} ({condition.get('wall_side', '?')})"
+        )
+    elif "actual_selected_wall_id" in condition:
+        selected = condition.get("actual_selected_wall_id") or "нет"
+        actual = f"выбрана {selected}"
+    elif "actual" in condition and isinstance(condition["actual"], (str, int, float)):
+        actual = escape(f"{condition['actual']}/{condition.get('threshold', '—')}")
+    else:
+        actual = str(condition.get("reason", "порог не применён"))
+    return f"{status} {name}: {actual}"
+
+
+def _planner_wall_line(wall: dict) -> str:
+    side = "BID" if wall.get("side") == "buy" else "ASK"
+    lifecycle = " · CONSUMED" if wall.get("event") == "CONSUMED" else ""
+    lines = [
+        f"<b>{side} {float(wall.get('price') or 0):.8g}</b>{lifecycle} · "
+        f"{float(wall.get('notional') or 0):.4g} USDT · "
+        f"{float(wall.get('age_seconds') or 0):.1f} с"
+    ]
+    strategies = wall.get("strategies") or []
+    if not strategies:
+        lines.append("  стратегиям не передана")
+    for trace in strategies:
+        strategy_id = escape(str(trace.get("strategy_id", "?")))
+        if not trace.get("evaluated"):
+            summary = (trace.get("reasons") or ["не оценивалась"])[0]
+            lines.append(f"  {strategy_id}: не оценивалась — {escape(str(summary))}")
             continue
-        age_label = f"{health['book_age_seconds']:.2f} с назад" if health.get("book_age_seconds") is not None else "нет данных"
-        lines = [f"\n<b>{escape(symbol)}</b> · цена {data.get('price', 'нет данных')} · стакан обновлён {age_label}"]
-        for side, label in (("bid", "BID"), ("ask", "ASK")):
-            walls = data.get(side, [])
-            items = [
-                f"{wall['status']} {wall['price']:g} · {wall['notional']:,.0f} USDT · "
-                f"{wall['distance_bps']:.1f} б.п. · возраст {wall['age_seconds']:.1f}/"
-                f"{wall['stability_seconds']:.0f} с ({wall['progress_percent']:.0f}%) · "
-                f"изменение {wall['change_notional']:+,.0f} USDT"
-                for wall in walls
-            ]
-            lines.append(f"{label}: " + ("; ".join(items) if items else "нет кандидатов"))
-        lines.append(f"Стабильных стен: {data.get('stable_count', 0)} · {escape(str(data.get('reason', 'нет данных')))}")
-        lines.append(f"Планировщик: {escape(str(data.get('planner_decision', 'нет данных')))}")
-        if data.get("rejected"):
-            lines.append("Отклонено: " + escape(", ".join(f"{key}={value}" for key, value in data["rejected"].items())))
-        sections.append("\n".join(lines))
-    return "\n".join(sections)
+        conditions = trace.get("conditions") or []
+        failed = [condition for condition in conditions if not condition.get("passed")]
+        chosen = failed if failed else conditions[-1:]
+        status = "сигнал" if trace.get("signal_formed") else "нет сигнала"
+        if trace.get("signal_formed") and not trace.get("signal_accepted"):
+            status += "; стратегия не выбрала стену"
+        if trace.get("pending_created"):
+            status += "; PENDING создан"
+        elif trace.get("trade_planner_reason"):
+            status += "; TradeManager отказал"
+        lines.append(f"  {strategy_id}: стена передана · {status}")
+        for condition in chosen:
+            lines.append(f"    {_planner_condition_line(condition)}")
+        for reason in (trace.get("reasons") or [])[:1]:
+            lines.append(f"    {escape(str(reason))}")
+        if trace.get("trade_planner_reason") and not trace.get("pending_created"):
+            lines.append(f"    {escape(str(trace['trade_planner_reason']))}")
+    return "\n".join(lines)
+
+
+def stable_walls_text(
+    runtime: RuntimeController,
+    symbol: str | None = None,
+    section: str = "stable",
+    page: int = 0,
+) -> str:
+    """Build one bounded page from the shared live scanner diagnostic snapshot."""
+    if section not in {"stable", "candidate", "diagnostics"}:
+        raise ValueError("Unknown wall diagnostics page")
+    pairs = list(runtime.engine.pair_settings)
+    if not pairs:
+        return "<b>Стабильные стены</b>\nТорговые пары не настроены."
+    symbol = (symbol or ("BTCUSDT" if "BTCUSDT" in pairs else pairs[0])).strip().upper()
+    if symbol not in runtime.engine.pair_settings:
+        symbol = pairs[0]
+    page = max(0, int(page))
+    data, health = _wall_snapshot(runtime, symbol)
+    stable, candidates = _wall_counts(data)
+
+    if section == "diagnostics":
+        rejected = data.get("rejected") or {}
+        rejected_text = (
+            ", ".join(f"{escape(str(key))}: {int(value)}" for key, value in rejected.items())
+            if rejected else "нет"
+        )
+        planner_walls = data.get("planner_wall_decisions") or []
+        total_pages = max(1, (len(planner_walls) + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE)
+        page = min(page, total_pages - 1)
+        selected = planner_walls[page * WALLS_PAGE_SIZE:(page + 1) * WALLS_PAGE_SIZE]
+        summary = (
+            f"Причина статуса: {escape(str(data.get('reason', 'нет данных')))}\n"
+            f"Отклонения Scanner: {rejected_text}\n"
+            f"Стратегии пары: {escape(', '.join(data.get('planner_strategies') or []) or 'нет данных')}\n"
+            f"Trade Planner: {escape(_compact_planner_decision(data.get('planner_decision')))}\n"
+            f"Оценка стен · стр. {page + 1}/{total_pages}:"
+        )
+        body = summary + "\n" + ("\n".join(_planner_wall_line(wall) for wall in selected) or "Нет оценённых стабильных стен.")
+    else:
+        walls = stable if section == "stable" else candidates
+        total_pages = max(1, (len(walls) + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE)
+        page = min(page, total_pages - 1)
+        selected = walls[page * WALLS_PAGE_SIZE:(page + 1) * WALLS_PAGE_SIZE]
+        if not data.get("book_synchronized"):
+            body = (
+                "стакан не синхронизирован. Стены по прежнему стакану не показываются.\n"
+                f"Причина: {escape(str(data.get('reason', 'ожидание синхронизации')))}"
+            )
+        elif not selected:
+            body = "Список пуст."
+        else:
+            rows = []
+            for wall in selected:
+                side = "BID" if wall.get("side") == "buy" else "ASK"
+                rows.append(
+                    f"{side} <code>{float(wall['price']):.8g}</code> · "
+                    f"<b>{float(wall['notional']):.4g} USDT</b> · "
+                    f"{float(wall['distance_bps']):.2f} bps · "
+                    f"{float(wall['age_seconds']):.1f} с · "
+                    f"Δ {float(wall['change_notional']):+.4g} USDT"
+                )
+            body = "\n".join(rows)
+
+    text = _wall_header(symbol, data, health, section, page) + "\n" + body
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        # Pages are bounded to five numeric rows and all free-form diagnostic
+        # strings are compacted above. Treat a violated invariant as a bug.
+        raise AssertionError(f"Wall diagnostics page exceeds Telegram limit: {len(text)}")
+    return text
+
+
+def stable_walls_keyboard(
+    runtime: RuntimeController, symbol: str, section: str, page: int,
+) -> InlineKeyboardMarkup:
+    data, _health = _wall_snapshot(runtime, symbol)
+    stable, candidates = _wall_counts(data)
+    total = (
+        len(stable if section == "stable" else candidates)
+        if section != "diagnostics"
+        else len(data.get("planner_wall_decisions") or [])
+    )
+    page_count = max(1, (total + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE)
+    page = min(max(0, page), page_count - 1)
+    pair_row = [InlineKeyboardButton(
+        text=("✓ " if pair == symbol else "") + pair,
+        callback_data=f"walls:{pair}:{section}:0",
+    ) for pair in runtime.engine.pair_settings]
+    rows = [pair_row] if pair_row else []
+    rows.append([
+        InlineKeyboardButton(text=f"STABLE · {len(stable)}", callback_data=f"walls:{symbol}:stable:0"),
+        InlineKeyboardButton(text=f"CANDIDATE · {len(candidates)}", callback_data=f"walls:{symbol}:candidate:0"),
+    ])
+    rows.append([InlineKeyboardButton(text="Диагностика", callback_data=f"walls:{symbol}:diagnostics:0")])
+    rows.append([
+        InlineKeyboardButton(text="Назад", callback_data=f"walls:{symbol}:{section}:{max(0, page - 1)}"),
+        InlineKeyboardButton(text="Вперёд", callback_data=f"walls:{symbol}:{section}:{min(page_count - 1, page + 1)}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="Обновить", callback_data=f"walls:{symbol}:{section}:{page}"),
+        InlineKeyboardButton(text="На главную", callback_data="dashboard"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_stable_walls(callback: CallbackQuery, runtime: RuntimeController,
+                               symbol: str, section: str, page: int,
+                               answer: str | None = None) -> None:
+    if not runtime.engine.pair_settings:
+        if callback.message is not None:
+            await edit_message_if_changed(callback.message, "<b>Стабильные стены</b>\nТорговые пары не настроены.", kb.main)
+        await callback.answer("Пары не настроены")
+        return
+    symbol = symbol.strip().upper()
+    if symbol not in runtime.engine.pair_settings:
+        symbol = "BTCUSDT" if "BTCUSDT" in runtime.engine.pair_settings else next(iter(runtime.engine.pair_settings))
+    page = max(0, int(page))
+    text = stable_walls_text(runtime, symbol, section, page)
+    markup = stable_walls_keyboard(runtime, symbol, section, page)
+    if callback.message is not None:
+        await edit_message_if_changed(callback.message, text, markup)
+    await callback.answer(answer or "")
 
 
 @admin.callback_query(Admin(), F.data == "stable_walls")
 async def show_stable_walls(callback: CallbackQuery, runtime: RuntimeController) -> None:
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Обновить", callback_data="stable_walls")],
-        [InlineKeyboardButton(text="На главную", callback_data="dashboard")],
-    ])
-    if callback.message is not None:
-        await edit_message_if_changed(callback.message, stable_walls_text(runtime), keyboard)
-    await callback.answer()
+    pairs = runtime.engine.pair_settings
+    if not pairs:
+        await callback.answer("Пары не настроены", show_alert=True)
+        return
+    symbol = "BTCUSDT" if "BTCUSDT" in pairs else next(iter(pairs))
+    await _render_stable_walls(callback, runtime, symbol, "stable", 0)
+
+
+@admin.callback_query(Admin(), F.data.startswith("walls:"))
+async def navigate_stable_walls(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    try:
+        _prefix, symbol, section, raw_page = callback.data.split(":", 3)
+        page = int(raw_page)
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная навигация", show_alert=True)
+        return
+    answer = None
+    if section not in {"stable", "candidate", "diagnostics"}:
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    if page < 0:
+        page = 0
+        answer = "Это первая страница"
+    await _render_stable_walls(callback, runtime, symbol, section, page, answer)

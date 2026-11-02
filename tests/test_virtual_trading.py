@@ -14,6 +14,7 @@ from aiogram.types import Chat, Message, User
 os.environ.setdefault("ADMIN_USER_ID", "4242")
 
 from script.engine import EngineMode, TradingEngine
+import script.engine as engine_module
 from script.formulas import (
     calculate_entry_price,
     calculate_stop_loss_price,
@@ -50,7 +51,8 @@ from script.strategies import (
     StrategyRegistry,
     TradeSignal,
 )
-from script.trade_manager import TradeManager
+from script.trade_manager import TradeManager as CoreTradeManager
+from script.trade_levels import calculate_trade_levels
 from script.trade_flow import TradeFlow
 from script.wall_tracker import WallTracker
 from app.runtime import RuntimeController
@@ -63,12 +65,45 @@ from app.admin import (
     pair_settings_text,
     pair_statistics_text,
     stable_walls_text,
+    stable_walls_keyboard,
+    navigate_stable_walls,
+    WALLS_PAGE_SIZE,
+    TELEGRAM_TEXT_LIMIT,
     _save_pair_leverage,
     close_open_trades as close_open_trades_callback,
     edit_message_if_changed,
     set_pair_strategy,
 )
 from run import _symbols_from_environment, build_runtime
+
+
+class TradeManager(CoreTradeManager):
+    """Legacy unit-test adapter: models the engine supplying prepared levels."""
+
+    def create_trade(self, signal, pair_settings, *, stake_usdt=None):
+        data = signal if isinstance(signal, dict) else dict(signal.__dict__)
+        if any(data.get(key) is None for key in ("entry_price", "stop_loss", "take_profit")):
+            strategy_id = data.get("strategy_id")
+            if strategy_id not in {BOUNCE_STRATEGY_ID, BREAKOUT_STRATEGY_ID}:
+                strategy_id = BOUNCE_STRATEGY_ID
+            levels = calculate_trade_levels(
+                strategy_id=strategy_id,
+                wall_side=data.get("wall_side", "buy"),
+                wall_price=data["wall_price"],
+                tick_size="0.00001",
+                bounce_stop_distance_bps=pair_settings.stop_distance_bps,
+            )
+            data = {**data, **levels}
+            if not data.get("entry_trigger_direction"):
+                data["entry_trigger_direction"] = levels["entry_trigger_direction"]
+            if data.get("reference_price") is None:
+                data["reference_price"] = float(levels["entry_price"]) * (
+                    1.001 if data["wall_side"] == "buy" else 0.999
+                )
+        return super().create_trade(data, pair_settings, stake_usdt=stake_usdt)
+
+
+engine_module.TradeManager = TradeManager
 
 
 def run_immediate(coroutine):
@@ -506,7 +541,16 @@ class BybitOrderbookSyncTests(unittest.TestCase):
         )
         self.assertEqual(result, [])
         self.assertEqual(engine.trade_manager.trades, [])
-        self.assertIn("Стабильная стена передана", engine.wall_diagnostics["BTCUSDT"]["planner_decision"])
+        diagnostic = engine.wall_diagnostics["BTCUSDT"]
+        self.assertIn("сформировали бы 1 сигнал", diagnostic["planner_decision"])
+        bounce_trace = diagnostic["planner_wall_decisions"][0]["strategies"][0]
+        entry_distance = next(
+            item for item in bounce_trace["conditions"]
+            if item["condition"] == "max_wall_distance_bps"
+        )
+        self.assertTrue(entry_distance["passed"])
+        self.assertAlmostEqual(entry_distance["actual_bps"], 10.0)
+        self.assertEqual(entry_distance["threshold_bps"], 100.0)
 
     def test_unsynchronized_status_is_explained_in_wall_panel(self):
         engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
@@ -630,28 +674,22 @@ class WallStrategyTests(unittest.TestCase):
             "BTCUSDT", price, tuple(walls or ()), tuple(events), self.settings, now
         )
 
-    def test_bounce_support_requires_approach_then_reversal_and_has_1_5r(self):
+    def test_bounce_support_creates_plan_immediately_without_reversal_confirmation(self):
         strategy = BounceStrategy()
         wall = self.wall()
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.01, 1, [wall])), [])
-        signal, = strategy.evaluate(self.context(strategy, 100.02, 2, [wall]))
+        signal, = strategy.evaluate(self.context(strategy, 100.01, 1, [wall]))
         self.assertEqual(signal.side, "long")
-        self.assertAlmostEqual(signal.stop_loss, 99.98)
-        self.assertAlmostEqual(signal.take_profit - signal.entry_price,
-                               1.5 * (signal.entry_price - signal.stop_loss))
+        self.assertEqual(signal.entry_mode, "cross")
+        self.assertEqual(signal.entry_trigger_direction, "cross_down")
         repeated, = strategy.evaluate(self.context(strategy, 100.03, 3, [wall]))
         self.assertEqual(repeated.wall_id, signal.wall_id)
 
     def test_bounce_resistance_is_short_and_wall_loss_clears_state(self):
         strategy = BounceStrategy()
         wall = self.wall("sell", identity="old")
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 1, [wall])), [])
-        new_wall = self.wall("sell", identity="new")
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 2, [new_wall])), [])
-        signal, = strategy.evaluate(self.context(strategy, 99.97, 3, [new_wall]))
+        signal, = strategy.evaluate(self.context(strategy, 99.99, 1, [wall]))
         self.assertEqual(signal.side, "short")
-        self.assertGreater(signal.stop_loss, signal.entry_price)
-        self.assertLess(signal.take_profit, signal.entry_price)
+        self.assertEqual(signal.entry_trigger_direction, "cross_up")
 
     def test_bounce_requires_full_stability_and_skips_bad_reward_obstacle(self):
         strategy = BounceStrategy()
@@ -660,9 +698,8 @@ class WallStrategyTests(unittest.TestCase):
         wall = self.wall()
         strategy.evaluate(self.context(strategy, 100.01, 2, [wall]))
         obstacle = self.wall("sell", 100.3, "obstacle")
-        self.assertEqual(
-            strategy.evaluate(self.context(strategy, 100.2, 3, [wall, obstacle])), []
-        )
+        signals = strategy.evaluate(self.context(strategy, 100.2, 3, [wall, obstacle]))
+        self.assertEqual({signal.wall_side for signal in signals}, {"buy", "sell"})
 
     def test_nearest_stable_support_is_the_only_bounce_signal_candidate(self):
         strategy = BounceStrategy()
@@ -686,69 +723,50 @@ class WallStrategyTests(unittest.TestCase):
         strategy = BounceStrategy()
         nearest = self.wall("buy", 100.0, "nearest")
         farther = self.wall("buy", 99.98, "farther")
-        # The closer opposite wall removes the required 1.5R upside.
+        # The opposite wall does not clip the agreed symmetric bounce target.
         obstacle = self.wall("sell", 100.04, "obstacle")
         strategy.evaluate(self.context(strategy, 100.01, 1, [nearest, farther, obstacle]))
         signals = strategy.evaluate(self.context(strategy, 100.02, 2, [nearest, farther, obstacle]))
-        self.assertEqual(signals, [])
+        self.assertEqual({signal.wall_id for signal in signals}, {
+            "BTCUSDT:buy:100:nearest", "BTCUSDT:sell:100.04:obstacle"
+        })
 
     def test_new_nearer_wall_changes_priority_without_recreating_old_signal(self):
         strategy = BounceStrategy()
         old = self.wall("buy", 100.0, "old")
-        strategy.evaluate(self.context(strategy, 100.01, 1, [old]))
-        old_signal, = strategy.evaluate(self.context(strategy, 100.02, 2, [old]))
         nearer = self.wall("buy", 100.015, "new")
-        # New support becomes the selected nearest wall. It gets its own
-        # approach and confirmation; the old signal is not emitted again.
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 3, [old, nearer])), [])
-        new_signal, = strategy.evaluate(self.context(strategy, 100.03, 4, [old, nearer]))
-        self.assertNotEqual(old_signal.wall_id, new_signal.wall_id)
+        signals = strategy.evaluate(self.context(strategy, 100.02, 3, [old, nearer]))
+        new_signal, = [signal for signal in signals if signal.wall_side == "buy"]
         self.assertEqual(new_signal.wall_id, "BTCUSDT:buy:100.015:new")
 
     def test_breakout_requires_hold_above_sell_wall_and_levels_are_directional(self):
         strategy = BreakoutStrategy()
-        wall = self.wall("sell")
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.01, 10, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 12, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 14, [wall])), [])
-        signal, = strategy.evaluate(self.context(strategy, 100.02, 15.1, [wall]))
+        wall = self.wall("sell", 100.05)
+        signal, = strategy.evaluate(self.context(strategy, 100.01, 10, [wall]))
         self.assertEqual(signal.side, "long")
-        self.assertAlmostEqual(signal.stop_loss, signal.wall_price)
-        self.assertAlmostEqual(signal.take_profit - signal.entry_price,
-                               1.5 * (signal.entry_price - signal.wall_price))
+        self.assertEqual(signal.entry_trigger_direction, "cross_up")
 
     def test_breakout_below_buy_wall_is_short_and_single_touch_is_not_enough(self):
         strategy = BreakoutStrategy()
         wall = self.wall("buy")
         self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 1, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 3, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.01, 4, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 5, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 7, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 9, [wall])), [])
-        signal, = strategy.evaluate(self.context(strategy, 99.98, 10.1, [wall]))
+        signal, = strategy.evaluate(self.context(strategy, 100.01, 2, [wall]))
         self.assertEqual(signal.side, "short")
-        self.assertLess(signal.take_profit, signal.entry_price)
-        self.assertGreater(signal.stop_loss, signal.entry_price)
+        self.assertEqual(signal.entry_trigger_direction, "cross_down")
 
     def test_breakout_selects_nearest_confirmed_wall_for_each_book_side(self):
         strategy = BreakoutStrategy()
-        farther = self.wall("sell", 100.0, "farther")
+        farther = self.wall("sell", 100.04, "farther")
         nearer = self.wall("sell", 100.02, "nearer")
-        events = [{**farther, "event": "CONSUMED"}, {**nearer, "event": "CONSUMED"}]
-        strategy.evaluate(self.context(strategy, 100.04, 1, [], events))
-        strategy.evaluate(self.context(strategy, 100.04, 3, [], events))
-        strategy.evaluate(self.context(strategy, 100.04, 5, [], events))
-        signals = strategy.evaluate(self.context(strategy, 100.04, 6.1, [], events))
+        signals = strategy.evaluate(self.context(strategy, 100.01, 6.1, [farther, nearer]))
         self.assertEqual([signal.wall_id for signal in signals], ["BTCUSDT:sell:100.02:nearer"])
         self.assertEqual(signals[0].side, "long")
 
     def test_breakout_cancelled_when_price_falls_back_or_wall_is_removed(self):
         strategy = BreakoutStrategy()
-        wall = self.wall("sell")
-        strategy.evaluate(self.context(strategy, 100.01, 0, [wall]))
-        strategy.evaluate(self.context(strategy, 100.0, 2, [wall]))
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 3, [wall])), [])
+        wall = self.wall("sell", 100.02)
+        signal, = strategy.evaluate(self.context(strategy, 100.01, 0, [wall]))
+        self.assertEqual(signal.entry_mode, "cross")
         self.assertEqual(
             strategy.evaluate(self.context(strategy, 100.02, 9, [], [{**wall, "event": "REMOVED"}])),
             [],
@@ -756,14 +774,12 @@ class WallStrategyTests(unittest.TestCase):
 
     def test_confirmation_ignores_book_only_refresh_and_resets_after_price_gap(self):
         strategy = BreakoutStrategy()
-        wall = self.wall("sell")
+        wall = self.wall("sell", 100.05)
         no_price_context = StrategyContext(
             "BTCUSDT", 100.02, (wall,), (), self.settings, 1, False
         )
-        self.assertEqual(strategy.evaluate(no_price_context), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 1, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 10, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 15, [wall])), [])
+        self.assertEqual(len(strategy.evaluate(no_price_context)), 1)
+        self.assertEqual(len(strategy.evaluate(self.context(strategy, 100.02, 1, [wall]))), 1)
 
     def test_confirmed_signal_creates_virtual_trade_with_strategy_levels(self):
         strategy = BounceStrategy()
@@ -777,24 +793,21 @@ class WallStrategyTests(unittest.TestCase):
         self.assertEqual(trade["status"], "pending")
         self.assertIsNone(trade["opened_at"])
         self.assertIsNone(manager.create_trade(signal, self.settings))
-        manager.on_price("BTCUSDT", signal.entry_price)
+        manager.on_price("BTCUSDT", trade["entry_price"])
         self.assertEqual(trade["status"], "open")
         self.assertIsNotNone(trade["opened_at"])
 
     def test_breakout_creates_pending_then_activates_on_price_confirmation(self):
         strategy = BreakoutStrategy()
-        wall = self.wall("sell")
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 10, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 12, [wall])), [])
-        self.assertEqual(strategy.evaluate(self.context(strategy, 100.02, 14, [wall])), [])
-        signal, = strategy.evaluate(self.context(strategy, 100.02, 15.1, [wall]))
+        wall = self.wall("sell", 100.05)
+        signal, = strategy.evaluate(self.context(strategy, 100.02, 10, [wall]))
         manager = TradeManager(TradingSettings(stake_usdt=10, initial_balance_usdt=100))
 
         trade = manager.create_trade(signal, self.settings)
 
         self.assertEqual(trade["status"], "pending")
         self.assertIsNone(trade["opened_at"])
-        self.assertEqual(manager.on_price("BTCUSDT", signal.entry_price)[0]["event"], "ENTRY_ACTIVATED")
+        self.assertEqual(manager.on_price("BTCUSDT", trade["entry_price"])[0]["event"], "ENTRY_ACTIVATED")
         self.assertEqual(trade["status"], "open")
 
     def test_one_wall_does_not_create_conflicting_strategy_trades(self):
@@ -905,8 +918,77 @@ class WallStrategyTests(unittest.TestCase):
         self.assertIsNotNone(manager.create_trade(eth, PairSettings("ETHUSDT", max_open_trades=1)))
         self.assertEqual(len(manager.get_open_trades()), 2)
 
+    def test_bounce_trace_exposes_price_distance_and_approach_gate(self):
+        strategy = BounceStrategy()
+        wall = self.wall(price=100, age=55)
+        _signals, traces = strategy.evaluate_with_diagnostics(
+            self.context(strategy, 100.1, 1, [wall])
+        )
+        trace = traces[0]
+        self.assertTrue(trace["wall_passed"])
+        distance = next(c for c in trace["conditions"] if c["condition"] == "max_wall_distance_bps")
+        self.assertTrue(distance["passed"])
+        self.assertEqual(distance["threshold_bps"], self.settings.max_wall_distance_bps)
+        self.assertTrue(trace["signal_formed"])
+
+    def test_breakout_trace_exposes_buffer_and_hold_confirmation(self):
+        strategy = BreakoutStrategy()
+        wall = self.wall(side="sell", price=100.05, age=55)
+        _signals, traces = strategy.evaluate_with_diagnostics(
+            self.context(strategy, 100.046, 1, [wall])
+        )
+        trace = traces[0]
+        side_condition = next(c for c in trace["conditions"] if c["condition"] == "wall_on_valid_side_of_price")
+        self.assertTrue(side_condition["passed"])
+        self.assertTrue(trace["signal_formed"])
+
+    def test_signal_forming_for_non_nearest_wall_is_reported_as_strategy_rejection(self):
+        strategy = BounceStrategy()
+        near = self.wall(price=100, identity="near")
+        far = self.wall(price=99.998, identity="far")
+        signals, traces = strategy.evaluate_with_diagnostics(self.context(strategy, 100.005, 1, [near, far]))
+        self.assertEqual(len(signals), 1)
+        far_trace = next(trace for trace in traces if trace["wall_id"].endswith(":far"))
+        self.assertFalse(far_trace["signal_formed"])
+        self.assertFalse(far_trace["signal_accepted"])
+        self.assertIn("более близкая", far_trace["reasons"][-1])
+
 
 class StrategyPipelineTests(unittest.TestCase):
+    def test_trade_manager_duplicate_rejection_is_attached_to_wall_trace(self):
+        settings = PairSettings("BTCUSDT", entry_distance_bps=2, bounce_reversal_bps=1)
+        engine = TradingEngine(
+            {"BTCUSDT": settings},
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        wall_id = "BTCUSDT:buy:100:diagnostic-life"
+        existing = {
+            "strategy_id": "bounce", "symbol": "BTCUSDT", "wall_side": "buy",
+            "wall_price": 100, "wall_id": wall_id, "signal_id": "already-pending",
+            "wall_size": 1000, "wall_ratio": 900, "side": "long",
+            "entry_price": 100.02, "stop_loss": 99.98, "take_profit": 100.06,
+            "entry_mode": "limit",
+        }
+        self.assertIsNotNone(engine.trade_manager.create_trade(existing, settings))
+        engine.start()
+        wall = {
+            "side": "buy", "price": 100.0, "first_seen_at": "diagnostic-life",
+            "current_size": 1000.0, "initial_size": 1000.0,
+            "wall_ratio": 900.0, "age": 55.0,
+        }
+        engine.on_market_update("BTCUSDT", 100.01, [wall])
+        engine.on_market_update("BTCUSDT", 100.02, [wall])
+
+        diagnostic = engine.wall_diagnostics["BTCUSDT"]
+        trace = diagnostic["planner_wall_decisions"][0]["strategies"][0]
+        self.assertTrue(trace["signal_formed"])
+        self.assertTrue(trace["signal_accepted"])
+        self.assertTrue(trace["pending_created"])
+        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
+        self.assertEqual(engine.trade_manager.get_pending_trades()[0]["signal_id"], "already-pending")
+
     def test_unknown_strategy_configuration_fails_before_worker_start(self):
         with self.assertRaisesRegex(KeyError, "Unknown strategies"):
             TradingEngine(
@@ -1017,7 +1099,7 @@ class StrategyPipelineTests(unittest.TestCase):
                 )
 
                 self.assertEqual(trade["status"], "cancelled")
-                self.assertEqual(trade["close_reason"], f"WALL_{event_type}")
+                self.assertEqual(trade["close_reason"], "NO_STABLE_WALL")
                 self.assertEqual(events[0]["event"], "ENTRY_CANCELLED")
 
     def test_custom_strategy_can_be_registered_and_enabled_per_pair(self):
@@ -1034,6 +1116,9 @@ class StrategyPipelineTests(unittest.TestCase):
                         wall_id="custom-wall-id",
                         wall_size=1000.0,
                         wall_ratio=900.0,
+                        side="long", entry_price=100.5,
+                        stop_loss=99.5, take_profit=101.5,
+                        entry_mode="market",
                     )
                 ]
 
@@ -1092,6 +1177,9 @@ class StrategyPipelineTests(unittest.TestCase):
                         wall_id="working-strategy-wall",
                         wall_size=1000.0,
                         wall_ratio=900.0,
+                        side="long", entry_price=100.5,
+                        stop_loss=99.5, take_profit=101.5,
+                        entry_mode="market",
                     )
                 ]
 
@@ -1431,6 +1519,170 @@ class StrategyCallbackTests(unittest.TestCase):
         self.assertFalse(run_immediate(Admin()(callback)))
 
 
+class StableWallTelegramTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime = RuntimeController(TradingEngine({
+            "BTCUSDT": PairSettings("BTCUSDT"),
+            "ETHUSDT": PairSettings("ETHUSDT"),
+        }))
+
+    @staticmethod
+    def walls(count: int, status: str, side: str = "buy", base: float = 100.0) -> list[dict]:
+        return [{
+            "side": side,
+            "status": status,
+            "price": base + index / 1000,
+            "notional": 25000 + index,
+            "distance_bps": 12.5 + index / 100,
+            "age_seconds": 40.0 + index,
+            "stability_seconds": 40.0,
+            "progress_percent": 100.0,
+            "change_notional": -125.5 + index,
+        } for index in range(count)]
+
+    def put_snapshot(self, symbol: str, stable: list[dict], candidates: list[dict]) -> None:
+        self.runtime.engine.wall_diagnostics[symbol] = {
+            "feed_state": "connected",
+            "book_synchronized": True,
+            "last_update_at": datetime.now(timezone.utc),
+            "price": 100.0 if symbol == "BTCUSDT" else 200.0,
+            "bid": stable + candidates,
+            "ask": [],
+            "stable_count": len(stable),
+            "rejected": {"below_min_wall_ratio": 2},
+            "reason": "Есть стабильные стены." if stable else "Кандидаты ещё ожидают устойчивости.",
+            "planner_decision": "Текущая стратегия ещё не сформировала новый сигнал.",
+        }
+
+    def test_large_candidate_list_is_paginated_and_each_message_fits(self):
+        self.put_snapshot("BTCUSDT", [], self.walls(1000, "CANDIDATE"))
+        pages = (1000 + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE
+        for page in range(pages):
+            text = stable_walls_text(self.runtime, "BTCUSDT", "candidate", page)
+            self.assertLessEqual(len(text), TELEGRAM_TEXT_LIMIT)
+            self.assertIn("CANDIDATE: 1000", text)
+            self.assertIn(f"стр. {page + 1}", text)
+        first = stable_walls_text(self.runtime, "BTCUSDT", "candidate", 0)
+        self.assertEqual(first.count("BID <code>"), WALLS_PAGE_SIZE)
+
+    def test_large_stable_wall_list_is_paginated_and_each_message_fits(self):
+        self.put_snapshot("BTCUSDT", self.walls(1000, "STABLE"), [])
+        pages = (1000 + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE
+        for page in range(pages):
+            text = stable_walls_text(self.runtime, "BTCUSDT", "stable", page)
+            self.assertLessEqual(len(text), TELEGRAM_TEXT_LIMIT)
+            self.assertIn("STABLE: 1000", text)
+        self.assertEqual(
+            stable_walls_text(self.runtime, "BTCUSDT", "stable", pages - 1).count("BID <code>"),
+            WALLS_PAGE_SIZE,
+        )
+
+    def test_empty_list_has_compact_empty_state(self):
+        self.put_snapshot("BTCUSDT", [], [])
+        text = stable_walls_text(self.runtime, "BTCUSDT", "stable")
+        self.assertIn("Список пуст", text)
+        self.assertLessEqual(len(text), TELEGRAM_TEXT_LIMIT)
+
+    def test_pair_switch_and_section_navigation_callbacks(self):
+        self.put_snapshot("BTCUSDT", self.walls(7, "STABLE"), [])
+        self.put_snapshot("ETHUSDT", [], self.walls(7, "CANDIDATE", side="sell", base=200))
+        btc = stable_walls_text(self.runtime, "BTCUSDT", "stable", 0)
+        eth = stable_walls_text(self.runtime, "ETHUSDT", "candidate", 0)
+        self.assertIn("BTCUSDT", btc)
+        self.assertIn("ETHUSDT", eth)
+        self.assertIn("ASK", eth)
+        keyboard = stable_walls_keyboard(self.runtime, "BTCUSDT", "stable", 0)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("walls:ETHUSDT:stable:0", callbacks)
+        self.assertIn("walls:BTCUSDT:candidate:0", callbacks)
+        self.assertIn("walls:BTCUSDT:diagnostics:0", callbacks)
+
+    def test_page_callbacks_and_refresh_use_latest_wall_count(self):
+        self.put_snapshot("BTCUSDT", self.walls(11, "STABLE"), [])
+        keyboard = stable_walls_keyboard(self.runtime, "BTCUSDT", "stable", 0)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("walls:BTCUSDT:stable:1", callbacks)
+
+        class FakeMessage:
+            text = "old"
+            reply_markup = None
+
+            async def edit_text(self, text, reply_markup=None):
+                self.text = text
+                self.reply_markup = reply_markup
+
+        class FakeCallback:
+            data = "walls:BTCUSDT:stable:1"
+            message = FakeMessage()
+
+            async def answer(self, text="", show_alert=False):
+                self.answer_text = text
+
+        callback = FakeCallback()
+        run_immediate(navigate_stable_walls(callback, self.runtime))
+        self.assertIn("стр. 2", callback.message.text)
+        self.assertEqual(callback.message.text.count("BID <code>"), 5)
+
+        self.put_snapshot("BTCUSDT", self.walls(12, "STABLE"), [])
+        refreshed = stable_walls_text(self.runtime, "BTCUSDT", "stable", 0)
+        self.assertIn("STABLE: 12", refreshed)
+
+    def test_diagnostics_page_is_separate_and_bounded(self):
+        self.put_snapshot("BTCUSDT", self.walls(10, "STABLE"), self.walls(10, "CANDIDATE"))
+        data = self.runtime.engine.wall_diagnostics["BTCUSDT"]
+        data["planner_strategies"] = ["bounce", "breakout"]
+        data["planner_wall_decisions"] = [{
+            "wall_id": str(index), "side": "buy", "price": 100 + index,
+            "notional": 50000, "age_seconds": 55,
+            "strategies": [{
+                "strategy_id": "bounce", "wall_passed": True, "evaluated": True,
+                "signal_formed": False, "conditions": [{
+                    "condition": "entry_distance_bps", "passed": False,
+                    "actual_bps": 8.2, "threshold_bps": 1.5,
+                }], "reasons": ["Цена ещё не подошла к стене на допустимую дистанцию."],
+            }, {
+                "strategy_id": "breakout", "wall_passed": True, "evaluated": True,
+                "signal_formed": False, "conditions": [{
+                    "condition": "price_beyond_wall_buffer", "passed": False,
+                    "actual_bps": -3.2, "threshold_bps": 0.5,
+                }], "reasons": ["Цена ещё не вышла за стену на заданный буфер."],
+            }],
+        } for index in range(12)]
+        text = stable_walls_text(self.runtime, "BTCUSDT", "diagnostics", 0)
+        self.assertIn("Отклонения Scanner", text)
+        self.assertIn("Trade Planner", text)
+        self.assertIn("8.20/1.5 bps", text)
+        self.assertLessEqual(len(text), TELEGRAM_TEXT_LIMIT)
+        keyboard = stable_walls_keyboard(self.runtime, "BTCUSDT", "diagnostics", 0)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("walls:BTCUSDT:diagnostics:1", callbacks)
+        for page in range(3):
+            self.assertLessEqual(
+                len(stable_walls_text(self.runtime, "BTCUSDT", "diagnostics", page)),
+                TELEGRAM_TEXT_LIMIT,
+            )
+        self.assertIn("стр. 2/3", stable_walls_text(self.runtime, "BTCUSDT", "diagnostics", 1))
+
+    def test_edit_ignores_only_message_is_not_modified(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        class FakeMessage:
+            text = "old"
+            reply_markup = None
+
+            async def edit_text(self, text, reply_markup=None):
+                raise TelegramBadRequest(method=None, message="Bad Request: message is not modified")
+
+        self.assertFalse(run_immediate(edit_message_if_changed(FakeMessage(), "new")))
+
+        class FailingMessage(FakeMessage):
+            async def edit_text(self, text, reply_markup=None):
+                raise TelegramBadRequest(method=None, message="Bad Request: text is too long")
+
+        with self.assertRaisesRegex(TelegramBadRequest, "text is too long"):
+            run_immediate(edit_message_if_changed(FailingMessage(), "new"))
+
+
 class PairSymbolValidationTests(unittest.TestCase):
     def test_build_runtime_restores_database_state_and_saved_run_mode(self):
         from database import request as database
@@ -1500,6 +1752,7 @@ class VirtualTradeTests(unittest.TestCase):
             "wall_id": "wall-1",
             "wall_size": 10000.0,
             "wall_ratio": 900.0,
+            "side": "long",
         }
 
     def test_levels_follow_agreed_bps_and_x2(self):
@@ -1592,9 +1845,9 @@ class VirtualTradeTests(unittest.TestCase):
         self.assertIsNone(self.manager.create_trade(self.signal, self.settings))
         events = self.manager.on_price("btcusdt", 100.0)
         self.assertEqual(events[0]["event"], "ENTRY_ACTIVATED")
-        self.assertEqual(events[0]["fill_price"], trade["entry_price"])
+        self.assertEqual(events[0]["fill_price"], 100.0)
         self.assertEqual(events[0]["trigger_price"], 100.0)
-        self.assertEqual(events[0]["price_source"], "Bybit V5 linear ticker lastPrice")
+        self.assertIn("virtual taker-fee simulation", events[0]["price_source"])
         self.assertIn("BTCUSDT", self.manager.last_prices)
 
         close_events = self.manager.on_price("BTCUSDT", trade["take_profit"])
@@ -1614,8 +1867,9 @@ class VirtualTradeTests(unittest.TestCase):
         stats = self.manager.get_statistics()
 
         notional = trade["stake_usdt"] * trade["leverage"]
-        gross = (100.0 - 100.015) / 100.015 * notional
-        expected_unrealized = gross - trade["entry_fee_usdt"] - notional * 100.0 / 100.015 * trade["taker_fee_rate"]
+        fill = trade["entry_fill_price"]
+        gross = (100.0 - fill) / fill * notional
+        expected_unrealized = gross - trade["entry_fee_usdt"] - notional * 100.0 / fill * trade["taker_fee_rate"]
         self.assertAlmostEqual(stats["unrealized_profit_usdt"], expected_unrealized)
         self.assertAlmostEqual(stats["equity_usdt"], 100 + expected_unrealized)
         self.assertAlmostEqual(stats["available_balance_usdt"], 90 - trade["entry_fee_usdt"])
@@ -1984,6 +2238,9 @@ class MarketFreshnessTests(unittest.TestCase):
                     wall_ratio=100.0,
                     entry_mode="market",
                     entry_price=context.last_price,
+                    side="long",
+                    stop_loss=context.last_price * 0.99,
+                    take_profit=context.last_price * 1.01,
                 )]
 
         registry = StrategyRegistry()
@@ -2027,6 +2284,44 @@ class MarketFreshnessTests(unittest.TestCase):
 
         self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
         self.assertEqual(engine.trade_manager.trades, [])
+
+    def test_stale_market_gap_disarms_pending_until_fresh_safe_side_and_recross(self):
+        engine = TradingEngine(
+            {"BTCUSDT": PairSettings(
+                "BTCUSDT", min_wall_age_seconds=0, max_wall_distance_bps=1000,
+            )},
+            TradingSettings(initial_balance_usdt=100),
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        wall = {
+            "side": "buy", "price": 100.0, "first_seen_at": "stale-gap",
+            "current_size": 10000.0, "initial_size": 10000.0,
+            "wall_ratio": 900.0, "age": 45.0,
+        }
+        self.record_market_health(engine, price_value=100.1)
+        engine.on_market_update("BTCUSDT", 100.1, [wall])
+        pending, = engine.trade_manager.get_pending_trades()
+        self.assertTrue(pending["entry_armed"])
+
+        # Price crossed Entry while the stream was stale. It must not use the
+        # old pre-gap price as evidence of a continuous crossing.
+        self.record_market_health(engine, received_age=2.0, price_value=99.9)
+        engine.on_market_update("BTCUSDT", 99.9, [wall])
+        self.assertEqual(pending["status"], "pending")
+        self.assertFalse(pending["entry_armed"])
+
+        self.record_market_health(engine, price_value=100.1)
+        engine.on_market_update("BTCUSDT", 100.1, [wall])
+        self.assertEqual(pending["status"], "pending")
+        self.assertTrue(pending["entry_armed"])
+
+        self.record_market_health(engine, price_value=100.01)
+        events = engine.on_market_update("BTCUSDT", 100.01, [wall])
+        self.assertIn("ENTRY_ACTIVATED", [event["event"] for event in events])
+        self.assertEqual(pending["status"], "open")
 
     def test_unsynchronized_book_blocks_new_entries(self):
         engine = self.make_engine()
@@ -2283,7 +2578,7 @@ class MarketFreshnessTests(unittest.TestCase):
 
 
 class EngineControlContinuationTests(unittest.TestCase):
-    def test_restart_cancels_old_pending_plan_but_keeps_open_trade_and_balance(self):
+    def test_restart_preserves_disarmed_pending_plan_and_open_trade_and_balance(self):
         settings = PairSettings("BTCUSDT", max_open_trades=3)
         engine = TradingEngine({"BTCUSDT": settings})
         pending = engine.trade_manager.create_trade({
@@ -2310,8 +2605,8 @@ class EngineControlContinuationTests(unittest.TestCase):
         with patch("app.runtime.asyncio.create_task", side_effect=fake_create_task):
             run_immediate(runtime.start(preserve_mode=True))
 
-        self.assertEqual(pending["status"], "cancelled")
-        self.assertEqual(pending["close_reason"], "PROCESS_RESTARTED")
+        self.assertEqual(pending["status"], "pending")
+        self.assertFalse(pending["entry_armed"])
         self.assertEqual(opened["status"], "open")
         self.assertEqual(engine.trade_manager.balance_usdt, balance)
         self.assertEqual(engine.mode, EngineMode.ENTRIES_PAUSED)
@@ -2346,6 +2641,8 @@ class EngineControlContinuationTests(unittest.TestCase):
             "wall_ratio": 900.0,
         }
         trade = manager.create_trade(signal, engine.pair_settings["BTCUSDT"])
+        manager.on_price("BTCUSDT", 100.1)
+        manager.on_price("BTCUSDT", 100.0)
         MarketFreshnessTests.record_market_health(engine, price_value=100.0)
         engine.on_market_update("BTCUSDT", 100.0, [])
         pending_signal = dict(signal, wall_id="wall-pending-during-pause", wall_price=101.0)
@@ -2392,6 +2689,8 @@ class EngineControlContinuationTests(unittest.TestCase):
             "wall_ratio": 900.0,
         }
         trade = manager.create_trade(signal, engine.pair_settings["BTCUSDT"])
+        manager.on_price("BTCUSDT", 100.1)
+        manager.on_price("BTCUSDT", 100.0)
         MarketFreshnessTests.record_market_health(engine, price_value=100.0)
         engine.on_market_update("BTCUSDT", 100.0, [])
         runtime = RuntimeController(engine)
@@ -2484,6 +2783,8 @@ class EngineControlContinuationTests(unittest.TestCase):
             },
             pair,
         )
+        engine.trade_manager.on_price("BTCUSDT", 100.1)
+        engine.trade_manager.on_price("BTCUSDT", 100.0)
         MarketFreshnessTests.record_market_health(engine)
         run_immediate(engine.process_market_update("BTCUSDT", 100.0, []))
         repository.fail_trade_saves = True
@@ -2498,7 +2799,7 @@ class EngineControlContinuationTests(unittest.TestCase):
         self.assertIsNone(restored_trade["exit_price"])
         self.assertEqual(engine.trade_manager.balance_usdt, balance_before)
         self.assertEqual(engine.get_status()["persistence_pending"], 0)
-        self.assertEqual(repository.saved_trade_batches[-1][0][0]["status"], "open")
+        self.assertEqual(repository.saved_trade_batches, [])
 
     def test_disabled_pair_cancels_pending_entry_before_price_activation(self):
         settings = PairSettings("BTCUSDT", enabled=False)

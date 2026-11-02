@@ -5,6 +5,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 from time import monotonic, time
 
 import aiohttp
@@ -22,6 +23,7 @@ BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 # `orderbook.full` requires the matching full-depth REST stream; the regular
 # `/orderbook` endpoint's `u` belongs to the 1000-level orderbook feed.
 BYBIT_REST_URL = "https://api.bybit.com/v5/market/full_orderbook"
+BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 DEFAULT_SYMBOL = "BTCUSDT"
 CATEGORY = "linear"
 logger = logging.getLogger(__name__)
@@ -139,6 +141,32 @@ async def get_orderbook_snapshot(symbol: str) -> dict:
     if data.get("retCode") != 0:
         raise RuntimeError(f"Bybit REST returned retCode={data.get('retCode')}")
     return data["result"]
+
+
+async def get_instrument_tick_size(symbol: str) -> float:
+    """Fetch and validate the public Bybit V5 linear price tick size."""
+    params = {"category": CATEGORY, "symbol": symbol.upper()}
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(BYBIT_INSTRUMENTS_URL, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit instruments-info returned retCode={data.get('retCode')}")
+    instruments = (data.get("result") or {}).get("list") or []
+    instrument = next(
+        (row for row in instruments if str(row.get("symbol", "")).upper() == symbol.upper()),
+        None,
+    )
+    if instrument is None:
+        raise RuntimeError(f"Bybit did not return linear instrument {symbol.upper()}")
+    try:
+        tick = float(instrument["priceFilter"]["tickSize"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"Bybit returned invalid tickSize for {symbol.upper()}") from error
+    if not isfinite(tick) or tick <= 0:
+        raise RuntimeError(f"Bybit returned invalid tickSize for {symbol.upper()}")
+    return tick
 
 
 def _check_subscription(payload: dict) -> None:
@@ -620,6 +648,14 @@ async def _run_connection(
         close_timeout=5,
     ) as websocket:
         logger.info("%s WebSocket connected", symbol)
+        try:
+            tick_size = await get_instrument_tick_size(symbol)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as error:
+            engine.instrument_tick_sizes.pop(symbol.upper(), None)
+            logger.warning("%s instrument tick size unavailable; plan creation blocked: %s", symbol, error)
+        else:
+            engine.instrument_tick_sizes[symbol.upper()] = tick_size
+            logger.info("%s Bybit linear instrument tickSize=%s", symbol, tick_size)
         await websocket.send(json.dumps({"op": "subscribe", "args": topics}))
         logger.info("%s WebSocket subscription requested: %s", symbol, ",".join(topics))
         logger.info("%s orderbook buffer generation=%d started", symbol, buffered_deltas.generation)

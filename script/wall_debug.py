@@ -25,6 +25,18 @@ def _signature(data: dict) -> tuple:
         data.get("feed_state"), data.get("book_synchronized"),
         data.get("stable_count"), tuple(walls), data.get("reason"),
         data.get("planner_decision"),
+        tuple(
+            (
+                wall.get("wall_id"),
+                tuple((trace.get("strategy_id"), trace.get("signal_formed"),
+                       trace.get("signal_accepted"), trace.get("pending_created"),
+                       tuple((item.get("condition"), item.get("passed"))
+                             for item in trace.get("conditions", [])),
+                       tuple(trace.get("reasons", [])[:1]))
+                      for trace in wall.get("strategies", [])),
+            )
+            for wall in data.get("planner_wall_decisions", [])
+        ),
     )
 
 
@@ -59,6 +71,46 @@ def _render(symbol: str, data: dict, health: dict) -> str:
     rejected = data.get("rejected") or {}
     lines.append(f"  rejected={rejected or 'нет'}")
     lines.append(f"  trade_planner={data.get('planner_decision', 'нет данных')}")
+    planner_walls = data.get("planner_wall_decisions") or []
+    strategies = data.get("planner_strategies") or []
+    lines.append(f"  planner_strategies={','.join(strategies) if strategies else 'нет'}; оценено стен={len(planner_walls)}")
+    for wall in planner_walls:
+        side = "BID" if wall.get("side") == "buy" else "ASK"
+        lines.append(
+            f"  planner {side} {wall.get('price', 0):g} "
+            f"{'CONSUMED ' if wall.get('event') == 'CONSUMED' else ''}"
+            f"{wall.get('notional', 0):.2f}USDT age={wall.get('age_seconds', 0):.1f}s"
+        )
+        for trace in wall.get("strategies", []):
+            strategy = trace.get("strategy_id", "?")
+            if not trace.get("evaluated"):
+                reason = (trace.get("reasons") or ["не оценивалась"])[0]
+                lines.append(f"    {strategy}: не оценивалась — {reason}")
+                continue
+            failed = [item for item in trace.get("conditions", []) if not item.get("passed")]
+            facts = []
+            for item in failed[:2]:
+                name = item.get("condition", "условие")
+                if "actual_bps" in item:
+                    value = f"{item['actual_bps']:.2f}/{item.get('threshold_bps', '—')}bps"
+                elif "actual_seconds" in item:
+                    value = f"{item['actual_seconds']:.1f}/{item.get('threshold_seconds', '—')}s"
+                elif "elapsed_seconds" in item:
+                    value = f"{item['elapsed_seconds']:.1f}/{item.get('confirmation_seconds', '—')}s"
+                else:
+                    value = str(item.get("actual", "не выполнено"))
+                facts.append(f"{name}={value}")
+            state = "signal" if trace.get("signal_formed") else "no-signal"
+            if trace.get("pending_created"):
+                state += "/PENDING"
+            elif trace.get("trade_planner_reason"):
+                state += "/rejected-by-TradeManager"
+            reason = (trace.get("reasons") or [])[:1]
+            lines.append(
+                f"    {strategy}: {state}; "
+                f"{'; '.join(facts) if facts else 'условия пройдены'}"
+                f"{'; ' + reason[0] if reason else ''}"
+            )
     return "\n".join(lines)
 
 

@@ -114,6 +114,10 @@ class VirtualTrade(Base):
     fee_rate: Mapped[float | None] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=True)
     accounting_version: Mapped[int] = mapped_column(nullable=False, default=1)
     entry_price: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
+    entry_fill_price: Mapped[float | None] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=True)
+    wall_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    entry_trigger_direction: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    entry_armed: Mapped[bool] = mapped_column(nullable=False, default=False)
     stop_loss: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
     take_profit: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
     exit_price: Mapped[float | None] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=True)
@@ -153,6 +157,10 @@ async def async_main() -> None:
         for column, sql_type in (("leverage", "NUMERIC(10,4)"), ("position_notional_usdt", "NUMERIC(24,8)"), ("entry_fee_usdt", "NUMERIC(24,8)"), ("exit_fee_usdt", "NUMERIC(24,8)"), ("gross_pnl_usdt", "NUMERIC(24,8)"), ("fee_rate", "NUMERIC(18,10)")):
             await connection.execute(text(f"ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS {column} {sql_type}"))
         await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS accounting_version INTEGER NOT NULL DEFAULT 1"))
+        await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS entry_fill_price NUMERIC(30,12)"))
+        await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS wall_id VARCHAR(240)"))
+        await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS entry_trigger_direction VARCHAR(12)"))
+        await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS entry_armed BOOLEAN NOT NULL DEFAULT FALSE"))
         await connection.execute(text(
             "ALTER TABLE pair_strategy_configs ADD COLUMN IF NOT EXISTS "
             "version INTEGER NOT NULL DEFAULT 1"

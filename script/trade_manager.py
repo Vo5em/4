@@ -3,11 +3,6 @@ from decimal import Decimal, InvalidOperation
 from math import isfinite
 from threading import RLock
 
-from .formulas import (
-    calculate_entry_price,
-    calculate_stop_loss_price,
-    calculate_x2_price,
-)
 from .settings import PairSettings, TradingSettings
 
 
@@ -21,6 +16,8 @@ class TradeManager:
         self._used_signal_ids: set[str] = set()
         self._create_lock = RLock()
         self.balance_usdt = self.trading_settings.initial_balance_usdt
+        self.last_create_rejection_reason: str | None = None
+        self._deferred_entry_ticks: dict[str, float | None] = {}
 
     def restore_state(
         self,
@@ -48,6 +45,17 @@ class TradeManager:
             trade["exit_fee"] = trade.get("exit_fee", trade.get("exit_fee_usdt") or 0.0) or 0.0
             trade["gross_pnl"] = trade.get("gross_pnl", trade.get("gross_pnl_usdt"))
             trade["taker_fee_rate"] = trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0) or 0.0
+            if trade.get("entry_trigger_direction") not in {"cross_down", "cross_up"}:
+                trade["entry_trigger_direction"] = (
+                    "cross_down" if trade.get("wall_side") == "buy" else "cross_up"
+                )
+            if trade.get("status") == "pending":
+                # A restart has no continuous price-crossing history.
+                trade["entry_armed"] = False
+            else:
+                trade.setdefault("entry_armed", False)
+            trade.setdefault("entry_fill_price", None)
+            trade["entry_previous_price"] = None
         self._used_signal_ids = {trade["signal_id"] for trade in self.trades}
         self.balance_usdt = float(balance_usdt)
         if last_prices is not None:
@@ -92,6 +100,7 @@ class TradeManager:
         # may invoke execution concurrently. Keep duplicate checks and insertion
         # in one critical section.
         with self._create_lock:
+            self.last_create_rejection_reason = None
             return self._create_trade_unlocked(
                 signal, pair_settings, stake_usdt=stake_usdt
             )
@@ -103,6 +112,7 @@ class TradeManager:
         *,
         stake_usdt: float | None = None,
     ) -> dict | None:
+        self.set_pair_settings_for_price_check(pair_settings)
         data = signal if isinstance(signal, dict) else {
             "strategy_id": signal.strategy_id,
             "symbol": signal.symbol,
@@ -116,6 +126,8 @@ class TradeManager:
             "stop_loss": signal.stop_loss,
             "take_profit": signal.take_profit,
             "entry_mode": signal.entry_mode,
+            "entry_trigger_direction": getattr(signal, "entry_trigger_direction", None),
+            "reference_price": getattr(signal, "reference_price", None),
             "signal_id": f"{signal.strategy_id}:{signal.wall_id}",
         }
         signal_id = data.get("signal_id") or data["wall_id"]
@@ -135,6 +147,7 @@ class TradeManager:
         ):
             raise ValueError("wall values must be finite and within valid ranges")
         if signal_id in self._used_signal_ids:
+            self.last_create_rejection_reason = "Сигнал с таким signal_id уже обрабатывался ранее."
             return None
         wall_id = str(data.get("wall_id") or signal_id)
         if any(
@@ -142,6 +155,7 @@ class TradeManager:
             and trade.get("status") in {"pending", "open", "closed"}
             for trade in self.trades
         ):
+            self.last_create_rejection_reason = "Эта идентичность стены уже дала сделку со статусом pending/open/closed."
             return None
         if any(
             trade["symbol"] == symbol
@@ -150,6 +164,7 @@ class TradeManager:
             and trade["status"] in {"pending", "open"}
             for trade in self.trades
         ):
+            self.last_create_rejection_reason = "Для этой пары, стороны и цены стены уже есть pending/open сделка."
             return None
 
         stake = float(
@@ -164,7 +179,15 @@ class TradeManager:
             for trade in self.trades
             if trade["status"] in {"pending", "open"}
         )
-        if not isfinite(stake) or stake <= 0 or self.balance_usdt - reserved < stake:
+        available = self.balance_usdt - reserved
+        if not isfinite(stake) or stake <= 0:
+            self.last_create_rejection_reason = f"Некорректная ставка: {stake!r} USDT."
+            return None
+        if available < stake:
+            self.last_create_rejection_reason = (
+                f"Недостаточно свободного баланса: доступно {available:.4g} USDT, "
+                f"требуется {stake:.4g} USDT маржи."
+            )
             return None
 
         wall_side = data["wall_side"]
@@ -172,18 +195,10 @@ class TradeManager:
             raise ValueError(f"Unsupported wall side: {wall_side}")
         trade_side = data.get("side") or ("long" if wall_side == "buy" else "short")
         entry_price = data.get("entry_price")
-        if entry_price is None:
-            entry_price = calculate_entry_price(
-                wall_price, wall_side, pair_settings.entry_distance_bps
-            )
         stop_loss = data.get("stop_loss")
-        if stop_loss is None:
-            stop_loss = calculate_stop_loss_price(
-                wall_price, wall_side, pair_settings.stop_distance_bps
-            )
         take_profit = data.get("take_profit")
-        if take_profit is None:
-            take_profit = calculate_x2_price(entry_price, stop_loss, wall_side)
+        if entry_price is None or stop_loss is None or take_profit is None:
+            raise ValueError("Trade levels must be calculated before TradeManager creates a plan")
         entry_price = float(entry_price)
         stop_loss = float(stop_loss)
         take_profit = float(take_profit)
@@ -198,6 +213,19 @@ class TradeManager:
             raise ValueError("trade levels are on the wrong side of entry")
         created_at = datetime.now(timezone.utc)
         immediate = data.get("entry_mode") == "market"
+        trigger_direction = data.get("entry_trigger_direction") or (
+            "cross_down" if wall_side == "buy" else "cross_up"
+        )
+        if trigger_direction not in {"cross_down", "cross_up"}:
+            raise ValueError("entry_trigger_direction must be cross_down or cross_up")
+        reference_price = data.get("reference_price")
+        if reference_price is None:
+            reference_price = self.last_prices.get(symbol)
+        armed = (
+            reference_price is not None
+            and ((wall_side == "buy" and float(reference_price) > entry_price)
+                 or (wall_side == "sell" and float(reference_price) < entry_price))
+        )
         trade = {
             "signal_id": signal_id,
             "strategy_id": data["strategy_id"],
@@ -223,6 +251,10 @@ class TradeManager:
             "net_pnl": 0.0,
             "margin_return_pct": 0.0,
             "entry_price": entry_price,
+            "entry_fill_price": entry_price if immediate else None,
+            "entry_trigger_direction": trigger_direction,
+            "entry_armed": bool(armed) if not immediate else True,
+            "entry_previous_price": float(reference_price) if reference_price is not None else None,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "status": "open" if immediate else "pending",
@@ -249,11 +281,20 @@ class TradeManager:
         prefix = f"{strategy_id}:"
         return signal_id[len(prefix):] if signal_id.startswith(prefix) else signal_id
 
-    def on_price(self, symbol: str, price: float) -> list[dict]:
+    def on_price(
+        self, symbol: str, price: float, *, process_entries: bool = True,
+        process_open: bool = True, eligible_signal_ids: set[str] | None = None,
+    ) -> list[dict]:
         with self._create_lock:
-            return self._on_price_unlocked(symbol, price)
+            return self._on_price_unlocked(
+                symbol, price, process_entries=process_entries,
+                process_open=process_open, eligible_signal_ids=eligible_signal_ids,
+            )
 
-    def _on_price_unlocked(self, symbol: str, price: float) -> list[dict]:
+    def _on_price_unlocked(
+        self, symbol: str, price: float, *, process_entries: bool = True,
+        process_open: bool = True, eligible_signal_ids: set[str] | None = None,
+    ) -> list[dict]:
         try:
             decimal_price = Decimal(str(price))
         except (InvalidOperation, TypeError, ValueError):
@@ -262,32 +303,91 @@ class TradeManager:
             raise ValueError("price must be a positive finite number")
         numeric_price = float(decimal_price)
         symbol = symbol.upper()
+        previous = self.last_prices.get(symbol)
+        if process_entries:
+            previous = self._deferred_entry_ticks.pop(symbol, previous)
         self.last_prices[symbol] = numeric_price
+        if not process_entries:
+            self._deferred_entry_ticks[symbol] = previous
         events = []
-        for trade in self.trades:
-            if trade["symbol"] != symbol or trade["status"] not in {"pending", "open"}:
+        pending = sorted(
+            (trade for trade in self.trades
+             if trade["symbol"] == symbol and trade["status"] == "pending"),
+            key=lambda trade: (
+                trade.get("created_at") or datetime.min.replace(tzinfo=timezone.utc),
+                0 if trade.get("wall_side") == "buy" else 1,
+                trade.get("signal_id", ""),
+            ),
+        )
+        for trade in pending:
+            if not process_entries:
                 continue
+            if eligible_signal_ids is not None and trade["signal_id"] not in eligible_signal_ids:
+                trade["entry_previous_price"] = numeric_price
+                continue
+            entry = Decimal(str(trade["entry_price"]))
+            trigger_previous = previous
+            if trigger_previous is None:
+                trigger_previous = trade.get("entry_previous_price")
+            safe_side = numeric_price > float(entry) if trade["wall_side"] == "buy" else numeric_price < float(entry)
+            if not trade.get("entry_armed"):
+                if safe_side:
+                    trade["entry_armed"] = True
+                    events.append({"event": "ENTRY_ARMED", "trade": trade})
+                continue
+            crossed = False
+            if trigger_previous is not None:
+                if trade["entry_trigger_direction"] == "cross_down":
+                    crossed = trigger_previous > float(entry) and numeric_price <= float(entry)
+                else:
+                    crossed = trigger_previous < float(entry) and numeric_price >= float(entry)
+            if not crossed:
+                continue
+            open_count = sum(item["status"] == "open" for item in self.trades)
+            pair_open_count = sum(
+                item["status"] == "open" and item["symbol"] == symbol
+                for item in self.trades
+            )
+            pair_settings = getattr(self, "_current_pair_settings", {}).get(symbol)
+            pair_limit = pair_settings.max_open_trades if pair_settings else self.trading_settings.max_open_trades
+            if open_count >= self.trading_settings.max_open_trades:
+                trade["entry_armed"] = False
+                events.append({"event": "ENTRY_BLOCKED", "trade": trade,
+                               "reason": "GLOBAL_OPEN_LIMIT"})
+                continue
+            if pair_open_count >= pair_limit:
+                trade["entry_armed"] = False
+                events.append({"event": "ENTRY_BLOCKED", "trade": trade,
+                               "reason": "PAIR_OPEN_LIMIT"})
+                continue
+            reserved = sum(
+                item["stake_usdt"] for item in self.trades
+                if item["status"] in {"pending", "open"}
+            )
+            entry_fee = trade["position_notional_usdt"] * trade["taker_fee_rate"]
+            if self.balance_usdt - reserved < entry_fee:
+                trade["entry_armed"] = False
+                events.append({"event": "ENTRY_BLOCKED", "trade": trade,
+                               "reason": "INSUFFICIENT_BALANCE_FOR_FEE"})
+                continue
+            trade["status"] = "open"
+            trade["opened_at"] = datetime.now(timezone.utc)
+            # Last Price crossing is a virtual trigger, not a guaranteed maker
+            # fill. Use a conservative taker fee and retain the simulated fill.
+            trade["entry_fill_price"] = numeric_price
+            trade["entry_fee"] = entry_fee
+            trade["entry_fee_usdt"] = entry_fee
+            self.balance_usdt -= entry_fee
+            events.append({
+                "event": "ENTRY_ACTIVATED", "trade": trade,
+                "trigger_price": numeric_price,
+                "fill_price": numeric_price,
+                "price_source": "Bybit V5 linear ticker lastPrice (virtual taker-fee simulation)",
+            })
 
-            if trade["status"] == "pending":
-                triggered = (
-                    decimal_price <= Decimal(str(trade["entry_price"]))
-                    if trade["side"] == "long"
-                    else decimal_price >= Decimal(str(trade["entry_price"]))
-                )
-                if not triggered:
-                    continue
-                trade["status"] = "open"
-                trade["opened_at"] = datetime.now(timezone.utc)
-                trade["entry_fee"] = trade["position_notional_usdt"] * trade["taker_fee_rate"]
-                trade["entry_fee_usdt"] = trade["entry_fee"]
-                self.balance_usdt -= trade["entry_fee"]
-                events.append({
-                    "event": "ENTRY_ACTIVATED", "trade": trade,
-                    "trigger_price": numeric_price,
-                    "fill_price": float(trade["entry_price"]),
-                    "price_source": "Bybit V5 linear ticker lastPrice",
-                })
-
+        for trade in self.trades:
+            if not process_open or trade["symbol"] != symbol or trade["status"] != "open":
+                continue
             reason = self._exit_reason(trade, decimal_price)
             if reason is not None:
                 # The ticker event that crossed the boundary is the virtual fill.
@@ -297,7 +397,13 @@ class TradeManager:
                 event["close_price"] = numeric_price
                 event["price_source"] = "Bybit V5 linear ticker lastPrice"
                 events.append(event)
+        for trade in self.trades:
+            if trade["symbol"] == symbol and trade["status"] == "pending":
+                trade["entry_previous_price"] = numeric_price
         return events
+
+    def discard_deferred_entry_tick(self, symbol: str) -> None:
+        self._deferred_entry_ticks.pop(symbol.upper(), None)
 
     def cancel_pending_for_wall(
         self,
@@ -357,6 +463,51 @@ class TradeManager:
             events.append({"event": "ENTRY_CANCELLED", "trade": trade})
         return events
 
+    def get_pending_for_slot(self, symbol: str, strategy_id: str, wall_side: str) -> dict | None:
+        return next((trade for trade in self.trades if
+                     trade["symbol"] == symbol.upper()
+                     and trade["strategy_id"] == strategy_id
+                     and trade["wall_side"] == wall_side
+                     and trade["status"] == "pending"), None)
+
+    def cancel_pending_for_slot(
+        self, symbol: str, strategy_id: str, wall_side: str, reason: str
+    ) -> list[dict]:
+        trade = self.get_pending_for_slot(symbol, strategy_id, wall_side)
+        if trade is None:
+            return []
+        trade.update(status="cancelled", closed_at=datetime.now(timezone.utc), close_reason=reason)
+        return [{"event": "ENTRY_CANCELLED", "trade": trade}]
+
+    def disarm_pending_for_symbol(self, symbol: str) -> None:
+        for trade in self.trades:
+            if trade["symbol"] == symbol.upper() and trade["status"] == "pending":
+                trade["entry_armed"] = False
+
+    def set_pair_settings_for_price_check(self, settings: PairSettings) -> None:
+        if not hasattr(self, "_current_pair_settings"):
+            self._current_pair_settings = {}
+        self._current_pair_settings[settings.symbol.upper()] = settings
+
+    def has_matching_pending_plan(self, signal, levels: dict, pair_settings: PairSettings) -> bool:
+        data = signal if isinstance(signal, dict) else signal.__dict__
+        existing = self.get_pending_for_slot(
+            data["symbol"], data["strategy_id"], data["wall_side"]
+        )
+        if existing is None:
+            return False
+        expected = {
+            "wall_id": data["wall_id"],
+            "wall_price": float(data["wall_price"]),
+            "side": levels["side"],
+            "entry_price": float(levels["entry_price"]),
+            "stop_loss": float(levels["stop_loss"]),
+            "take_profit": float(levels["take_profit"]),
+            "leverage": float(pair_settings.leverage or self.trading_settings.leverage),
+            "stake_usdt": float(self.trading_settings.stake_usdt),
+        }
+        return all(existing.get(key) == value for key, value in expected.items())
+
     def cancel_pending_not_in_wall_set(
         self,
         symbol: str,
@@ -409,12 +560,13 @@ class TradeManager:
         direction = 1 if trade["side"] == "long" else -1
         notional = trade.get("position_notional_usdt") or trade["stake_usdt"]
         entry_fee = trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0)
+        fill_entry = float(trade.get("entry_fill_price") or trade["entry_price"])
         gross_pnl = (
             notional
-            * (price - trade["entry_price"]) / trade["entry_price"]
+            * (price - fill_entry) / fill_entry
             * direction
         )
-        exit_notional = notional * price / trade["entry_price"]
+        exit_notional = notional * price / fill_entry
         exit_fee = exit_notional * trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0)
         net_pnl = gross_pnl - entry_fee - exit_fee
         trade.update(
@@ -508,12 +660,12 @@ class TradeManager:
         weekly_losses = sum(trade["profit_usdt"] < 0 for trade in weekly)
         open_trades = self.get_open_trades()
         unrealized_profit = sum(
-            ((self.last_prices[trade["symbol"]] - trade["entry_price"])
-            / trade["entry_price"] * (trade.get("position_notional_usdt") or trade["stake_usdt"])
+            ((self.last_prices[trade["symbol"]] - (trade.get("entry_fill_price") or trade["entry_price"]))
+            / (trade.get("entry_fill_price") or trade["entry_price"]) * (trade.get("position_notional_usdt") or trade["stake_usdt"])
             * (1 if trade["side"] == "long" else -1)
             - trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0)
             - (trade.get("position_notional_usdt") or trade["stake_usdt"])
-            * self.last_prices[trade["symbol"]] / trade["entry_price"]
+            * self.last_prices[trade["symbol"]] / (trade.get("entry_fill_price") or trade["entry_price"])
             * trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0))
             for trade in open_trades
             if trade["symbol"] in self.last_prices

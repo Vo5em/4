@@ -521,6 +521,26 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(runtime_state.engine_mode, "running")
         self.assertEqual(session.commits, 1)
 
+    def test_save_trade_persists_entry_crossing_state_and_simulated_fill(self):
+        session = FakeSession()
+        trade = {
+            "signal_id": "plan-1", "strategy_id": "bounce", "symbol": "BTCUSDT",
+            "side": "long", "wall_side": "buy", "status": "open",
+            "wall_id": "BTCUSDT:buy:100:lifecycle", "wall_price": 100,
+            "wall_size": 1000, "wall_ratio": 900, "stake_usdt": 10,
+            "entry_price": 100.02, "entry_fill_price": 100.01,
+            "entry_trigger_direction": "cross_down", "entry_armed": True,
+            "stop_loss": 99.98, "take_profit": 100.06, "profit_usdt": 0,
+        }
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_trades([trade], 99.8625))
+
+        row = session.rows[VirtualTrade][0]
+        self.assertEqual(row.wall_id, trade["wall_id"])
+        self.assertEqual(row.entry_trigger_direction, "cross_down")
+        self.assertTrue(row.entry_armed)
+        self.assertEqual(row.entry_fill_price, 100.01)
+
     def test_pair_settings_and_cancelled_trade_commit_together(self):
         runtime_state = RuntimeState(
             id=1,
