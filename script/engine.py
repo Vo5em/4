@@ -166,6 +166,9 @@ class TradingEngine:
         self.database_status = "unknown" if repository is not None else "not_configured"
         self.database_last_success_at: datetime | None = None
         self.database_last_error: dict | None = None
+        self.cancelled_trade_count: int | None = None
+        self.last_cancelled_cleanup_at: datetime | None = None
+        self.last_cancelled_cleanup_deleted: int | None = None
 
     def start(self) -> None:
         if self.mode == EngineMode.STOPPING:
@@ -883,6 +886,28 @@ class TradingEngine:
                 if self._pending_persistence.get(signal_id) is trade_ref:
                     self._pending_persistence.pop(signal_id, None)
             return True
+
+    async def cleanup_cancelled_trades(self) -> int:
+        """Delete one safe, persisted batch and mirror that deletion in memory."""
+        async with self.state_lock:
+            if self.repository is None:
+                return 0
+            cleanup = getattr(self.repository, "cleanup_cancelled_trades", None)
+            if not callable(cleanup):
+                raise RuntimeError("Repository does not support cancelled-plan cleanup")
+            # Match the lock order used by lifecycle persistence. Rows queued in
+            # memory are excluded even though the DB cleanup itself is atomic.
+            async with self._persistence_lock:
+                result = await cleanup(
+                    exclude_signal_ids=set(self._pending_persistence)
+                )
+                signal_ids = result["deleted_signal_ids"]
+                self.trade_manager.remove_persisted_cancelled_trades(set(signal_ids))
+                self.cancelled_trade_count = int(result["cancelled_trade_count"])
+                self.last_cancelled_cleanup_at = result["last_cleanup_at"]
+                self.last_cancelled_cleanup_deleted = int(result["deleted_count"])
+                self.record_database_success()
+                return int(result["deleted_count"])
 
     def _log_trade_lifecycle_events(self, events: list[dict]) -> None:
         for event in events:
@@ -1623,6 +1648,9 @@ class TradingEngine:
                 for symbol, errors in self.strategy_errors.items()
             },
             "persistence_pending": len(self._pending_persistence),
+            "cancelled_trade_count": self.cancelled_trade_count,
+            "last_cancelled_cleanup_at": self.last_cancelled_cleanup_at,
+            "last_cancelled_cleanup_deleted": self.last_cancelled_cleanup_deleted,
             "enabled_pairs": [
                 symbol for symbol, settings in self.pair_settings.items() if settings.enabled
             ],

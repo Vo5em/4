@@ -30,3 +30,25 @@ except RuntimeError:
     if DATABASE_URL:
         raise
     raise RuntimeError("Set DATABASE_URL in the process environment before starting the application.")
+
+
+def _positive_int_setting(name: str, default: int) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{name} must be a positive integer.") from None
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be a positive integer.")
+    return parsed
+
+
+# Keep cancellation diagnostics for a month. Active manual suppressions are
+# excluded from cleanup regardless of this retention period.
+CANCELLED_TRADE_RETENTION_MINUTES = _positive_int_setting(
+    "CANCELLED_TRADE_RETENTION_MINUTES", 60
+)
+CANCELLED_TRADE_CLEANUP_BATCH_SIZE = _positive_int_setting(
+    "CANCELLED_TRADE_CLEANUP_BATCH_SIZE", 500
+)
+CANCELLED_TRADE_CLEANUP_INTERVAL_SECONDS = 60

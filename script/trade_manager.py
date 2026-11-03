@@ -796,6 +796,25 @@ class TradeManager:
     def get_pending_trades(self) -> list[dict]:
         return [trade for trade in self.trades if trade["status"] == "pending"]
 
+    def remove_persisted_cancelled_trades(self, signal_ids: set[str] | list[str]) -> int:
+        """Drop only cancelled trades confirmed deleted by the repository."""
+        removed_ids = set(signal_ids)
+        if not removed_ids:
+            return 0
+        before = len(self.trades)
+        self.trades = [
+            trade for trade in self.trades
+            if not (
+                trade.get("signal_id") in removed_ids
+                and trade.get("status") == "cancelled"
+            )
+        ]
+        actually_removed = before - len(self.trades)
+        if actually_removed:
+            still_present = {trade.get("signal_id") for trade in self.trades}
+            self._used_signal_ids.difference_update(removed_ids - still_present)
+        return actually_removed
+
     def get_open_trades(self) -> list[dict]:
         return [trade for trade in self.trades if trade["status"] == "open"]
 
@@ -884,10 +903,7 @@ class TradeManager:
         unrealized = 0.0
         if price is not None:
             unrealized = sum(
-                (price - trade["entry_price"])
-                / trade["entry_price"]
-                * trade["stake_usdt"]
-                * (1 if trade["side"] == "long" else -1)
+                self.trade_unrealized_pnl(trade, price)
                 for trade in open_trades
             )
         return {

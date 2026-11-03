@@ -3,7 +3,7 @@
 import asyncio
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
@@ -14,7 +14,10 @@ os.environ.setdefault(
 )
 
 from database import request as repository
-from database.models import Base, StrategyChangeEvent, async_close, async_main
+from database.models import (
+    Base, ManualPlanBlock, RuntimeState, StrategyChangeEvent, VirtualTrade,
+    async_close, async_main,
+)
 from script.settings import PairSettings, TradingSettings
 
 
@@ -133,6 +136,72 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 restored["trades"][0]["close_reason"], "STRATEGY_DISABLED"
             )
+
+            # Exercise bounded cleanup against PostgreSQL while preserving a
+            # recent cancelled row, active manual suppression, and active/
+            # financial trade rows.
+            expired_cancelled = dict(
+                trade, signal_id="expired-cleanup", status="cancelled",
+                close_reason="PLAN_REPLACED", closed_at=now - timedelta(minutes=120),
+            )
+            expired_manual = dict(
+                trade, signal_id="expired-manual-cleanup", status="cancelled",
+                close_reason="MANUAL_CANCELLED", closed_at=now - timedelta(minutes=120),
+            )
+            recent_cancelled = dict(
+                trade, signal_id="recent-cleanup", status="cancelled",
+                close_reason="PLAN_REPLACED", closed_at=now,
+            )
+            pending = dict(
+                trade, signal_id="pending-cleanup-protection", status="pending",
+                closed_at=None,
+            )
+            open_trade = dict(
+                trade, signal_id="open-cleanup-protection", status="open",
+                opened_at=now, closed_at=None,
+            )
+            closed_trade = dict(
+                trade, signal_id="closed-cleanup-protection", status="closed",
+                exit_price=100.1, profit_usdt=0.1, closed_at=now,
+            )
+            await repository.save_trades(
+                [expired_cancelled, expired_manual, recent_cancelled,
+                 pending, open_trade, closed_trade],
+                100.0, engine_mode="running",
+            )
+            deleted = await repository.cleanup_cancelled_trades(
+                older_than_minutes=60, batch_size=10, now=now,
+            )
+            self.assertEqual(deleted["deleted_signal_ids"], ["expired-cleanup"])
+            self.assertEqual(deleted["deleted_count"], 1)
+            self.assertEqual(deleted["cancelled_trade_count"], 3)
+            async with repository.async_session() as session:
+                remaining = {
+                    row.signal_id: row.status
+                    for row in (await session.scalars(
+                        select(VirtualTrade).where(VirtualTrade.signal_id.in_([
+                            "expired-cleanup", "expired-manual-cleanup",
+                            "recent-cleanup", "pending-cleanup-protection",
+                            "open-cleanup-protection", "closed-cleanup-protection",
+                        ]))
+                    )).all()
+                }
+                block_count = await session.scalar(
+                    select(ManualPlanBlock.signal_id).where(
+                        ManualPlanBlock.signal_id == "expired-manual-cleanup"
+                    )
+                )
+                runtime_state = await session.get(RuntimeState, 1)
+            self.assertNotIn("expired-cleanup", remaining)
+            self.assertEqual(remaining["expired-manual-cleanup"], "cancelled")
+            self.assertEqual(remaining["recent-cleanup"], "cancelled")
+            self.assertEqual(remaining["pending-cleanup-protection"], "pending")
+            self.assertEqual(remaining["open-cleanup-protection"], "open")
+            self.assertEqual(remaining["closed-cleanup-protection"], "closed")
+            self.assertEqual(block_count, "expired-manual-cleanup")
+            self.assertEqual(runtime_state.cancelled_trade_count, 3)
+            self.assertEqual(runtime_state.last_cancelled_cleanup_at, now)
+            self.assertEqual(runtime_state.last_cancelled_cleanup_deleted, 1)
 
             invalid = dict(cancelled, signal_id="x" * 201)
             with self.assertRaises(SQLAlchemyError):

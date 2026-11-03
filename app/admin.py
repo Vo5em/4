@@ -301,6 +301,13 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"{escape(str(db_error.get('message')))} ({_date_label(db_error.get('at'))})\n"
         if db_error else "Ошибка БД: нет\n"
     )
+    cancelled_count = status.get("cancelled_trade_count")
+    cleanup_at = status.get("last_cancelled_cleanup_at")
+    cleanup_deleted = status.get("last_cancelled_cleanup_deleted")
+    cancelled_line = (
+        f"CANCELLED в PostgreSQL: {cancelled_count if cancelled_count is not None else 'нет данных'}\n"
+        f"Последняя очистка: {_date_label(cleanup_at)}; удалено {cleanup_deleted if cleanup_deleted is not None else 'нет данных'}\n"
+    )
     return (
         "<b>Админ-панель · виртуальная торговля</b>\n\n"
         f"Состояние: {_mode_label(status['mode'])}\n"
@@ -314,6 +321,7 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"PostgreSQL: {_database_label(status['database_status'])}; "
         f"последний успех {_date_label(status['database_last_success_at'])}; "
         f"отложено записей: {status['persistence_pending']}\n"
+        f"{cancelled_line}"
         f"Виртуальный баланс: {status['balance_usdt']:.2f} USDT\n"
         f"Плавающий P/L: {status['unrealized_profit_usdt']:+.2f} USDT · "
         f"оценка баланса: {status['equity_usdt']:.2f} USDT\n"

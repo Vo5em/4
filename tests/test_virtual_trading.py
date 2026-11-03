@@ -1268,9 +1268,11 @@ class AdminAuthorizationTests(unittest.TestCase):
         self.assertIsNotNone(callback.message.reply_markup)
 
     def test_dashboard_displays_floating_pnl_and_equity(self):
-        runtime = RuntimeController(
-            TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
-        )
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        engine.cancelled_trade_count = 34000
+        engine.last_cancelled_cleanup_at = datetime(2026, 11, 3, 10, 30, tzinfo=timezone.utc)
+        engine.last_cancelled_cleanup_deleted = 500
+        runtime = RuntimeController(engine)
 
         text = dashboard_text(runtime)
 
@@ -1280,6 +1282,8 @@ class AdminAuthorizationTests(unittest.TestCase):
         self.assertIn("прибыльных сделок: 0.0%", text)
         self.assertIn("Доступно для новых сделок: 1000.00 USDT", text)
         self.assertIn("Общий лимит сделок не задан", text)
+        self.assertIn("CANCELLED в PostgreSQL: 34000", text)
+        self.assertIn("удалено 500", text)
 
     def test_dashboard_shows_algorithm_feed_analysis_and_database_status(self):
         engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
@@ -1986,6 +1990,68 @@ class VirtualTradeTests(unittest.TestCase):
         self.assertAlmostEqual(stats["unrealized_profit_usdt"], expected_unrealized)
         self.assertAlmostEqual(stats["equity_usdt"], 100 + expected_unrealized)
         self.assertAlmostEqual(stats["available_balance_usdt"], 90 - trade["entry_fee_usdt"])
+
+    def test_realized_pnl_and_cash_balance_include_each_fee_exactly_once(self):
+        signal = dict(
+            self.signal, entry_mode="market", reference_price=100.0,
+            entry_price=100.0, stop_loss=99.0, take_profit=101.0,
+        )
+        trade = self.manager.create_trade(signal, self.settings)
+        self.assertEqual(trade["status"], "open")
+        opening_cash = self.manager.balance_usdt
+        expected_entry_fee = trade["position_notional_usdt"] * trade["taker_fee_rate"]
+        self.assertAlmostEqual(trade["entry_fee_usdt"], expected_entry_fee)
+        self.assertAlmostEqual(100 - opening_cash, expected_entry_fee)
+
+        self.manager.on_price("BTCUSDT", 100.25)
+        event = self.manager.close_open_trades()[0]
+        expected_net = (
+            trade["gross_pnl_usdt"]
+            - trade["entry_fee_usdt"]
+            - trade["exit_fee_usdt"]
+        )
+        self.assertEqual(event["event"], "TRADE_CLOSED")
+        self.assertAlmostEqual(trade["profit_usdt"], expected_net)
+        self.assertAlmostEqual(
+            self.manager.get_statistics()["total_profit_usdt"], expected_net
+        )
+        self.assertAlmostEqual(self.manager.balance_usdt, 100 + expected_net)
+
+    def test_pair_unrealized_pnl_uses_notional_and_matches_global_fee_accounting(self):
+        manager = CoreTradeManager(TradingSettings(
+            stake_usdt=20, initial_balance_usdt=500, leverage=10,
+        ))
+        btc = dict(
+            self.signal, symbol="BTCUSDT", wall_id="btc-pair-pnl",
+            entry_mode="market", reference_price=100,
+            entry_price=100, stop_loss=99, take_profit=101,
+        )
+        eth = dict(
+            self.signal, symbol="ETHUSDT", wall_id="eth-pair-pnl",
+            entry_mode="market", reference_price=200,
+            entry_price=200, stop_loss=199, take_profit=201,
+        )
+        btc_trade = manager.create_trade(btc, PairSettings(
+            "BTCUSDT", leverage=5, taker_fee_rate=0.0004,
+        ))
+        eth_trade = manager.create_trade(eth, PairSettings(
+            "ETHUSDT", leverage=12, taker_fee_rate=0.0006,
+        ))
+        manager.on_price("BTCUSDT", 100.2, process_open=False)
+        manager.on_price("ETHUSDT", 199.8, process_open=False)
+
+        btc_pnl = manager.get_pair_statistics("BTCUSDT")["unrealized_profit_usdt"]
+        eth_pnl = manager.get_pair_statistics("ETHUSDT")["unrealized_profit_usdt"]
+        global_pnl = manager.get_statistics()["unrealized_profit_usdt"]
+
+        self.assertAlmostEqual(
+            btc_pnl, manager.trade_unrealized_pnl(btc_trade, 100.2)
+        )
+        self.assertAlmostEqual(
+            eth_pnl, manager.trade_unrealized_pnl(eth_trade, 199.8)
+        )
+        self.assertAlmostEqual(btc_pnl + eth_pnl, global_pnl)
+        self.assertNotEqual(btc_pnl, (100.2 - 100) / 100 * btc_trade["stake_usdt"])
 
     def test_pair_specific_leverage_is_frozen_and_margin_is_reserved_per_trade(self):
         btc = PairSettings("BTCUSDT", leverage=10)
@@ -3302,6 +3368,80 @@ class EngineControlContinuationTests(unittest.TestCase):
         self.assertEqual(
             repository.saved_prices, [("BTCUSDT", 100.0), ("BTCUSDT", 102.0)]
         )
+
+    def test_cancelled_cleanup_prunes_only_repository_confirmed_cancelled_rows(self):
+        manager = CoreTradeManager(TradingSettings(initial_balance_usdt=100))
+        manager.trades = [
+            {"signal_id": "old-cancelled", "status": "cancelled", "stake_usdt": 10},
+            {"signal_id": "active-pending", "status": "pending", "stake_usdt": 10},
+            {"signal_id": "active-open", "status": "open", "stake_usdt": 10},
+            {"signal_id": "closed", "status": "closed", "stake_usdt": 10, "profit_usdt": 0},
+        ]
+        manager._used_signal_ids = {trade["signal_id"] for trade in manager.trades}
+
+        class CleanupRepository:
+            async def cleanup_cancelled_trades(self, *, exclude_signal_ids):
+                self.excluded = set(exclude_signal_ids)
+                now = datetime.now(timezone.utc)
+                return {
+                    "deleted_signal_ids": ["old-cancelled"],
+                    "cancelled_trade_count": 7,
+                    "last_cleanup_at": now,
+                    "deleted_count": 1,
+                }
+
+        repository = CleanupRepository()
+        engine = TradingEngine({}, trade_manager=manager, repository=repository)
+        removed = run_immediate(engine.cleanup_cancelled_trades())
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(repository.excluded, set())
+        self.assertEqual(engine.cancelled_trade_count, 7)
+        self.assertEqual(engine.last_cancelled_cleanup_deleted, 1)
+        self.assertEqual(
+            {trade["signal_id"] for trade in manager.trades},
+            {"active-pending", "active-open", "closed"},
+        )
+        self.assertEqual(
+            sum(
+                trade["stake_usdt"] for trade in manager.trades
+                if trade["status"] in {"pending", "open"}
+            ),
+            20,
+        )
+        self.assertNotIn("old-cancelled", manager._used_signal_ids)
+
+    def test_cancelled_cleanup_database_failure_keeps_memory_unchanged(self):
+        manager = CoreTradeManager(TradingSettings(initial_balance_usdt=100))
+        manager.trades = [{
+            "signal_id": "old-cancelled", "status": "cancelled", "stake_usdt": 10,
+        }]
+
+        class FailingRepository:
+            async def cleanup_cancelled_trades(self, *, exclude_signal_ids):
+                raise OSError("database unavailable")
+
+        engine = TradingEngine({}, trade_manager=manager, repository=FailingRepository())
+        with self.assertRaisesRegex(OSError, "database unavailable"):
+            run_immediate(engine.cleanup_cancelled_trades())
+        self.assertEqual(len(manager.trades), 1)
+
+    def test_cleanup_service_continues_to_a_later_cycle_after_database_failure(self):
+        class Repository:
+            pass
+
+        engine = TradingEngine({}, repository=Repository())
+        engine.cleanup_cancelled_trades = AsyncMock(
+            side_effect=[OSError("database unavailable"), 0]
+        )
+        runtime = RuntimeController(engine)
+        with self.assertLogs("app.runtime", level="ERROR"):
+            first_result = run_immediate(runtime._cleanup_cancelled_once())
+        second_result = run_immediate(runtime._cleanup_cancelled_once())
+
+        self.assertIsNone(first_result)
+        self.assertEqual(second_result, 0)
+        self.assertEqual(engine.cleanup_cancelled_trades.await_count, 2)
 
 
 if __name__ == "__main__":

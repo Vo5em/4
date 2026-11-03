@@ -49,6 +49,11 @@ async def build_runtime() -> tuple[RuntimeController, bool]:
         last_market_update_at=state.get("last_price_observed_at", {}),
     )
     engine.record_database_success()
+    engine.cancelled_trade_count = state.get("cancelled_trade_count")
+    engine.last_cancelled_cleanup_at = state.get("last_cancelled_cleanup_at")
+    engine.last_cancelled_cleanup_deleted = state.get(
+        "last_cancelled_cleanup_deleted", 0
+    )
     engine.trade_manager.restore_state(
         state["trades"], state["balance_usdt"], state["last_prices"],
         state.get("manual_plan_blocks", []),
@@ -82,6 +87,7 @@ async def main() -> None:
     )
     dispatcher = Dispatcher()
     dispatcher.include_router(admin)
+    runtime.start_cancelled_trade_cleanup()
 
     try:
         if not initialized:

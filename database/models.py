@@ -36,6 +36,13 @@ class RuntimeState(Base):
     )
     engine_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="stopped")
     initialized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cancelled_trade_count: Mapped[int] = mapped_column(nullable=False, default=0, server_default=text("0"))
+    last_cancelled_cleanup_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_cancelled_cleanup_deleted: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default=text("0")
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -117,6 +124,7 @@ class VirtualTrade(Base):
     __tablename__ = "virtual_trades"
     __table_args__ = (
         Index("ix_virtual_trades_symbol_status", "symbol", "status"),
+        Index("ix_virtual_trades_status_closed_at", "status", "closed_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -186,6 +194,18 @@ async def async_main() -> None:
             "default_stop_loss_bps NUMERIC(18,8) NOT NULL DEFAULT 5.0"
         ))
         await connection.execute(text(
+            "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
+            "cancelled_trade_count INTEGER NOT NULL DEFAULT 0"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
+            "last_cancelled_cleanup_at TIMESTAMPTZ"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
+            "last_cancelled_cleanup_deleted INTEGER NOT NULL DEFAULT 0"
+        ))
+        await connection.execute(text(
             "ALTER TABLE runtime_state ALTER COLUMN default_take_profit_bps SET DEFAULT 5.0"
         ))
         await connection.execute(text(
@@ -221,6 +241,19 @@ async def async_main() -> None:
         await connection.execute(text(
             "UPDATE trading_pairs SET min_wall_age_seconds = 40 "
             "WHERE min_wall_age_seconds < 40"
+        ))
+
+    # Existing installations are not altered by create_all when a table
+    # already exists. Build this index concurrently so the running market
+    # process can continue writing trade rows during the additive migration.
+    async with engine.connect() as connection:
+        autocommit_connection = await connection.execution_options(
+            isolation_level="AUTOCOMMIT"
+        )
+        await autocommit_connection.execute(text(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+            "ix_virtual_trades_status_closed_at "
+            "ON virtual_trades (status, closed_at)"
         ))
 
 

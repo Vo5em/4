@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,7 +9,12 @@ os.environ.setdefault(
 )
 
 from database import request as repository
-from config import validate_database_url
+from config import (
+    CANCELLED_TRADE_CLEANUP_BATCH_SIZE,
+    CANCELLED_TRADE_CLEANUP_INTERVAL_SECONDS,
+    CANCELLED_TRADE_RETENTION_MINUTES,
+    validate_database_url,
+)
 from database.models import (
     MarketPrice,
     ManualPlanBlock,
@@ -88,6 +93,13 @@ class FakeSession:
 
 
 class DatabaseRepositoryTests(unittest.TestCase):
+    def test_cancelled_cleanup_uses_one_hour_retention_and_minute_interval(self):
+        if "CANCELLED_TRADE_RETENTION_MINUTES" not in os.environ:
+            self.assertEqual(CANCELLED_TRADE_RETENTION_MINUTES, 60)
+        if "CANCELLED_TRADE_CLEANUP_BATCH_SIZE" not in os.environ:
+            self.assertEqual(CANCELLED_TRADE_CLEANUP_BATCH_SIZE, 500)
+        self.assertEqual(CANCELLED_TRADE_CLEANUP_INTERVAL_SECONDS, 60)
+
     def test_database_url_requires_postgresql_asyncpg_without_exposing_values(self):
         self.assertEqual(
             validate_database_url(
@@ -125,6 +137,9 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(state["enabled_strategies"], {"BTCUSDT": {"stable_wall_v1"}})
         self.assertEqual(state["trades"], [])
         self.assertEqual(state["last_prices"], {})
+        self.assertEqual(state["cancelled_trade_count"], 0)
+        self.assertIsNone(state["last_cancelled_cleanup_at"])
+        self.assertEqual(state["last_cancelled_cleanup_deleted"], 0)
         self.assertGreaterEqual(session.commits, 1)
 
     def test_initialize_restores_trade_state_price_and_explicit_empty_strategy_set(self):
@@ -138,6 +153,9 @@ class DatabaseRepositoryTests(unittest.TestCase):
             initialized=True,
             default_take_profit_bps=32,
             default_stop_loss_bps=24,
+            cancelled_trade_count=0,
+            last_cancelled_cleanup_at=datetime(2026, 11, 3, 10, 30, tzinfo=timezone.utc),
+            last_cancelled_cleanup_deleted=9,
         )
         pair_row = TradingPairSetting(
             symbol="BTCUSDT",
@@ -214,6 +232,11 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertTrue(state["initialized"])
         self.assertEqual(state["enabled_strategies"], {"BTCUSDT": set()})
         self.assertEqual(state["last_prices"], {"BTCUSDT": 100.25})
+        self.assertEqual(state["last_cancelled_cleanup_deleted"], 9)
+        self.assertEqual(
+            state["last_cancelled_cleanup_at"],
+            datetime(2026, 11, 3, 10, 30, tzinfo=timezone.utc),
+        )
         self.assertEqual(state["pair_settings"]["BTCUSDT"].leverage, 17.5)
         self.assertEqual(state["trading_settings"].default_take_profit_bps, 32)
         self.assertEqual(state["trading_settings"].default_stop_loss_bps, 24)
@@ -725,6 +748,96 @@ class DatabaseRepositoryTests(unittest.TestCase):
             ],
             1,
         )
+
+    def test_cancelled_cleanup_deletes_only_selected_old_cancelled_batch(self):
+        now = datetime.now(timezone.utc)
+        cancelled = VirtualTrade(
+            signal_id="expired-cancelled", strategy_id="bounce", symbol="BTCUSDT",
+            side="long", wall_side="buy", status="cancelled", wall_price=100,
+            wall_size=1000, stake_usdt=10, entry_price=100,
+            stop_loss=99, take_profit=101, closed_at=now - timedelta(minutes=120),
+        )
+        recent = VirtualTrade(
+            signal_id="recent-cancelled", strategy_id="bounce", symbol="BTCUSDT",
+            side="long", wall_side="buy", status="cancelled", wall_price=100,
+            wall_size=1000, stake_usdt=10, entry_price=100,
+            stop_loss=99, take_profit=101, closed_at=now - timedelta(minutes=2),
+        )
+        manual = VirtualTrade(
+            signal_id="manual-blocked", strategy_id="bounce", symbol="BTCUSDT",
+            side="long", wall_side="buy", status="cancelled", wall_price=100,
+            wall_size=1000, stake_usdt=10, entry_price=100,
+            stop_loss=99, take_profit=101, closed_at=now - timedelta(minutes=120),
+        )
+        block = ManualPlanBlock(
+            signal_id=manual.signal_id, symbol="BTCUSDT", strategy_id="bounce",
+            wall_side="buy", wall_price=100,
+        )
+
+        class CleanupSession(FakeSession):
+            def __init__(self):
+                super().__init__({
+                    VirtualTrade: [cancelled, recent, manual],
+                    ManualPlanBlock: [block],
+                })
+                self.candidates = ["expired-cancelled"]
+                self.select_statement = None
+                self.deleted = []
+
+            async def scalars(self, statement):
+                self.select_statement = statement
+                return FakeResult(self.candidates)
+
+            async def scalar(self, statement):
+                return 2
+
+            async def execute(self, statement):
+                self.executed.append(statement)
+                self.deleted = list(self.candidates)
+                self.rows[VirtualTrade] = [
+                    row for row in self.rows[VirtualTrade]
+                    if row.signal_id not in self.deleted
+                ]
+
+        session = CleanupSession()
+        with patch.object(repository, "async_session", return_value=session):
+            deleted = run_immediate(repository.cleanup_cancelled_trades(
+                older_than_minutes=60, batch_size=1, now=now,
+            ))
+
+        from sqlalchemy.dialects import postgresql
+
+        statement = str(session.select_statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        ))
+        self.assertEqual(deleted["deleted_signal_ids"], ["expired-cancelled"])
+        self.assertEqual(deleted["cancelled_trade_count"], 2)
+        self.assertEqual(deleted["deleted_count"], 1)
+        self.assertEqual(session.deleted, ["expired-cancelled"])
+        self.assertEqual(
+            {row.signal_id for row in session.rows[VirtualTrade]},
+            {"recent-cancelled", "manual-blocked"},
+        )
+        self.assertEqual(session.commits, 1)
+        self.assertIn("cancelled", statement)
+        self.assertIn("closed_at", statement)
+        self.assertIn("manual_plan_blocks", statement)
+        self.assertIn("FOR UPDATE SKIP LOCKED", statement)
+        self.assertEqual(session.select_statement._limit, 1)
+        self.assertTrue(session.select_statement._for_update_arg.skip_locked)
+
+    def test_cancelled_cleanup_database_error_propagates_for_service_retry(self):
+        class FailingCleanupSession(FakeSession):
+            async def scalars(self, statement):
+                return FakeResult(["expired-cancelled"])
+
+            async def execute(self, statement):
+                raise OSError("database unavailable")
+
+        with patch.object(repository, "async_session", return_value=FailingCleanupSession()):
+            with self.assertRaisesRegex(OSError, "database unavailable"):
+                run_immediate(repository.cleanup_cancelled_trades())
 
     def test_pair_settings_and_cancelled_trade_commit_together(self):
         runtime_state = RuntimeState(

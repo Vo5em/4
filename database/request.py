@@ -1,4 +1,6 @@
-from sqlalchemy import MetaData, Table, delete, inspect, select
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import MetaData, Table, and_, delete, exists, func, inspect, or_, select
 
 from database.models import (
     MarketPrice,
@@ -12,6 +14,10 @@ from database.models import (
     engine,
     async_session,
     utc_now,
+)
+from config import (
+    CANCELLED_TRADE_CLEANUP_BATCH_SIZE,
+    CANCELLED_TRADE_RETENTION_MINUTES,
 )
 from script.settings import PairSettings, TradingSettings, normalize_pair_symbol
 from script.strategies import DEFAULT_STRATEGY_ID
@@ -67,9 +73,37 @@ async def initialize_database(
                 session.add(strategy_row)
             await session.commit()
             strategy_rows = (await session.scalars(select(PairStrategyConfig))).all()
-        trade_rows = (await session.scalars(select(VirtualTrade))).all()
         market_price_rows = (await session.scalars(select(MarketPrice))).all()
         manual_plan_block_rows = (await session.scalars(select(ManualPlanBlock))).all()
+        # Cancelled plans are retained in PostgreSQL for the configured audit
+        # period, but do not affect runtime balance or statistics. Load only
+        # currently active suppression rows from that status, avoiding a large
+        # cancelled-history scan in TradeManager after a restart.
+        cancelled_retention_cutoff = utc_now() - timedelta(
+            minutes=CANCELLED_TRADE_RETENTION_MINUTES
+        )
+        trade_rows = (await session.scalars(
+            select(VirtualTrade).where(
+                or_(
+                    VirtualTrade.status != "cancelled",
+                    and_(
+                        VirtualTrade.status == "cancelled",
+                        VirtualTrade.closed_at >= cancelled_retention_cutoff,
+                    ),
+                    VirtualTrade.signal_id.in_(
+                        select(ManualPlanBlock.signal_id)
+                    ),
+                )
+            )
+        )).all()
+        cancelled_trade_count = int(await session.scalar(
+            select(func.count())
+            .select_from(VirtualTrade)
+            .where(VirtualTrade.status == "cancelled")
+        ) or 0)
+        if getattr(state, "cancelled_trade_count", 0) != cancelled_trade_count:
+            state.cancelled_trade_count = cancelled_trade_count
+            await session.commit()
         configured_strategies = {
             row.symbol: set(row.enabled_strategy_ids)
             for row in strategy_rows
@@ -94,6 +128,11 @@ async def initialize_database(
                 ) or 5.0,
             ),
             "balance_usdt": state.balance_usdt,
+            "cancelled_trade_count": cancelled_trade_count,
+            "last_cancelled_cleanup_at": state.last_cancelled_cleanup_at,
+            "last_cancelled_cleanup_deleted": int(
+                getattr(state, "last_cancelled_cleanup_deleted", 0) or 0
+            ),
             "engine_mode": state.engine_mode,
             "initialized": state.initialized,
             "pair_settings": {
@@ -356,6 +395,69 @@ async def release_manual_plan_blocks(signal_ids: list[str]) -> None:
             delete(ManualPlanBlock).where(ManualPlanBlock.signal_id.in_(signal_ids))
         )
         await session.commit()
+
+
+async def cleanup_cancelled_trades(
+    *,
+    older_than_minutes: int = CANCELLED_TRADE_RETENTION_MINUTES,
+    batch_size: int = CANCELLED_TRADE_CLEANUP_BATCH_SIZE,
+    exclude_signal_ids: set[str] | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Delete one bounded batch of old cancelled plans, preserving active blocks.
+
+    Row locks and SKIP LOCKED avoid waiting on concurrent trade updates. The
+    select and delete share one transaction; any failure rolls back on session
+    exit. MANUAL_CANCELLED rows referenced by ManualPlanBlock remain durable.
+    """
+    if older_than_minutes <= 0 or batch_size <= 0:
+        raise ValueError("Cleanup retention and batch size must be positive")
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    cutoff = now - timedelta(minutes=older_than_minutes)
+    excluded = set(exclude_signal_ids or ())
+    criteria = [
+        VirtualTrade.status == "cancelled",
+        VirtualTrade.closed_at.is_not(None),
+        VirtualTrade.closed_at < cutoff,
+        ~exists(
+            select(1).where(ManualPlanBlock.signal_id == VirtualTrade.signal_id)
+        ),
+    ]
+    if excluded:
+        criteria.append(VirtualTrade.signal_id.not_in(excluded))
+
+    async with async_session() as session:
+        candidates = await session.scalars(
+            select(VirtualTrade.signal_id)
+            .where(*criteria)
+            .order_by(VirtualTrade.closed_at, VirtualTrade.id)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        )
+        signal_ids = list(candidates.all())
+        if signal_ids:
+            await session.execute(
+                delete(VirtualTrade).where(VirtualTrade.signal_id.in_(signal_ids))
+            )
+        remaining_count = int(await session.scalar(
+            select(func.count())
+            .select_from(VirtualTrade)
+            .where(VirtualTrade.status == "cancelled")
+        ) or 0)
+        state = await session.get(RuntimeState, 1)
+        if state is not None:
+            state.cancelled_trade_count = remaining_count
+            state.last_cancelled_cleanup_at = now
+            state.last_cancelled_cleanup_deleted = len(signal_ids)
+        await session.commit()
+        return {
+            "deleted_signal_ids": signal_ids,
+            "cancelled_trade_count": remaining_count,
+            "last_cleanup_at": now,
+            "deleted_count": len(signal_ids),
+        }
 
 
 async def save_pair_settings(settings: PairSettings) -> None:
