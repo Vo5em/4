@@ -41,7 +41,7 @@ from script.market_data import (
 )
 from script.orderbook import LocalOrderBook
 from script.scanner import find_nearby_levels, find_walls
-from script.settings import PairSettings, TradingSettings
+from script.settings import PairSettings, TradingSettings, normalize_pair_symbol
 from script.strategies import (
     BOUNCE_STRATEGY_ID,
     BREAKOUT_STRATEGY_ID,
@@ -599,6 +599,9 @@ class BybitOrderbookSyncTests(unittest.TestCase):
         self.assertTrue(book.synchronized)
         self.assertEqual(result["candidates"], [])
         self.assertEqual(result["filter_counts"]["below_min_wall_ratio"], 2)
+        self.assertEqual(result["scanner_diagnostics"]["ratio_sweep"]["buy"][5], 0)
+        self.assertEqual(result["scanner_diagnostics"]["ratio_sweep"]["buy"][100], 0)
+        self.assertTrue(result["scanner_diagnostics"]["largest_levels"])
 
 
 class MarketDataSnapshotHandshakeTests(unittest.TestCase):
@@ -1615,6 +1618,8 @@ class DealManagerTelegramTests(unittest.TestCase):
         )
         self.assertIn(f"{expected_pnl:+.4f} USDT", open_text)
         self.assertIn("Номинал", open_text)
+        self.assertIn("MAKER_MAKER_SIMULATION", open_text)
+        self.assertIn("применено 0.0360% на вход/выход", open_text)
         self.assertIn("PENDING", pending_text)
         self.assertIn("Резерв маржи", pending_text)
         self.assertIn("ARMED", pending_text)
@@ -1747,6 +1752,22 @@ class StableWallTelegramTests(unittest.TestCase):
         self.put_snapshot("BTCUSDT", self.walls(10, "STABLE"), self.walls(10, "CANDIDATE"))
         data = self.runtime.engine.wall_diagnostics["BTCUSDT"]
         data["planner_strategies"] = ["bounce", "breakout"]
+        data["scanner_filters"] = {
+            "min_wall_ratio": 20, "min_wall_notional_usdt": 10000,
+            "max_wall_distance_bps": 100,
+        }
+        data["scanner_diagnostics"] = {
+            "side_medians": {"buy": 1000.0, "sell": 1200.0},
+            "ratio_sweep": {
+                "buy": {5: 7, 10: 5, 15: 4, 20: 3, 30: 2, 50: 1, 100: 0},
+                "sell": {5: 6, 10: 4, 15: 3, 20: 2, 30: 1, 50: 0, 100: 0},
+            },
+            "largest_levels": [{
+                "side": "buy", "price": 99.9, "notional": 50000,
+                "wall_ratio": 50, "distance_bps": 10,
+                "rejection": None,
+            }],
+        }
         data["planner_wall_decisions"] = [{
             "wall_id": str(index), "side": "buy", "price": 100 + index,
             "notional": 50000, "age_seconds": 55,
@@ -1767,6 +1788,9 @@ class StableWallTelegramTests(unittest.TestCase):
         text = stable_walls_text(self.runtime, "BTCUSDT", "diagnostics", 0)
         self.assertIn("Отклонения Scanner", text)
         self.assertIn("Trade Planner", text)
+        self.assertIn("Ratio sweep (порог:BID/ASK)", text)
+        self.assertIn("Крупнейшие уровни", text)
+        self.assertIn("ratio 50.00x", text)
         self.assertIn("8.20/1.5 bps", text)
         self.assertLessEqual(len(text), TELEGRAM_TEXT_LIMIT)
         keyboard = stable_walls_keyboard(self.runtime, "BTCUSDT", "diagnostics", 0)
@@ -1800,6 +1824,10 @@ class StableWallTelegramTests(unittest.TestCase):
 
 
 class PairSymbolValidationTests(unittest.TestCase):
+    def test_doge_and_meme_token_symbols_are_valid_pair_symbols(self):
+        self.assertEqual(normalize_pair_symbol(" dogeusdt "), "DOGEUSDT")
+        self.assertEqual(normalize_pair_symbol("1000pepeusdt"), "1000PEPEUSDT")
+
     def test_build_runtime_restores_database_state_and_saved_run_mode(self):
         from database import request as database
 
@@ -1964,7 +1992,7 @@ class VirtualTradeTests(unittest.TestCase):
         self.assertEqual(events[0]["event"], "ENTRY_ACTIVATED")
         self.assertEqual(events[0]["fill_price"], 100.0)
         self.assertEqual(events[0]["trigger_price"], 100.0)
-        self.assertIn("virtual taker-fee simulation", events[0]["price_source"])
+        self.assertIn("virtual Maker/Maker simulation", events[0]["price_source"])
         self.assertIn("BTCUSDT", self.manager.last_prices)
 
         close_events = self.manager.on_price("BTCUSDT", trade["take_profit"])
@@ -1986,7 +2014,7 @@ class VirtualTradeTests(unittest.TestCase):
         notional = trade["stake_usdt"] * trade["leverage"]
         fill = trade["entry_fill_price"]
         gross = (100.0 - fill) / fill * notional
-        expected_unrealized = gross - trade["entry_fee_usdt"] - notional * 100.0 / fill * trade["taker_fee_rate"]
+        expected_unrealized = gross - trade["entry_fee_usdt"] - notional * 100.0 / fill * trade["applied_fee_rate"]
         self.assertAlmostEqual(stats["unrealized_profit_usdt"], expected_unrealized)
         self.assertAlmostEqual(stats["equity_usdt"], 100 + expected_unrealized)
         self.assertAlmostEqual(stats["available_balance_usdt"], 90 - trade["entry_fee_usdt"])
@@ -1999,7 +2027,7 @@ class VirtualTradeTests(unittest.TestCase):
         trade = self.manager.create_trade(signal, self.settings)
         self.assertEqual(trade["status"], "open")
         opening_cash = self.manager.balance_usdt
-        expected_entry_fee = trade["position_notional_usdt"] * trade["taker_fee_rate"]
+        expected_entry_fee = trade["position_notional_usdt"] * trade["maker_fee_rate"]
         self.assertAlmostEqual(trade["entry_fee_usdt"], expected_entry_fee)
         self.assertAlmostEqual(100 - opening_cash, expected_entry_fee)
 
@@ -2081,6 +2109,62 @@ class VirtualTradeTests(unittest.TestCase):
         self.assertEqual(eth_trade["leverage"], 20)
         self.assertAlmostEqual(self.manager.balance_usdt, 100 + btc_trade["profit_usdt"] + eth_trade["profit_usdt"])
         self.assertEqual(self.manager.get_statistics()["reserved_margin_usdt"], 0)
+
+    def test_new_virtual_trade_freezes_maker_maker_rates_for_long_short_and_exit_paths(self):
+        for side, wall_side, reason, price in (
+            ("long", "buy", "TAKE_PROFIT", 100.5),
+            ("long", "buy", "STOP_LOSS", 99.5),
+            ("short", "sell", "TAKE_PROFIT", 99.5),
+            ("short", "sell", "STOP_LOSS", 100.5),
+        ):
+            manager = CoreTradeManager(TradingSettings(
+                stake_usdt=30, initial_balance_usdt=500, max_open_trades=5,
+                leverage=25,
+            ))
+            signal = {
+                **self.signal,
+                "side": side,
+                "wall_side": wall_side,
+                "wall_id": f"{side}-{reason}",
+                "entry_mode": "market",
+                "reference_price": 100.0,
+                "entry_price": 100.0,
+                "stop_loss": 99.0 if side == "long" else 101.0,
+                "take_profit": 101.0 if side == "long" else 99.0,
+            }
+            pair = PairSettings("BTCUSDT", maker_fee_rate=0.00036, taker_fee_rate=0.001)
+            trade = manager.create_trade(signal, pair)
+            self.assertEqual(trade["commission_model"], "MAKER_MAKER_SIMULATION")
+            self.assertEqual(trade["maker_fee_rate"], 0.00036)
+            self.assertEqual(trade["taker_fee_rate"], 0.001)
+            self.assertEqual(trade["applied_fee_rate"], 0.00036)
+            self.assertEqual(trade["fee_rate"], 0.00036)
+            self.assertAlmostEqual(trade["entry_fee_usdt"], 750 * 0.00036)
+            event = manager.close_trade(trade["signal_id"], price)
+            self.assertEqual(event["event"], "TRADE_CLOSED")
+            expected_exit_fee = trade["position_notional_usdt"] * price / 100 * 0.00036
+            self.assertAlmostEqual(trade["exit_fee_usdt"], expected_exit_fee)
+            self.assertAlmostEqual(
+                trade["profit_usdt"],
+                trade["gross_pnl_usdt"] - trade["entry_fee_usdt"] - expected_exit_fee,
+            )
+
+    def test_legacy_open_trade_keeps_its_saved_fee_rate(self):
+        legacy = {
+            "signal_id": "legacy-fee", "strategy_id": "bounce", "symbol": "BTCUSDT",
+            "side": "long", "wall_side": "buy", "status": "open", "wall_price": 100,
+            "wall_size": 1000, "wall_ratio": 10, "stake_usdt": 30, "leverage": 25,
+            "position_notional_usdt": 750, "entry_price": 100, "entry_fill_price": 100,
+            "stop_loss": 99, "take_profit": 101, "fee_rate": 0.001,
+            "taker_fee_rate": 0.001, "entry_fee_usdt": 0.75,
+            "profit_usdt": 0, "accounting_version": 1,
+        }
+        manager = CoreTradeManager(TradingSettings(stake_usdt=30, initial_balance_usdt=100))
+        manager.restore_state([legacy], 99.25)
+        trade = manager.trades[0]
+        self.assertEqual(trade["applied_fee_rate"], 0.001)
+        self.assertEqual(trade["commission_model"], "LEGACY_SAVED_RATE")
+        self.assertAlmostEqual(manager.trade_unrealized_pnl(trade, 100), -1.5)
 
     def test_legacy_trade_restore_preserves_historical_financial_values(self):
         legacy = {

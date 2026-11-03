@@ -37,7 +37,7 @@ def estimate_trade_outcomes(
     position_notional_usdt: float | Decimal,
     taker_fee_rate: float | Decimal,
 ) -> dict[str, Decimal]:
-    """Estimate gross/net outcomes using taker fees on both virtual fills."""
+    """Estimate outcomes using the supplied per-fill simulation fee rate."""
     try:
         entry = Decimal(str(entry_price))
         take_profit = Decimal(str(take_profit_price))

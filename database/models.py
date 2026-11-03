@@ -64,8 +64,8 @@ class TradingPairSetting(Base):
     breakout_buffer_bps: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=0.5)
     breakout_max_update_gap_seconds: Mapped[float] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=False, default=2.0)
     leverage: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False), nullable=True)
-    maker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.0002)
-    taker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.00055)
+    maker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.00036)
+    taker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.001)
     take_profit_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
     stop_loss_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
@@ -143,6 +143,10 @@ class VirtualTrade(Base):
     entry_fee_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
     exit_fee_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
     gross_pnl_usdt: Mapped[float | None] = mapped_column(Numeric(24, 8, asdecimal=False), nullable=True)
+    maker_fee_rate: Mapped[float | None] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=True)
+    taker_fee_rate: Mapped[float | None] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=True)
+    applied_fee_rate: Mapped[float | None] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=True)
+    commission_model: Mapped[str | None] = mapped_column(String(40), nullable=True)
     fee_rate: Mapped[float | None] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=True)
     accounting_version: Mapped[int] = mapped_column(
         nullable=False, default=1, server_default=text("1")
@@ -212,15 +216,38 @@ async def async_main() -> None:
             "ALTER TABLE runtime_state ALTER COLUMN default_stop_loss_bps SET DEFAULT 5.0"
         ))
         await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS leverage NUMERIC(10,4)"))
-        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS maker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.0002"))
-        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS taker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.00055"))
+        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS maker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.00036"))
+        await connection.execute(text("ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS taker_fee_rate NUMERIC(18,10) NOT NULL DEFAULT 0.001"))
+        await connection.execute(text("ALTER TABLE trading_pairs ALTER COLUMN maker_fee_rate SET DEFAULT 0.00036"))
+        await connection.execute(text("ALTER TABLE trading_pairs ALTER COLUMN taker_fee_rate SET DEFAULT 0.001"))
+        # Replace only the exact historical application defaults; preserve
+        # custom per-pair tariff values.
+        await connection.execute(text(
+            "UPDATE trading_pairs SET maker_fee_rate = 0.00036 "
+            "WHERE maker_fee_rate = 0.0002"
+        ))
+        await connection.execute(text(
+            "UPDATE trading_pairs SET taker_fee_rate = 0.001 "
+            "WHERE taker_fee_rate = 0.00055"
+        ))
         await connection.execute(text(
             "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS take_profit_bps NUMERIC(18,8)"
         ))
         await connection.execute(text(
             "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS stop_loss_bps NUMERIC(18,8)"
         ))
-        for column, sql_type in (("leverage", "NUMERIC(10,4)"), ("position_notional_usdt", "NUMERIC(24,8)"), ("entry_fee_usdt", "NUMERIC(24,8)"), ("exit_fee_usdt", "NUMERIC(24,8)"), ("gross_pnl_usdt", "NUMERIC(24,8)"), ("fee_rate", "NUMERIC(18,10)")):
+        for column, sql_type in (
+            ("leverage", "NUMERIC(10,4)"),
+            ("position_notional_usdt", "NUMERIC(24,8)"),
+            ("entry_fee_usdt", "NUMERIC(24,8)"),
+            ("exit_fee_usdt", "NUMERIC(24,8)"),
+            ("gross_pnl_usdt", "NUMERIC(24,8)"),
+            ("fee_rate", "NUMERIC(18,10)"),
+            ("maker_fee_rate", "NUMERIC(18,10)"),
+            ("taker_fee_rate", "NUMERIC(18,10)"),
+            ("applied_fee_rate", "NUMERIC(18,10)"),
+            ("commission_model", "VARCHAR(40)"),
+        ):
             await connection.execute(text(f"ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS {column} {sql_type}"))
         await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS accounting_version INTEGER NOT NULL DEFAULT 1"))
         await connection.execute(text(

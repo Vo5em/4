@@ -154,8 +154,14 @@ async def initialize_database(
                         row, "breakout_max_update_gap_seconds", 2.0
                     ) or 2.0,
                     leverage=getattr(row, "leverage", None),
-                    maker_fee_rate=getattr(row, "maker_fee_rate", 0.0002) or 0.0002,
-                    taker_fee_rate=getattr(row, "taker_fee_rate", 0.00055) or 0.00055,
+                    maker_fee_rate=(
+                        getattr(row, "maker_fee_rate", None)
+                        if getattr(row, "maker_fee_rate", None) is not None else 0.00036
+                    ),
+                    taker_fee_rate=(
+                        getattr(row, "taker_fee_rate", None)
+                        if getattr(row, "taker_fee_rate", None) is not None else 0.001
+                    ),
                     take_profit_bps=getattr(row, "take_profit_bps", None),
                     stop_loss_bps=getattr(row, "stop_loss_bps", None),
                 )
@@ -250,6 +256,11 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
 
 
 def _trade_dict(row: VirtualTrade) -> dict:
+    saved_fee_rate = getattr(row, "fee_rate", None)
+    stored_taker_rate = getattr(row, "taker_fee_rate", None)
+    stored_applied_rate = getattr(row, "applied_fee_rate", None)
+    taker_rate = stored_taker_rate if stored_taker_rate is not None else saved_fee_rate
+    applied_rate = stored_applied_rate if stored_applied_rate is not None else saved_fee_rate
     return {
         "signal_id": row.signal_id,
         "strategy_id": row.strategy_id,
@@ -267,15 +278,17 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "entry_fee_usdt": getattr(row, "entry_fee_usdt", None),
         "exit_fee_usdt": getattr(row, "exit_fee_usdt", None),
         "gross_pnl_usdt": getattr(row, "gross_pnl_usdt", None),
-        "fee_rate": getattr(row, "fee_rate", None),
+        "maker_fee_rate": getattr(row, "maker_fee_rate", None),
+        "taker_fee_rate": taker_rate if taker_rate is not None else 0.0,
+        "applied_fee_rate": applied_rate,
+        "commission_model": getattr(row, "commission_model", None) or "LEGACY_SAVED_RATE",
+        "fee_rate": saved_fee_rate,
         "accounting_version": getattr(row, "accounting_version", None) or 1,
         # Older rows have no accounting metadata; keep their recorded PnL and
         # allow TradeManager's legacy stake-as-notional/zero-fee fallback.
         "entry_fee": getattr(row, "entry_fee_usdt", None) or 0.0,
         "exit_fee": getattr(row, "exit_fee_usdt", None) or 0.0,
         "gross_pnl": getattr(row, "gross_pnl_usdt", None),
-        "taker_fee_rate": getattr(row, "fee_rate", None) or 0.0,
-        "fee_rate": getattr(row, "fee_rate", None),
         "entry_price": row.entry_price,
         "entry_fill_price": getattr(row, "entry_fill_price", None),
         "entry_trigger_direction": getattr(row, "entry_trigger_direction", None),
@@ -296,7 +309,8 @@ _VIRTUAL_TRADE_FIELDS = (
     "signal_id", "strategy_id", "symbol", "side", "wall_side", "status",
     "wall_price", "wall_size", "wall_ratio", "stake_usdt", "entry_price",
     "leverage", "position_notional_usdt", "entry_fee_usdt", "exit_fee_usdt",
-    "gross_pnl_usdt", "fee_rate", "accounting_version", "stop_loss",
+    "gross_pnl_usdt", "maker_fee_rate", "taker_fee_rate", "applied_fee_rate",
+    "commission_model", "fee_rate", "accounting_version", "stop_loss",
     "take_profit", "entry_fill_price", "wall_id", "entry_trigger_direction",
     "entry_armed", "exit_price", "profit_usdt", "close_reason",
     "profit_percent", "created_at", "opened_at", "closed_at",

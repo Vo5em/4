@@ -32,8 +32,8 @@ class PairSettings:
     breakout_buffer_bps: float = 0.5
     breakout_max_update_gap_seconds: float = 2.0
     leverage: float | None = None
-    maker_fee_rate: float = 0.0002
-    taker_fee_rate: float = 0.00055
+    maker_fee_rate: float = 0.00036
+    taker_fee_rate: float = 0.001
     maintenance_margin_rate: float = 0.005
     take_profit_bps: float | None = None
     stop_loss_bps: float | None = None

@@ -13,7 +13,7 @@ import websockets
 
 from .engine import EngineMode, MARKET_PRICE_SOURCE, TradingEngine
 from .orderbook import LocalOrderBook
-from .scanner import find_nearby_levels, find_walls
+from .scanner import diagnose_wall_levels, find_nearby_levels, find_walls
 from .settings import PairSettings
 from .trade_flow import TradeFlow
 from .wall_tracker import WallTracker
@@ -422,6 +422,11 @@ def analyze_synced_orderbook(
         min_wall_notional=pair_settings.min_wall_notional_usdt,
         diagnostics=filter_counts,
     )
+    scanner_diagnostics = diagnose_wall_levels(
+        nearby,
+        min_wall_notional=pair_settings.min_wall_notional_usdt,
+        min_wall_ratio=pair_settings.min_wall_ratio,
+    )
     wall_events = wall_tracker.update(candidates, orderbook, flow)
     stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
     observed_at = monotonic()
@@ -448,6 +453,7 @@ def analyze_synced_orderbook(
         "nearby_levels": nearby,
         "candidates": candidates,
         "filter_counts": filter_counts,
+        "scanner_diagnostics": scanner_diagnostics,
         "wall_events": wall_events,
         "stable_walls": stable_walls,
         "tracked_walls": tracked_walls,

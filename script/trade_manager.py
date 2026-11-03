@@ -4,6 +4,7 @@ from math import isfinite
 from threading import RLock
 
 from .settings import PairSettings, TradingSettings
+from .commission import LEGACY_SAVED_RATE, maker_maker_simulation
 
 
 class TradeManager:
@@ -53,7 +54,17 @@ class TradeManager:
             trade["entry_fee_usdt"] = trade.get("entry_fee_usdt", entry_fee) or 0.0
             trade["exit_fee"] = trade.get("exit_fee", trade.get("exit_fee_usdt") or 0.0) or 0.0
             trade["gross_pnl"] = trade.get("gross_pnl", trade.get("gross_pnl_usdt"))
-            trade["taker_fee_rate"] = trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0) or 0.0
+            if trade.get("taker_fee_rate") is None:
+                trade["taker_fee_rate"] = trade.get("fee_rate") or 0.0
+            if trade.get("applied_fee_rate") is None:
+                # Existing rows retain their recorded execution rate. New rows
+                # persist an explicit Maker/Maker simulation snapshot.
+                saved_rate = trade.get("fee_rate")
+                trade["applied_fee_rate"] = (
+                    float(saved_rate) if saved_rate is not None
+                    else float(trade["taker_fee_rate"] or 0.0)
+                )
+            trade.setdefault("commission_model", LEGACY_SAVED_RATE)
             if trade.get("entry_trigger_direction") not in {"cross_down", "cross_up"}:
                 trade["entry_trigger_direction"] = (
                     "cross_down" if trade.get("wall_side") == "buy" else "cross_up"
@@ -211,6 +222,9 @@ class TradeManager:
         )
         leverage = float(pair_settings.leverage or self.trading_settings.leverage)
         position_notional = stake * leverage
+        commission = maker_maker_simulation(
+            pair_settings.maker_fee_rate, pair_settings.taker_fee_rate
+        )
         reserved = sum(
             trade["stake_usdt"]
             for trade in self.trades
@@ -278,7 +292,9 @@ class TradeManager:
             "position_notional_usdt": position_notional,
             "maker_fee_rate": pair_settings.maker_fee_rate,
             "taker_fee_rate": pair_settings.taker_fee_rate,
-            "fee_rate": pair_settings.taker_fee_rate,
+            "applied_fee_rate": commission.applied_fee_rate,
+            "commission_model": commission.model,
+            "fee_rate": commission.applied_fee_rate,
             "entry_fee": 0.0,
             "entry_fee_usdt": 0.0,
             "exit_fee": 0.0,
@@ -305,7 +321,7 @@ class TradeManager:
             "profit_percent": 0.0,
         }
         if immediate:
-            trade["entry_fee"] = position_notional * pair_settings.taker_fee_rate
+            trade["entry_fee"] = position_notional * commission.applied_fee_rate
             trade["entry_fee_usdt"] = trade["entry_fee"]
             self.balance_usdt -= trade["entry_fee"]
         self.trades.append(trade)
@@ -402,7 +418,8 @@ class TradeManager:
                 item["stake_usdt"] for item in self.trades
                 if item["status"] in {"pending", "open"}
             )
-            entry_fee = trade["position_notional_usdt"] * trade["taker_fee_rate"]
+            applied_fee_rate = self._applied_fee_rate(trade)
+            entry_fee = trade["position_notional_usdt"] * applied_fee_rate
             if self.balance_usdt - reserved < entry_fee:
                 trade["entry_armed"] = False
                 events.append({"event": "ENTRY_BLOCKED", "trade": trade,
@@ -410,8 +427,8 @@ class TradeManager:
                 continue
             trade["status"] = "open"
             trade["opened_at"] = datetime.now(timezone.utc)
-            # Last Price crossing is a virtual trigger, not a guaranteed maker
-            # fill. Use a conservative taker fee and retain the simulated fill.
+            # A Last Price trigger is only a virtual fill assumption. This
+            # model intentionally applies the configured Maker rate on both sides.
             trade["entry_fill_price"] = numeric_price
             trade["entry_fee"] = entry_fee
             trade["entry_fee_usdt"] = entry_fee
@@ -420,7 +437,7 @@ class TradeManager:
                 "event": "ENTRY_ACTIVATED", "trade": trade,
                 "trigger_price": numeric_price,
                 "fill_price": numeric_price,
-                "price_source": "Bybit V5 linear ticker lastPrice (virtual taker-fee simulation)",
+                "price_source": "Bybit V5 linear ticker lastPrice (virtual Maker/Maker simulation)",
             })
 
         for trade in self.trades:
@@ -623,9 +640,18 @@ class TradeManager:
         entry_fee = float(trade.get("entry_fee", trade.get("entry_fee_usdt") or 0.0))
         exit_fee = (
             notional * price / entry_fill
-            * float(trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0))
+            * self._applied_fee_rate(trade)
         )
         return gross - entry_fee - exit_fee
+
+    @staticmethod
+    def _applied_fee_rate(trade: dict) -> float:
+        rate = trade.get("applied_fee_rate")
+        if rate is None:
+            rate = trade.get("fee_rate")
+        if rate is None:
+            rate = trade.get("taker_fee_rate", 0.0)
+        return float(rate or 0.0)
 
     def cancel_pending_for_slot(
         self, symbol: str, strategy_id: str, wall_side: str, reason: str
@@ -724,7 +750,7 @@ class TradeManager:
             * direction
         )
         exit_notional = notional * price / fill_entry
-        exit_fee = exit_notional * trade.get("taker_fee_rate", trade.get("fee_rate") or 0.0)
+        exit_fee = exit_notional * self._applied_fee_rate(trade)
         net_pnl = gross_pnl - entry_fee - exit_fee
         trade.update(
             status="closed",

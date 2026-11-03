@@ -326,6 +326,8 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"Плавающий P/L: {status['unrealized_profit_usdt']:+.2f} USDT · "
         f"оценка баланса: {status['equity_usdt']:.2f} USDT\n"
         f"Ставка на сделку: {status['stake_usdt']:.2f} USDT\n"
+        "Комиссионная модель новых виртуальных сделок: Maker/Maker; "
+        "ставка Maker пары фиксируется отдельно в каждой сделке.\n"
         "Общий лимит сделок не задан; новые входы зависят от сигналов и доступного баланса\n"
         f"Профит всего: {status['total_profit_usdt']:.2f} USDT\n"
         f"Профит за 7 дней: {status['weekly_profit_usdt']:.2f} USDT\n"
@@ -360,6 +362,8 @@ def pair_settings_text(runtime: RuntimeController) -> str:
             f"устойчивость {max(40.0, settings.min_wall_age_seconds):g} с; "
             f"порог потребления {settings.consumed_ratio:.0%}; "
             f"плечо {settings.leverage if settings.leverage is not None else runtime.engine.trading_settings.leverage:g}x; "
+            f"комиссии Maker/Taker {settings.maker_fee_rate * 100:.4f}% / {settings.taker_fee_rate * 100:.4f}%; "
+            "виртуальная модель Maker/Maker; "
             f"TP {take_profit_bps:g} / SL {stop_loss_bps:g} б.п.; "
             f"стратегии {escape(strategies)}"
         )
@@ -389,12 +393,12 @@ def trade_level_pair_text(runtime: RuntimeController, symbol: str) -> str:
     long = estimate_trade_outcomes(
         side="long", entry_price=entry, take_profit_price=tp_long,
         stop_loss_price=sl_long, position_notional_usdt=notional,
-        taker_fee_rate=pair.taker_fee_rate,
+        taker_fee_rate=pair.maker_fee_rate,
     )
     short = estimate_trade_outcomes(
         side="short", entry_price=entry, take_profit_price=tp_short,
         stop_loss_price=sl_short, position_notional_usdt=notional,
-        taker_fee_rate=pair.taker_fee_rate,
+        taker_fee_rate=pair.maker_fee_rate,
     )
     strategies = runtime.engine.get_enabled_strategy_ids(symbol)
     warnings = []
@@ -412,7 +416,9 @@ def trade_level_pair_text(runtime: RuntimeController, symbol: str) -> str:
         f"SL: {_level_value_label(pair.stop_loss_bps, trading.default_stop_loss_bps)}",
         f"Эффективно: TP {tp_bps:g} / SL {sl_bps:g} б.п. от Entry",
         f"Оценка: ставка {trading.stake_usdt:g} × {leverage:g}x = {notional:g} USDT; "
-        f"Taker {pair.taker_fee_rate * 100:.4f}% за каждое виртуальное исполнение.",
+        f"Модель виртуальных комиссий: Maker/Maker — {pair.maker_fee_rate * 100:.4f}% на вход и выход. "
+        f"Фактические тарифы пары: Maker {pair.maker_fee_rate * 100:.4f}% / "
+        f"Taker {pair.taker_fee_rate * 100:.4f}%.",
         "Пример на Entry 100 USDT, до округления по tickSize:",
         f"LONG: TP до комиссий {long['tp_gross_pnl_usdt']:+.4f}, "
         f"TP после комиссий {long['tp_net_pnl_usdt']:+.4f}, "
@@ -1087,6 +1093,17 @@ def _deal_card(runtime: RuntimeController, trade: dict) -> tuple[str, InlineKeyb
     strategy = _strategy_name(str(trade.get("strategy_id", "")))
     side = str(trade.get("side", "нет данных")).upper()
     price = manager.last_prices.get(str(trade.get("symbol", "")).upper())
+    commission_model = str(trade.get("commission_model") or "LEGACY_SAVED_RATE")
+    applied_fee_rate = trade.get("applied_fee_rate")
+    if applied_fee_rate is None:
+        applied_fee_rate = trade.get("fee_rate") or 0.0
+    if trade.get("maker_fee_rate") is not None and trade.get("taker_fee_rate") is not None:
+        commission_tariffs = (
+            f"Maker {float(trade['maker_fee_rate']) * 100:.4f}% / "
+            f"Taker {float(trade['taker_fee_rate']) * 100:.4f}%"
+        )
+    else:
+        commission_tariffs = "исходные тарифы не сохранены"
     lines = [
         f"<b>{symbol} · {strategy} · {side}</b>",
         f"ID: <code>{escape(str(trade.get('signal_id', 'нет данных')))}</code>",
@@ -1101,8 +1118,10 @@ def _deal_card(runtime: RuntimeController, trade: dict) -> tuple[str, InlineKeyb
         lines.extend([
             f"Плечо: {float(trade.get('leverage') or 1):g}x · маржа: {float(trade.get('stake_usdt') or 0):.2f} USDT",
             f"Номинал: {notional:.2f} USDT · плавающий PnL: {f'{pnl:+.4f} USDT' if pnl is not None else 'нет данных'}",
+            f"Комиссия {escape(commission_model)}: применено "
+            f"{float(applied_fee_rate) * 100:.4f}% на вход/выход; {commission_tariffs}",
             f"Комиссия входа: {float(trade.get('entry_fee_usdt') or 0):.6f} USDT · ожидаемая комиссия выхода: "
-            + (f"{notional * float(price) / float(trade.get('entry_fill_price') or trade.get('entry_price')) * float(trade.get('taker_fee_rate', trade.get('fee_rate') or 0)):.6f} USDT" if price is not None else "нет данных"),
+            + (f"{notional * float(price) / float(trade.get('entry_fill_price') or trade.get('entry_price')) * float(applied_fee_rate):.6f} USDT" if price is not None else "нет данных"),
             f"Wall: {_wall_side_label(trade.get('wall_side', ''))} {float(trade.get('wall_price') or 0):g} · {escape(str(trade.get('wall_id') or 'нет ID'))}",
         ])
         rows = [
@@ -1733,12 +1752,45 @@ def stable_walls_text(
             if rejected else "нет"
         )
         planner_walls = data.get("planner_wall_decisions") or []
+        scanner = data.get("scanner_diagnostics") or {}
+        medians = scanner.get("side_medians") or {}
+        sweep = scanner.get("ratio_sweep") or {}
+        thresholds = (5, 10, 15, 20, 30, 50, 100)
+        sweep_text = " ".join(
+            f"{threshold}:{sweep.get('buy', {}).get(threshold, 0)}/"
+            f"{sweep.get('sell', {}).get(threshold, 0)}"
+            for threshold in thresholds
+        )
+        median_buy = medians.get("buy")
+        median_sell = medians.get("sell")
+        median_text = (
+            f"{median_buy:.4g}" if median_buy is not None else "нет"
+        ) + "/" + (
+            f"{median_sell:.4g}" if median_sell is not None else "нет"
+        )
+        largest = []
+        for level in (scanner.get("largest_levels") or [])[:5]:
+            side_label = "BID" if level.get("side") == "buy" else "ASK"
+            ratio = level.get("wall_ratio")
+            largest.append(
+                f"{side_label} {float(level['price']):.8g} "
+                f"{float(level['notional']):.4g}USDT "
+                f"ratio {float(ratio):.2f}x · {float(level.get('distance_bps', 0)):.2f}bps · "
+                f"{escape(str(level.get('rejection') or 'проходит Scanner'))}" if ratio is not None else
+                f"{side_label} {float(level['price']):.8g} "
+                f"{float(level['notional']):.4g}USDT ratio нет · "
+                f"{float(level.get('distance_bps', 0)):.2f}bps · "
+                f"{escape(str(level.get('rejection') or 'проходит Scanner'))}"
+            )
         total_pages = max(1, (len(planner_walls) + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE)
         page = min(page, total_pages - 1)
         selected = planner_walls[page * WALLS_PAGE_SIZE:(page + 1) * WALLS_PAGE_SIZE]
         summary = (
             f"Причина статуса: {escape(str(data.get('reason', 'нет данных')))}\n"
             f"Отклонения Scanner: {rejected_text}\n"
+            f"Медиана notional BID/ASK: {median_text} USDT\n"
+            f"Ratio sweep (порог:BID/ASK): {sweep_text}\n"
+            f"Крупнейшие уровни: {escape('; '.join(largest) or 'нет данных')}\n"
             f"Стратегии пары: {escape(', '.join(data.get('planner_strategies') or []) or 'нет данных')}\n"
             f"Trade Planner: {escape(_compact_planner_decision(data.get('planner_decision')))}\n"
             f"Оценка стен · стр. {page + 1}/{total_pages}:"

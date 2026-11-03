@@ -403,6 +403,12 @@ class TradingEngine:
             "ask": [dict(item) for item in tracked if item.get("side") == "sell"],
             "stable_count": len(stable),
             "rejected": rejected,
+            "scanner_diagnostics": result.get("scanner_diagnostics", {}),
+            "scanner_filters": {
+                "min_wall_ratio": self.pair_settings[symbol].min_wall_ratio,
+                "min_wall_notional_usdt": self.pair_settings[symbol].min_wall_notional_usdt,
+                "max_wall_distance_bps": self.pair_settings[symbol].max_wall_distance_bps,
+            } if symbol in self.pair_settings else {},
             "reason": reason,
             "planner_decision": "обрабатывается",
         }

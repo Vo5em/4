@@ -70,6 +70,37 @@ def _render(symbol: str, data: dict, health: dict) -> str:
     lines.append(f"  stable_walls={data.get('stable_count', 0)} · reason={data.get('reason', 'нет данных')}")
     rejected = data.get("rejected") or {}
     lines.append(f"  rejected={rejected or 'нет'}")
+    scanner = data.get("scanner_diagnostics") or {}
+    filters = data.get("scanner_filters") or {}
+    lines.append(
+        "  active_filters="
+        f"ratio>={filters.get('min_wall_ratio', 'нет данных')}x "
+        f"notional>={filters.get('min_wall_notional_usdt', 'нет данных')}USDT "
+        f"distance<={filters.get('max_wall_distance_bps', 'нет данных')}bps"
+    )
+    medians = scanner.get("side_medians") or {}
+    lines.append(
+        "  side_median_notional="
+        f"BID:{medians.get('buy') if medians.get('buy') is not None else 'нет'} "
+        f"ASK:{medians.get('sell') if medians.get('sell') is not None else 'нет'} USDT"
+    )
+    sweep = scanner.get("ratio_sweep") or {}
+    thresholds = (5, 10, 15, 20, 30, 50, 100)
+    lines.append("  ratio_threshold_sweep candidates BID/ASK=" + " ".join(
+        f"{threshold}:{sweep.get('buy', {}).get(threshold, 0)}/"
+        f"{sweep.get('sell', {}).get(threshold, 0)}" for threshold in thresholds
+    ))
+    lines.append("  largest_nearby_levels: side price notional ratio distance rejection")
+    for level in (scanner.get("largest_levels") or [])[:8]:
+        side = "BID" if level.get("side") == "buy" else "ASK"
+        ratio = level.get("wall_ratio")
+        lines.append(
+            f"    {side} {level['price']:g} {level['notional']:.4g}USDT "
+            f"ratio={ratio:.2f}x distance={level['distance_bps']:.2f}bps "
+            f"reject={level['rejection'] or 'нет'}" if ratio is not None else
+            f"    {side} {level['price']:g} {level['notional']:.4g}USDT ratio=нет "
+            f"distance={level['distance_bps']:.2f}bps reject={level['rejection'] or 'нет'}"
+        )
     lines.append(f"  trade_planner={data.get('planner_decision', 'нет данных')}")
     planner_walls = data.get("planner_wall_decisions") or []
     strategies = data.get("planner_strategies") or []

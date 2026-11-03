@@ -749,6 +749,21 @@ class DatabaseRepositoryTests(unittest.TestCase):
             1,
         )
 
+    def test_commission_snapshot_fields_are_mapped_and_additive(self):
+        trade = {
+            "maker_fee_rate": 0.00036,
+            "taker_fee_rate": 0.001,
+            "applied_fee_rate": 0.00036,
+            "commission_model": "MAKER_MAKER_SIMULATION",
+        }
+        values = repository._virtual_trade_values(trade)
+        self.assertEqual(values, trade)
+        for column in (
+            "maker_fee_rate", "taker_fee_rate", "applied_fee_rate", "commission_model"
+        ):
+            self.assertIn(column, VirtualTrade.__table__.columns)
+            self.assertTrue(VirtualTrade.__table__.columns[column].nullable)
+
     def test_cancelled_cleanup_deletes_only_selected_old_cancelled_batch(self):
         now = datetime.now(timezone.utc)
         cancelled = VirtualTrade(

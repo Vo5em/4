@@ -122,7 +122,7 @@ class TradeLevelPolicyTests(unittest.TestCase):
             (40, 40),
         )
 
-    def test_pnl_projection_uses_notional_and_taker_fee_both_sides(self):
+    def test_pnl_projection_uses_notional_and_supplied_fee_rate_both_sides(self):
         outcome = estimate_trade_outcomes(
             side="long", entry_price=100, take_profit_price=100.05,
             stop_loss_price=99.95, position_notional_usdt=750,
