@@ -112,7 +112,7 @@ def _wall_id(symbol: str, wall: dict) -> str:
 
 
 class BounceStrategy:
-    """Maintain a pending plan for the nearest stable BID and ASK walls."""
+    """Maintain one pending plan for each eligible stable BID and ASK wall."""
 
     strategy_id = BOUNCE_STRATEGY_ID
 
@@ -133,7 +133,7 @@ class BounceStrategy:
 
 
 class BreakoutStrategy:
-    """Maintain a pending plan ahead of the nearest stable BID and ASK walls."""
+    """Maintain one pending plan for each eligible stable BID and ASK wall."""
 
     strategy_id = BREAKOUT_STRATEGY_ID
 
@@ -158,7 +158,7 @@ def _wall_plan_signals(
 ) -> tuple[list[TradeSignal], list[dict]]:
     traces = []
     walls = [wall for wall in context.stable_walls if wall.get("event") not in {"REMOVED", "CONSUMED"}]
-    eligible: dict[str, tuple[float, dict]] = {}
+    eligible: dict[str, dict] = {}
     for wall in walls:
         side = wall.get("side")
         price = float(wall.get("price") or 0)
@@ -196,14 +196,11 @@ def _wall_plan_signals(
         elif not distance_ok:
             trace["reasons"].append("Стена находится дальше допустимой дистанции поиска.")
         else:
-            distance = abs(context.last_price - price)
-            selected = eligible.get(side)
-            if selected is None or distance < selected[0]:
-                eligible[side] = (distance, wall)
+            eligible[wall_id] = wall
 
     signals = []
-    for side, (_, wall) in eligible.items():
-        wall_id = _wall_id(context.symbol, wall)
+    for wall_id, wall in eligible.items():
+        side = wall["side"]
         trace = next(row for row in traces if row["wall_id"] == wall_id)
         trade_side = (
             "long" if (strategy_id == BOUNCE_STRATEGY_ID and side == "buy")
@@ -211,10 +208,9 @@ def _wall_plan_signals(
             else "short"
         )
         trigger = "cross_down" if side == "buy" else "cross_up"
-        trace["nearest_wall_passed"] = True
         trace["signal_formed"] = True
         trace["signal_accepted"] = True
-        trace["reasons"].append("Ближайшая стабильная стена выбрана; создан план ожидания Entry.")
+        trace["reasons"].append("Подходящая стабильная стена выбрана; создан план ожидания Entry.")
         signals.append(TradeSignal(
             strategy_id=strategy_id, symbol=context.symbol, wall_side=side,
             wall_price=float(wall["price"]), wall_id=wall_id,
@@ -222,9 +218,6 @@ def _wall_plan_signals(
             wall_ratio=float(wall.get("wall_ratio", 0)), side=trade_side,
             entry_mode="cross", entry_trigger_direction=trigger,
         ))
-    for trace in traces:
-        if not trace["signal_accepted"] and not trace["reasons"]:
-            trace["reasons"].append("Есть более близкая подходящая стена этой стороны.")
     return signals, traces
 
 

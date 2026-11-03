@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -631,6 +632,40 @@ class TradingEngine:
             and health["book_synchronized"]
             and health["connection_generation"] == health["active_connection_generation"]
         )
+        failures = []
+        if price_received is None:
+            failures.append("PRICE_NOT_RECEIVED")
+        elif price_age is not None and price_age > MARKET_PRICE_STALE_AFTER_SECONDS:
+            failures.append(f"PRICE_AGE>{MARKET_PRICE_STALE_AFTER_SECONDS:.2f}s")
+        if price_received is not None:
+            if (health["price_delivery_lag_ms"] or 0) > MARKET_PRICE_STALE_AFTER_SECONDS * 1000:
+                failures.append(
+                    f"PRICE_DELIVERY_LAG>{MARKET_PRICE_STALE_AFTER_SECONDS:.0f}s"
+                )
+            if health["price_source"] != MARKET_PRICE_SOURCE:
+                failures.append("PRICE_SOURCE_MISMATCH")
+            if health["price_value"] is None:
+                failures.append("PRICE_VALUE_MISSING")
+            if health["price_connection_generation"] is None:
+                failures.append("PRICE_GENERATION_MISSING")
+            elif health["price_connection_generation"] != health["active_connection_generation"]:
+                failures.append("PRICE_GENERATION_MISMATCH")
+        if book_received is None:
+            failures.append("BOOK_NOT_RECEIVED")
+        elif book_age is not None and book_age > MARKET_BOOK_STALE_AFTER_SECONDS:
+            failures.append(f"BOOK_AGE>{MARKET_BOOK_STALE_AFTER_SECONDS:.2f}s")
+        if book_received is not None:
+            if (health["book_delivery_lag_ms"] or 0) > MARKET_BOOK_STALE_AFTER_SECONDS * 1000:
+                failures.append(
+                    f"BOOK_DELIVERY_LAG>{MARKET_BOOK_STALE_AFTER_SECONDS:.0f}s"
+                )
+            if not health["book_synchronized"]:
+                failures.append("BOOK_UNSYNCHRONIZED")
+            if health["connection_generation"] is None:
+                failures.append("BOOK_GENERATION_MISSING")
+            elif health["connection_generation"] != health["active_connection_generation"]:
+                failures.append("BOOK_GENERATION_MISMATCH")
+        health["freshness_failures"] = failures
         health["exchange_price_age_seconds"] = (
             max(0.0, now_ms - health["price_event_time_ms"]) / 1000
             if health["price_event_time_ms"] is not None else None
@@ -1352,19 +1387,27 @@ class TradingEngine:
                 reason = (
                     "missing market metadata" if health is None else
                     "input price does not match the confirmed ticker" if not health_matches_price else
-                    "stale price or old WebSocket generation"
+                    ",".join(health.get("freshness_failures") or ["price_not_confirmed"])
                 )
                 logger.warning(
-                    "%s open trade check skipped: %s; event_ts=%s age=%s source=%s "
-                    "price=%s confirmed_price=%s generation=%s/%s",
+                    "%s open trade check skipped: %s; event_ts=%s message_ts=%s "
+                    "age=%s/%.2fs delivery_lag=%sms source=%s "
+                    "price=%s confirmed_price=%s price_generation=%s/%s "
+                    "book_generation=%s/%s book_sync=%s",
                     symbol, reason,
                     health.get("price_event_time_ms") if health else None,
+                    health.get("price_message_time_ms") if health else None,
                     health.get("price_age_seconds") if health else None,
+                    MARKET_PRICE_STALE_AFTER_SECONDS,
+                    health.get("price_delivery_lag_ms") if health else None,
                     health.get("price_source") if health else None,
                     last_price,
                     health.get("price_value") if health else None,
                     health.get("price_connection_generation") if health else None,
                     health.get("active_connection_generation") if health else None,
+                    health.get("connection_generation") if health else None,
+                    health.get("active_connection_generation") if health else None,
+                    health.get("book_synchronized") if health else None,
                 )
                 self._stale_data_warning_at[warning_key] = now
         if settings is None or not settings.enabled or self.mode != EngineMode.RUNNING:
@@ -1399,9 +1442,20 @@ class TradingEngine:
                 if now - last_warn >= 30:
                     logger.warning(
                         "%s refusing entries on stale/unsynchronized market data: "
-                        "price_age=%s book_age=%s book_synced=%s generation=%s",
-                        symbol, health["price_age_seconds"], health["book_age_seconds"],
-                        health["book_synchronized"], health["connection_generation"],
+                        "failed=%s price_age=%s/%.2fs price_lag=%sms source=%s "
+                        "price_ts=%s price_msg_ts=%s price_generation=%s/%s "
+                        "book_age=%s/%.2fs book_lag=%sms book_ts=%s book_cts=%s "
+                        "book_synced=%s book_generation=%s/%s",
+                        symbol,
+                        health["freshness_failures"],
+                        health["price_age_seconds"], MARKET_PRICE_STALE_AFTER_SECONDS,
+                        health["price_delivery_lag_ms"], health["price_source"],
+                        health["price_event_time_ms"], health["price_message_time_ms"],
+                        health["price_connection_generation"], health["active_connection_generation"],
+                        health["book_age_seconds"], MARKET_BOOK_STALE_AFTER_SECONDS,
+                        health["book_delivery_lag_ms"], health["book_message_time_ms"],
+                        health["book_cts_ms"], health["book_synchronized"],
+                        health["connection_generation"], health["active_connection_generation"],
                     )
                     self._stale_data_warning_at[symbol] = now
             self._record_planner_blocked(
@@ -1475,37 +1529,30 @@ class TradingEngine:
                 symbol_errors.pop(strategy.strategy_id, None)
                 if not symbol_errors:
                     self.strategy_errors.pop(symbol, None)
-            desired_slots = {"buy": None, "sell": None}
+            valid_wall_ids = set()
+            tick_size = self.instrument_tick_sizes.get(symbol)
             for signal in signals:
+                wall_side = signal.wall_side
                 if self.trade_manager.is_wall_manually_cancelled(
                     symbol, strategy.strategy_id, signal.wall_id,
-                    signal.wall_side, signal.wall_price,
+                    wall_side, signal.wall_price,
                 ):
                     trade_rejections.append(
-                        f"{signal.wall_side.upper()} {signal.wall_price}: план вручную отменён до завершения жизненного цикла стены."
+                        f"{wall_side.upper()} {signal.wall_price}: план вручную отменён до завершения жизненного цикла стены."
                     )
                     continue
-                desired_slots[signal.wall_side] = signal
-            tick_size = self.instrument_tick_sizes.get(symbol)
-            for wall_side in ("buy", "sell"):
-                signal = desired_slots[wall_side]
-                existing = self.trade_manager.get_pending_for_slot(
-                    symbol, strategy.strategy_id, wall_side
+                existing = self.trade_manager.get_pending_for_wall(
+                    symbol, strategy.strategy_id, wall_side, signal.wall_id
                 )
-                if signal is None:
-                    if existing is not None:
-                        reason = "WALL_NO_LONGER_QUALIFIES" if stable_walls else "NO_STABLE_WALL"
-                        events.extend(self.trade_manager.cancel_pending_for_slot(
-                            symbol, strategy.strategy_id, wall_side, reason
-                        ))
-                    continue
                 requires_bybit_tick = strategy.strategy_id in {"bounce", "breakout"}
                 if requires_bybit_tick and (tick_size is None or tick_size <= 0):
                     trade_rejections.append("Не получен tickSize Bybit; уровни плана не рассчитаны.")
                     if existing is not None:
-                        events.extend(self.trade_manager.cancel_pending_for_slot(
-                            symbol, strategy.strategy_id, wall_side, "TICK_SIZE_UNAVAILABLE"
-                        ))
+                        trade = self.trade_manager.cancel_pending_for_plan(
+                            symbol, strategy.strategy_id, signal.wall_id,
+                            "TICK_SIZE_UNAVAILABLE",
+                        )
+                        events.extend(trade)
                     continue
                 if strategy.strategy_id in {"bounce", "breakout"}:
                     take_profit_bps, stop_loss_bps = effective_trade_level_bps(
@@ -1524,8 +1571,8 @@ class TradingEngine:
                         reason = f"Уровни невалидны: {error}"
                         trade_rejections.append(reason)
                         if existing is not None:
-                            events.extend(self.trade_manager.cancel_pending_for_slot(
-                                symbol, strategy.strategy_id, wall_side,
+                            events.extend(self.trade_manager.cancel_pending_for_plan(
+                                symbol, strategy.strategy_id, signal.wall_id,
                                 "INVALID_TRADE_LEVELS",
                             ))
                         self._record_trade_plan_result(
@@ -1549,16 +1596,25 @@ class TradingEngine:
                         f"Стратегия {strategy.strategy_id} не предоставила готовые уровни сделки."
                     )
                     continue
+                valid_wall_ids.add(signal.wall_id)
                 if self.trade_manager.has_matching_pending_plan(signal, levels, settings):
                     self._record_trade_plan_result(
                         symbol, signal.wall_id, strategy.strategy_id, existing, None
                     )
                     continue
                 if existing is not None:
-                    events.extend(self.trade_manager.cancel_pending_for_slot(
-                        symbol, strategy.strategy_id, wall_side, "PLAN_REPLACED"
-                    ))
-                from uuid import uuid4
+                    updated = self.trade_manager.update_pending_plan(signal, levels, settings)
+                    if updated is not None:
+                        eligible_pending_ids.discard(updated["signal_id"])
+                        events.append({"event": "PENDING_UPDATED", "trade": updated})
+                        self._record_trade_plan_result(
+                            symbol, signal.wall_id, strategy.strategy_id, updated, None
+                        )
+                    continue
+                stable_key = "|".join((
+                    symbol, strategy.strategy_id, wall_side, signal.wall_id,
+                ))
+                plan_id = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:32]
                 payload = {
                     "strategy_id": signal.strategy_id,
                     "symbol": signal.symbol,
@@ -1571,7 +1627,7 @@ class TradingEngine:
                     "entry_mode": signal.entry_mode or "cross",
                     "entry_trigger_direction": levels["entry_trigger_direction"],
                     "reference_price": last_price,
-                    "signal_id": f"plan:{uuid4().hex}",
+                    "signal_id": f"plan:{strategy.strategy_id}:{plan_id}",
                 }
                 try:
                     trade = self.trade_manager.create_trade(
@@ -1597,6 +1653,10 @@ class TradingEngine:
                     )
                 else:
                     trade_rejections.append(rejection_reason or "TradeManager отклонил план без причины.")
+            reason = "NO_STABLE_WALL" if not stable_walls else "WALL_NO_LONGER_QUALIFIES"
+            events.extend(self.trade_manager.cancel_pending_not_in_wall_ids(
+                symbol, strategy.strategy_id, valid_wall_ids, reason
+            ))
         if confirmed_price_update:
             events.extend(self.trade_manager.on_price(
                 symbol, last_price, process_open=False,
@@ -1722,17 +1782,8 @@ class TradingEngine:
             if not health["book_synchronized"]:
                 return "Локальный стакан не синхронизирован."
             if not health["fresh"]:
-                price_age = health["price_age_seconds"]
-                book_age = health["book_age_seconds"]
-                return (
-                    "Рыночные данные устарели: цена "
-                    f"{price_age:.2f} с" if price_age is not None else
-                    "Рыночные данные устарели: цена нет данных"
-                ) + (
-                    ", стакан "
-                    f"{book_age:.2f} с." if book_age is not None else
-                    ", стакан нет данных."
-                )
+                failures = health.get("freshness_failures") or ["UNKNOWN_FRESHNESS_FAILURE"]
+                return "Рыночные данные не прошли проверки: " + ", ".join(failures) + "."
         if not self.last_market_update_at.get(symbol):
             return "Рынок ещё не обработан алгоритмом."
         if self.repository is not None and self._pending_persistence:
@@ -1746,9 +1797,6 @@ class TradingEngine:
             return "Нет потенциальных стен, прошедших текущие фильтры."
         if stable == 0:
             return "Потенциальные стены ещё не подтвердили устойчивость."
-        stats = self.trade_manager.get_statistics()
-        if stats["available_balance_usdt"] < self.trading_settings.stake_usdt:
-            return "Недостаточно свободного виртуального баланса для ставки."
         if symbol in self.strategy_errors:
             return "Ошибка оценки одной или нескольких стратегий."
         return "Текущая стратегия ещё не сформировала новый сигнал."

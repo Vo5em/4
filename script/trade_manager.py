@@ -198,21 +198,19 @@ class TradeManager:
             self.last_create_rejection_reason = "Сигнал с таким signal_id уже обрабатывался ранее."
             return None
         wall_id = str(data.get("wall_id") or signal_id)
+        strategy_id = str(data["strategy_id"])
+        wall_side = data["wall_side"]
         if any(
             str(trade.get("wall_id") or self._wall_id_from_signal_id(trade)) == wall_id
+            and str(trade.get("symbol", "")).upper() == symbol
+            and trade.get("strategy_id") == strategy_id
+            and trade.get("wall_side") == wall_side
             and trade.get("status") in {"pending", "open", "closed"}
             for trade in self.trades
         ):
-            self.last_create_rejection_reason = "Эта идентичность стены уже дала сделку со статусом pending/open/closed."
-            return None
-        if any(
-            trade["symbol"] == symbol
-            and trade["wall_side"] == data["wall_side"]
-            and trade["wall_price"] == wall_price
-            and trade["status"] in {"pending", "open"}
-            for trade in self.trades
-        ):
-            self.last_create_rejection_reason = "Для этой пары, стороны и цены стены уже есть pending/open сделка."
+            self.last_create_rejection_reason = (
+                "Эта стена уже использовалась указанной парой и стратегией."
+            )
             return None
 
         stake = float(
@@ -225,23 +223,10 @@ class TradeManager:
         commission = maker_maker_simulation(
             pair_settings.maker_fee_rate, pair_settings.taker_fee_rate
         )
-        reserved = sum(
-            trade["stake_usdt"]
-            for trade in self.trades
-            if trade["status"] in {"pending", "open"}
-        )
-        available = self.balance_usdt - reserved
         if not isfinite(stake) or stake <= 0:
             self.last_create_rejection_reason = f"Некорректная ставка: {stake!r} USDT."
             return None
-        if available < stake:
-            self.last_create_rejection_reason = (
-                f"Недостаточно свободного баланса: доступно {available:.4g} USDT, "
-                f"требуется {stake:.4g} USDT маржи."
-            )
-            return None
 
-        wall_side = data["wall_side"]
         if wall_side not in {"buy", "sell"}:
             raise ValueError(f"Unsupported wall side: {wall_side}")
         trade_side = data.get("side") or ("long" if wall_side == "buy" else "short")
@@ -264,6 +249,29 @@ class TradeManager:
             raise ValueError("trade levels are on the wrong side of entry")
         created_at = datetime.now(timezone.utc)
         immediate = data.get("entry_mode") == "market"
+        if immediate:
+            global_open = sum(item.get("status") == "open" for item in self.trades)
+            pair_open = sum(
+                item.get("status") == "open"
+                and str(item.get("symbol", "")).upper() == symbol
+                for item in self.trades
+            )
+            if pair_open >= 1:
+                self.last_create_rejection_reason = "Для пары уже есть OPEN-сделка."
+                return None
+            if global_open >= self.trading_settings.max_open_trades:
+                self.last_create_rejection_reason = "Достигнут глобальный лимит OPEN-сделок."
+                return None
+            open_reserved = sum(
+                float(item.get("stake_usdt", 0.0))
+                for item in self.trades if item.get("status") == "open"
+            )
+            immediate_fee = position_notional * commission.applied_fee_rate
+            if self.balance_usdt - open_reserved < stake + immediate_fee:
+                self.last_create_rejection_reason = (
+                    "Недостаточно свободного баланса для маржи и комиссии входа."
+                )
+                return None
         trigger_direction = data.get("entry_trigger_direction") or (
             "cross_down" if wall_side == "buy" else "cross_up"
         )
@@ -364,15 +372,34 @@ class TradeManager:
         if not process_entries:
             self._deferred_entry_ticks[symbol] = previous
         events = []
-        pending = sorted(
-            (trade for trade in self.trades
-             if trade["symbol"] == symbol and trade["status"] == "pending"),
-            key=lambda trade: (
+        pending = [
+            trade for trade in self.trades
+            if trade["symbol"] == symbol and trade["status"] == "pending"
+        ]
+
+        def pending_order(trade):
+            entry = float(trade["entry_price"])
+            crossed_down = (
+                previous is not None and previous > entry >= numeric_price
+                and trade.get("entry_trigger_direction") == "cross_down"
+            )
+            crossed_up = (
+                previous is not None and previous < entry <= numeric_price
+                and trade.get("entry_trigger_direction") == "cross_up"
+            )
+            if crossed_down:
+                # Moving down, the highest crossed Entry is encountered first.
+                return (0, -entry, trade.get("signal_id", ""))
+            if crossed_up:
+                # Moving up, the lowest crossed Entry is encountered first.
+                return (0, entry, trade.get("signal_id", ""))
+            return (
+                1,
                 trade.get("created_at") or datetime.min.replace(tzinfo=timezone.utc),
-                0 if trade.get("wall_side") == "buy" else 1,
                 trade.get("signal_id", ""),
-            ),
-        )
+            )
+
+        pending.sort(key=pending_order)
         for trade in pending:
             if not process_entries:
                 continue
@@ -384,17 +411,30 @@ class TradeManager:
             if trigger_previous is None:
                 trigger_previous = trade.get("entry_previous_price")
             safe_side = numeric_price > float(entry) if trade["wall_side"] == "buy" else numeric_price < float(entry)
-            if not trade.get("entry_armed"):
-                if safe_side:
-                    trade["entry_armed"] = True
-                    events.append({"event": "ENTRY_ARMED", "trade": trade})
-                continue
             crossed = False
             if trigger_previous is not None:
                 if trade["entry_trigger_direction"] == "cross_down":
                     crossed = trigger_previous > float(entry) and numeric_price <= float(entry)
                 else:
                     crossed = trigger_previous < float(entry) and numeric_price >= float(entry)
+            if not trade.get("entry_armed"):
+                if safe_side:
+                    trade["entry_armed"] = True
+                    events.append({"event": "ENTRY_ARMED", "trade": trade})
+                elif crossed and any(
+                    item.get("status") == "open" and item.get("symbol") == symbol
+                    for item in self.trades
+                ):
+                    trade.update(
+                        status="cancelled",
+                        closed_at=datetime.now(timezone.utc),
+                        close_reason="ENTRY_BLOCKED_BY_OPEN_TRADE",
+                    )
+                    events.append({
+                        "event": "ENTRY_CANCELLED", "trade": trade,
+                        "reason": "ENTRY_BLOCKED_BY_OPEN_TRADE",
+                    })
+                continue
             if not crossed:
                 continue
             open_count = sum(item["status"] == "open" for item in self.trades)
@@ -402,28 +442,34 @@ class TradeManager:
                 item["status"] == "open" and item["symbol"] == symbol
                 for item in self.trades
             )
-            pair_settings = getattr(self, "_current_pair_settings", {}).get(symbol)
-            pair_limit = pair_settings.max_open_trades if pair_settings else self.trading_settings.max_open_trades
+            if pair_open_count >= 1:
+                trade.update(
+                    status="cancelled",
+                    closed_at=datetime.now(timezone.utc),
+                    close_reason="ENTRY_BLOCKED_BY_OPEN_TRADE",
+                    entry_armed=False,
+                )
+                events.append({
+                    "event": "ENTRY_CANCELLED", "trade": trade,
+                    "reason": "ENTRY_BLOCKED_BY_OPEN_TRADE",
+                })
+                continue
             if open_count >= self.trading_settings.max_open_trades:
                 trade["entry_armed"] = False
                 events.append({"event": "ENTRY_BLOCKED", "trade": trade,
                                "reason": "GLOBAL_OPEN_LIMIT"})
                 continue
-            if pair_open_count >= pair_limit:
-                trade["entry_armed"] = False
-                events.append({"event": "ENTRY_BLOCKED", "trade": trade,
-                               "reason": "PAIR_OPEN_LIMIT"})
-                continue
             reserved = sum(
-                item["stake_usdt"] for item in self.trades
-                if item["status"] in {"pending", "open"}
+                float(item["stake_usdt"]) for item in self.trades
+                if item["status"] == "open"
             )
             applied_fee_rate = self._applied_fee_rate(trade)
             entry_fee = trade["position_notional_usdt"] * applied_fee_rate
-            if self.balance_usdt - reserved < entry_fee:
+            available = self.balance_usdt - reserved
+            if available < float(trade["stake_usdt"]) + entry_fee:
                 trade["entry_armed"] = False
                 events.append({"event": "ENTRY_BLOCKED", "trade": trade,
-                               "reason": "INSUFFICIENT_BALANCE_FOR_FEE"})
+                               "reason": "INSUFFICIENT_AVAILABLE_BALANCE"})
                 continue
             trade["status"] = "open"
             trade["opened_at"] = datetime.now(timezone.utc)
@@ -524,6 +570,37 @@ class TradeManager:
                      and trade["strategy_id"] == strategy_id
                      and trade["wall_side"] == wall_side
                      and trade["status"] == "pending"), None)
+
+    def get_pending_for_wall(
+        self, symbol: str, strategy_id: str, wall_side: str, wall_id: str
+    ) -> dict | None:
+        return next((trade for trade in self.trades if
+                     str(trade.get("symbol", "")).upper() == symbol.upper()
+                     and trade.get("strategy_id") == strategy_id
+                     and trade.get("wall_side") == wall_side
+                     and trade.get("wall_id") == wall_id
+                     and trade.get("status") == "pending"), None)
+
+    def get_pending_for_strategy(self, symbol: str, strategy_id: str) -> list[dict]:
+        return [trade for trade in self.trades if
+                str(trade.get("symbol", "")).upper() == symbol.upper()
+                and trade.get("strategy_id") == strategy_id
+                and trade.get("status") == "pending"]
+
+    def cancel_pending_not_in_wall_ids(
+        self, symbol: str, strategy_id: str, valid_wall_ids: set[str], reason: str
+    ) -> list[dict]:
+        events = []
+        for trade in self.get_pending_for_strategy(symbol, strategy_id):
+            if trade.get("wall_id") in valid_wall_ids:
+                continue
+            trade.update(
+                status="cancelled",
+                closed_at=datetime.now(timezone.utc),
+                close_reason=reason,
+            )
+            events.append({"event": "ENTRY_CANCELLED", "trade": trade})
+        return events
 
     def find_trade(self, signal_id: str) -> dict | None:
         return next(
@@ -662,6 +739,19 @@ class TradeManager:
         trade.update(status="cancelled", closed_at=datetime.now(timezone.utc), close_reason=reason)
         return [{"event": "ENTRY_CANCELLED", "trade": trade}]
 
+    def cancel_pending_for_plan(
+        self, symbol: str, strategy_id: str, wall_id: str, reason: str
+    ) -> list[dict]:
+        trade = next((item for item in self.trades if
+                      str(item.get("symbol", "")).upper() == symbol.upper()
+                      and item.get("strategy_id") == strategy_id
+                      and item.get("wall_id") == wall_id
+                      and item.get("status") == "pending"), None)
+        if trade is None:
+            return []
+        trade.update(status="cancelled", closed_at=datetime.now(timezone.utc), close_reason=reason)
+        return [{"event": "ENTRY_CANCELLED", "trade": trade}]
+
     def disarm_pending_for_symbol(self, symbol: str) -> None:
         for trade in self.trades:
             if trade["symbol"] == symbol.upper() and trade["status"] == "pending":
@@ -674,8 +764,8 @@ class TradeManager:
 
     def has_matching_pending_plan(self, signal, levels: dict, pair_settings: PairSettings) -> bool:
         data = signal if isinstance(signal, dict) else signal.__dict__
-        existing = self.get_pending_for_slot(
-            data["symbol"], data["strategy_id"], data["wall_side"]
+        existing = self.get_pending_for_wall(
+            data["symbol"], data["strategy_id"], data["wall_side"], data["wall_id"]
         )
         if existing is None:
             return False
@@ -690,6 +780,32 @@ class TradeManager:
             "stake_usdt": float(self.trading_settings.stake_usdt),
         }
         return all(existing.get(key) == value for key, value in expected.items())
+
+    def update_pending_plan(
+        self, signal, levels: dict, pair_settings: PairSettings
+    ) -> dict | None:
+        """Update a still-valid plan in place when its calculated settings change."""
+        data = signal if isinstance(signal, dict) else signal.__dict__
+        trade = self.get_pending_for_wall(
+            data["symbol"], data["strategy_id"], data["wall_side"], data["wall_id"]
+        )
+        if trade is None:
+            return None
+        trade.update({
+            "side": levels["side"],
+            "wall_price": float(data["wall_price"]),
+            "wall_size": float(data["wall_size"]),
+            "wall_ratio": float(data.get("wall_ratio", 0.0)),
+            "entry_price": float(levels["entry_price"]),
+            "stop_loss": float(levels["stop_loss"]),
+            "take_profit": float(levels["take_profit"]),
+            "entry_trigger_direction": levels["entry_trigger_direction"],
+            "leverage": float(pair_settings.leverage or self.trading_settings.leverage),
+            "position_notional_usdt": float(trade["stake_usdt"])
+            * float(pair_settings.leverage or self.trading_settings.leverage),
+            "entry_armed": False,
+        })
+        return trade
 
     def cancel_pending_not_in_wall_set(
         self,
@@ -867,9 +983,9 @@ class TradeManager:
             if trade["symbol"] in self.last_prices
         )
         reserved = sum(
-            trade["stake_usdt"]
+            float(trade["stake_usdt"])
             for trade in self.trades
-            if trade["status"] in {"pending", "open"}
+            if trade["status"] == "open"
         )
         # Entry fees are already deducted from cash when a position opens.
         # Add them back when combining net unrealized trade PnL with cash, so
@@ -881,7 +997,7 @@ class TradeManager:
         return {
             "balance_usdt": self.balance_usdt,
             "equity_usdt": self.balance_usdt + unrealized_profit + outstanding_entry_fees,
-            "available_balance_usdt": self.balance_usdt - reserved,
+            "available_balance_usdt": max(0.0, self.balance_usdt - reserved),
             "reserved_margin_usdt": reserved,
             "unrealized_profit_usdt": unrealized_profit,
             "stake_usdt": self.trading_settings.stake_usdt,

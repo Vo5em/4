@@ -109,6 +109,22 @@ def _delivery_lag_ms(engine: TradingEngine, symbol: str, channel: str,
     if offsets is None:
         offsets = {}
         engine.exchange_clock_offsets_ms = offsets
+    received_monotonic = monotonic()
+    previous_clock = getattr(engine, "exchange_clock_observation", None)
+    if previous_clock is not None:
+        previous_wall_ms, previous_monotonic = previous_clock
+        wall_elapsed_ms = received_at_ms - previous_wall_ms
+        monotonic_elapsed_ms = (received_monotonic - previous_monotonic) * 1000
+        # A wall-clock step invalidates all wall-vs-exchange offset baselines.
+        # Without this reset a forward NTP/manual clock correction permanently
+        # makes every future event appear delayed despite fresh monotonic age.
+        if abs(wall_elapsed_ms - monotonic_elapsed_ms) > 250:
+            offsets.clear()
+            logger.warning(
+                "%s local wall-clock step detected; recalibrating exchange timestamp offsets",
+                symbol.upper(),
+            )
+    engine.exchange_clock_observation = (received_at_ms, received_monotonic)
     key = (symbol.upper(), channel)
     offset = received_at_ms - exchange_timestamp_ms
     baseline = offsets.get(key)
@@ -835,7 +851,7 @@ async def _run_connection(
                 if not price_changed and not needs_reconciliation:
                     continue
                 health = engine.get_market_data_health(symbol)
-                if not health["price_fresh"] or not health["book_synchronized"]:
+                if not health["fresh"]:
                     continue
                 flow = trade_flow.get_flow()
                 pair_settings = engine.pair_settings.get(symbol, pair_settings)
@@ -897,7 +913,7 @@ async def _run_connection(
             # not try to calculate price-relative wall distance with None.
             if (
                 last_price is None
-                or not engine.get_market_data_health(symbol)["price_fresh"]
+                or not engine.get_market_data_health(symbol)["fresh"]
             ):
                 continue
             result = analyze_synced_orderbook(

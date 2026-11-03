@@ -215,9 +215,79 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(plans["sell"]["side"], "short")
         self.assertEqual(plans["buy"]["accounting_version"], 1)
         self.assertEqual(plans["sell"]["accounting_version"], 1)
-        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 60)
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 0)
+        self.assertEqual(engine.trade_manager.get_statistics()["available_balance_usdt"], 1000)
 
-    def test_nearest_wall_replaces_plan_and_unchanged_plan_is_not_recreated(self):
+    def test_pending_plans_have_stable_identity_and_restore_without_duplicates(self):
+        engine, settings = self.make_engine()
+        wall = self.wall("buy", 100, "restart-wall")
+        self.update(engine, 100.5, [wall])
+        original, = engine.trade_manager.get_pending_trades()
+        restored = TradeManager(engine.trading_settings)
+        restored.restore_state(engine.trade_manager.trades, engine.trade_manager.balance_usdt)
+        restarted_engine = TradingEngine(
+            {"ETHUSDT": settings}, engine.trading_settings,
+            trade_manager=restored,
+            enabled_strategies={"ETHUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        restarted_engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        restarted_engine.start()
+        restarted_engine.on_market_update("ETHUSDT", 100.5, [wall], (), [wall])
+        self.assertEqual(len(restored.get_pending_trades()), 1)
+        self.assertEqual(restored.get_pending_trades()[0]["signal_id"], original["signal_id"])
+
+    def test_open_limit_retains_untriggered_pending_but_requires_fresh_cross(self):
+        manager = TradeManager(TradingSettings(
+            stake_usdt=10, initial_balance_usdt=100, max_open_trades=1,
+        ))
+        settings = PairSettings("BTCUSDT")
+        manager.set_pair_settings_for_price_check(settings)
+        manager.on_price("BTCUSDT", 100.2)
+        first = manager.create_trade({
+            "signal_id": "global-a", "strategy_id": "bounce", "symbol": "BTCUSDT",
+            "wall_side": "buy", "wall_price": 100, "wall_id": "global-wall-a",
+            "wall_size": 1000, "wall_ratio": 900, "side": "long",
+            "entry_price": 100.1, "stop_loss": 99.9, "take_profit": 100.4,
+            "entry_trigger_direction": "cross_down", "reference_price": 100.2,
+        }, settings)
+        second = manager.create_trade({
+            "signal_id": "global-b", "strategy_id": "bounce", "symbol": "ETHUSDT",
+            "wall_side": "buy", "wall_price": 100, "wall_id": "global-wall-b",
+            "wall_size": 1000, "wall_ratio": 900, "side": "long",
+            "entry_price": 100.1, "stop_loss": 99.9, "take_profit": 100.4,
+            "entry_trigger_direction": "cross_down", "reference_price": 100.2,
+        }, PairSettings("ETHUSDT"))
+        self.assertEqual(manager.on_price("BTCUSDT", 100.0)[0]["event"], "ENTRY_ACTIVATED")
+        manager.on_price("ETHUSDT", 100.0)
+        self.assertEqual(first["status"], "open")
+        self.assertEqual(second["status"], "pending")
+        self.assertFalse(second["entry_armed"])
+        manager._close_trade(first, 100.0, "test")
+        manager.on_price("ETHUSDT", 100.2)  # safe side arms after the slot is free
+        manager.on_price("ETHUSDT", 100.0)  # a new cross, never a backdated open
+        self.assertEqual(second["status"], "open")
+
+    def test_pending_without_funds_is_rejected_at_entry_without_negative_available_balance(self):
+        manager = TradeManager(TradingSettings(
+            stake_usdt=10, initial_balance_usdt=10, max_open_trades=1,
+        ))
+        settings = PairSettings("BTCUSDT", leverage=25)
+        manager.set_pair_settings_for_price_check(settings)
+        manager.on_price("BTCUSDT", 100.2)
+        pending = manager.create_trade({
+            "signal_id": "funds-late", "strategy_id": "bounce", "symbol": "BTCUSDT",
+            "wall_side": "buy", "wall_price": 100, "wall_id": "funds-wall",
+            "wall_size": 1000, "wall_ratio": 900, "side": "long",
+            "entry_price": 100.1, "stop_loss": 99.9, "take_profit": 100.4,
+            "entry_trigger_direction": "cross_down", "reference_price": 100.2,
+        }, settings)
+        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 10)
+        events = manager.on_price("BTCUSDT", 100.0)
+        self.assertTrue(any(event.get("reason") == "INSUFFICIENT_AVAILABLE_BALANCE" for event in events))
+        self.assertEqual(pending["status"], "pending")
+        self.assertGreaterEqual(manager.get_statistics()["available_balance_usdt"], 0)
+
+    def test_each_qualified_wall_keeps_its_plan_and_unchanged_plans_are_not_recreated(self):
         engine, _ = self.make_engine()
         far = self.wall("buy", 99.0, "far", size=1200)
         near = self.wall("buy", 100.0, "near", size=1300)
@@ -228,12 +298,12 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(len(engine.trade_manager.trades), count)
         self.update(engine, 100.5, [far, near])
         current = engine.trade_manager.get_pending_trades()
-        self.assertEqual(len(current), 1)
-        self.assertEqual(current[0]["wall_id"], "ETHUSDT:buy:100:near")
-        self.assertEqual(first["status"], "cancelled")
-        self.assertEqual(first["close_reason"], "PLAN_REPLACED")
+        self.assertEqual({trade["wall_id"] for trade in current}, {
+            "ETHUSDT:buy:99:far", "ETHUSDT:buy:100:near",
+        })
+        self.assertEqual(first["status"], "pending")
 
-    def test_pending_replacement_is_one_database_batch_and_preserves_reserve(self):
+    def test_adding_wall_persists_only_new_plan_without_changing_old_pending(self):
         engine, _ = self.make_engine()
         repository = self.Repository()
         engine.repository = repository
@@ -257,14 +327,14 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(
             [(row["signal_id"], row["status"], row.get("close_reason"))
              for row in replacement_batch],
-            [(original_pending["signal_id"], "cancelled", "PLAN_REPLACED"),
-             (next(row["trade"]["signal_id"] for row in events
+            [(next(row["trade"]["signal_id"] for row in events
                    if row["event"] == "TRADE_CREATED"), "pending", None)],
         )
         self.assertEqual(repository.trade_batches[-1][1], original_balance)
-        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 30)
+        self.assertEqual(original_pending["status"], "pending")
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 0)
 
-    def test_failed_postgres_replacement_rolls_back_trade_and_reserved_balance(self):
+    def test_failed_postgres_new_plan_rolls_back_without_changing_existing_pending(self):
         engine, _ = self.make_engine()
         repository = self.Repository()
         engine.repository = repository
@@ -286,7 +356,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(restored_pending["signal_id"], original_pending["signal_id"])
         self.assertEqual(restored_pending["wall_id"], original_pending["wall_id"])
         self.assertEqual(engine.trade_manager.balance_usdt, initial_balance)
-        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 30)
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 0)
         self.assertEqual(engine.get_status()["persistence_pending"], 0)
         self.assertEqual(len(repository.trade_batches), 1)
 
@@ -299,9 +369,9 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         bid_pending = engine.trade_manager.get_pending_for_slot(
             "ETHUSDT", BOUNCE_STRATEGY_ID, "buy"
         )
-        ask_old = engine.trade_manager.get_pending_for_slot(
+        ask_old = dict(engine.trade_manager.get_pending_for_slot(
             "ETHUSDT", BOUNCE_STRATEGY_ID, "sell"
-        )
+        ))
         engine.trade_manager.on_price("ETHUSDT", 100.5)
         engine.trade_manager.on_price("ETHUSDT", 100.01)
         self.assertEqual(bid_pending["status"], "open")
@@ -322,7 +392,8 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         ask_new = engine.trade_manager.get_pending_for_slot(
             "ETHUSDT", BOUNCE_STRATEGY_ID, "sell"
         )
-        self.assertEqual(ask_old["status"], "cancelled")
+        self.assertEqual(ask_old["status"], "pending")
+        self.assertEqual(ask_new["signal_id"], ask_old["signal_id"])
         self.assertNotEqual(ask_new["take_profit"], ask_old["take_profit"])
         self.assertAlmostEqual(
             ask_new["take_profit"],
@@ -333,7 +404,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             bid_pending[key] for key in ("entry_price", "stop_loss", "take_profit")
         ), frozen_open_levels)
         self.assertEqual(engine.trade_manager.balance_usdt, original_balance)
-        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 60)
+        self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 30)
 
         run_immediate(runtime.update_pair_settings(
             replace(updated, take_profit_bps=None)
@@ -341,7 +412,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         ask_reset = engine.trade_manager.get_pending_for_slot(
             "ETHUSDT", BOUNCE_STRATEGY_ID, "sell"
         )
-        self.assertNotEqual(ask_reset["signal_id"], ask_new["signal_id"])
+        self.assertEqual(ask_reset["signal_id"], ask_new["signal_id"])
         self.assertAlmostEqual(
             ask_reset["take_profit"],
             float(ask_reset["entry_price"]) * (1 - 5 / 10000),
@@ -356,6 +427,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         wall = self.wall("buy", 100, "global-level-bid")
         self.update(engine, 100.5, [wall])
         old_pending, = engine.trade_manager.get_pending_trades()
+        old_take_profit = old_pending["take_profit"]
         runtime = RuntimeController(engine)
 
         new_settings = run_immediate(runtime.update_trade_level_defaults(
@@ -363,11 +435,11 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         ))
         new_pending, = engine.trade_manager.get_pending_trades()
         self.assertEqual(new_settings.default_take_profit_bps, 12)
-        self.assertNotEqual(new_pending["take_profit"], old_pending["take_profit"])
+        self.assertNotEqual(new_pending["take_profit"], old_take_profit)
         self.assertEqual(len(repository.global_batches), 1)
         self.assertEqual(
             [trade["status"] for trade in repository.global_batches[0][1]],
-            ["cancelled", "pending"],
+            ["pending"],
         )
 
         previous_settings = engine.trading_settings
@@ -407,7 +479,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(pending["status"], "cancelled")
         self.assertEqual(open_trade["status"], "open")
 
-    def test_open_only_limits_block_entry_and_require_safe_return_and_recross(self):
+    def test_pair_open_blocks_and_cancels_crossed_pending_without_backdated_open(self):
         settings = PairSettings("BTCUSDT", max_open_trades=1)
         manager = TradeManager(TradingSettings(
             stake_usdt=10, initial_balance_usdt=100, max_open_trades=1
@@ -428,19 +500,18 @@ class TradingPlanLifecycleTests(unittest.TestCase):
                                            stop_loss=100.05, take_profit=99.99,
                                            entry_trigger_direction="cross_up",
                                            reference_price=100.0, signal_id="b"), settings)
-        # PENDINGs reserve margin, but do not consume OPEN slots.
+        # PENDINGs neither reserve margin nor consume OPEN slots.
         self.assertEqual(len(manager.get_pending_trades()), 2)
+        self.assertEqual(manager.get_statistics()["reserved_margin_usdt"], 0)
         self.assertEqual(manager.on_price("BTCUSDT", 100.0)[0]["event"], "ENTRY_ACTIVATED")
-        # The second plan cannot open while the only slot is occupied.
+        # Since a pair already has OPEN, a crossed PENDING is cancelled.
         blocked = manager.on_price("BTCUSDT", 100.03)
-        self.assertTrue(any(event["event"] == "ENTRY_BLOCKED" for event in blocked))
-        self.assertEqual(second["status"], "pending")
-        self.assertFalse(second["entry_armed"])
+        self.assertTrue(any(event.get("reason") == "ENTRY_BLOCKED_BY_OPEN_TRADE" for event in blocked))
+        self.assertEqual(second["status"], "cancelled")
+        self.assertEqual(second["close_reason"], "ENTRY_BLOCKED_BY_OPEN_TRADE")
         manager._close_trade(first, 100.0, "test")
-        manager.on_price("BTCUSDT", 100.0)  # safe side rearms it
-        self.assertEqual(second["status"], "pending")
-        manager.on_price("BTCUSDT", 100.03)  # fresh ASK cross upward
-        self.assertEqual(second["status"], "open")
+        manager.on_price("BTCUSDT", 100.0)
+        self.assertEqual(second["status"], "cancelled")
 
     def test_restore_disarms_pending_until_a_new_safe_side_and_cross(self):
         pair = PairSettings("BTCUSDT")

@@ -334,6 +334,8 @@ def dashboard_text(runtime: RuntimeController) -> str:
         f"Доходность: {status['total_return_percent']:+.2f}% · "
         f"прибыльных сделок: {status['win_rate_percent']:.1f}%\n"
         f"Доступно для новых сделок: {status['available_balance_usdt']:.2f} USDT\n"
+        f"Зарезервировано маржи по OPEN: {status['reserved_margin_usdt']:.2f} USDT; "
+        "PENDING маржу не резервируют\n"
         f"Победы / убытки: {status['wins']} / {status['losses']} · "
         f"K/D {_format_ratio(status['kd_ratio'], status['wins'])} · "
         f"K/D за 7 дней {_format_ratio(status['weekly_kd_ratio'], status['weekly_wins'])}\n"
@@ -1062,7 +1064,7 @@ def _deal_list_text(runtime: RuntimeController, section: str, page: int) -> tupl
             pnl = manager.trade_unrealized_pnl(trade, price) if price is not None else None
             measure = f"PnL {pnl:+.2f} USDT" if pnl is not None else "PnL нет данных"
         else:
-            measure = f"Entry {float(trade['entry_price']):g} · маржа {float(trade['stake_usdt']):.2f}"
+            measure = f"Entry {float(trade['entry_price']):g} · маржа при входе {float(trade['stake_usdt']):.2f}"
         lines.append(
             f"• <code>{escape(trade['symbol'])}</code> {_strategy_name(trade.get('strategy_id'))} "
             f"{trade.get('side', '').upper()} · {measure}"
@@ -1135,7 +1137,8 @@ def _deal_card(runtime: RuntimeController, trade: dict) -> tuple[str, InlineKeyb
             f"Стабильная стена: {_wall_side_label(trade.get('wall_side', ''))} {float(trade.get('wall_price') or 0):g} · объём {float(trade.get('wall_size') or 0):g} · ratio {float(trade.get('wall_ratio') or 0):g}x",
             f"Расстояние до Entry: {f'{distance:.2f} bps' if distance is not None else 'нет данных'}",
             f"Триггер: {'ARMED' if trade.get('entry_armed') else 'WAITING'} · направление: {escape(str(trade.get('entry_trigger_direction') or 'нет данных'))}",
-            f"Резерв маржи: {float(trade.get('stake_usdt') or 0):.2f} USDT · плечо {float(trade.get('leverage') or 1):g}x",
+            f"Маржа при активации: {float(trade.get('stake_usdt') or 0):.2f} USDT · "
+            f"сейчас не резервируется · плечо {float(trade.get('leverage') or 1):g}x",
             f"Диагностика: reference={trade.get('entry_previous_price') if trade.get('entry_previous_price') is not None else 'нет данных'}; wall_id={escape(str(trade.get('wall_id') or 'нет данных'))}",
         ])
         rows = [[InlineKeyboardButton(text="Отменить план", callback_data=f"deal:confirm_cancel:{_deal_token(trade)}")], [InlineKeyboardButton(text="К PENDING", callback_data="deals:pending:0")]]
@@ -1266,7 +1269,7 @@ async def confirm_cancel_plan(callback: CallbackQuery, runtime: RuntimeControlle
         await edit_message_if_changed(
             callback.message,
             f"Отменить PENDING <code>{escape(str(trade['symbol']))}</code> на стену "
-            f"{float(trade['wall_price']):g}? Резерв маржи освободится. Эта стена не будет "
+            f"{float(trade['wall_price']):g}? Резерв маржи отсутствует, так как план не открыт. Эта стена не будет "
             "снова запланирована в рамках текущего жизненного цикла.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Подтвердить отмену", callback_data=f"deal:cancel:{token}")],

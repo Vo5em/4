@@ -29,6 +29,7 @@ from script.market_data import (
     TickerPriceCursor,
     _update_flow,
     _update_ticker_price,
+    _delivery_lag_ms,
     _fetch_snapshot_while_buffering,
     analyze_synced_orderbook,
     apply_orderbook_delta,
@@ -726,23 +727,27 @@ class WallStrategyTests(unittest.TestCase):
         signals = strategy.evaluate(self.context(strategy, 100.2, 3, [wall, obstacle]))
         self.assertEqual({signal.wall_side for signal in signals}, {"buy", "sell"})
 
-    def test_nearest_stable_support_is_the_only_bounce_signal_candidate(self):
+    def test_all_qualified_stable_supports_are_bounce_signal_candidates(self):
         strategy = BounceStrategy()
         nearest = self.wall("buy", 100.0, "nearest")
         farther = self.wall("buy", 99.98, "farther")
         strategy.evaluate(self.context(strategy, 100.01, 1, [nearest, farther]))
         signals = strategy.evaluate(self.context(strategy, 100.02, 2, [nearest, farther]))
-        self.assertEqual([signal.wall_id for signal in signals], ["BTCUSDT:buy:100:nearest"])
-        self.assertEqual(signals[0].side, "long")
+        self.assertEqual({signal.wall_id for signal in signals}, {
+            "BTCUSDT:buy:100:nearest", "BTCUSDT:buy:99.98:farther",
+        })
+        self.assertTrue(all(signal.side == "long" for signal in signals))
 
-    def test_nearest_stable_resistance_is_the_only_bounce_signal_candidate(self):
+    def test_all_qualified_stable_resistances_are_bounce_signal_candidates(self):
         strategy = BounceStrategy()
         nearest = self.wall("sell", 100.0, "nearest")
         farther = self.wall("sell", 100.02, "farther")
         strategy.evaluate(self.context(strategy, 99.99, 1, [nearest, farther]))
         signals = strategy.evaluate(self.context(strategy, 99.98, 2, [nearest, farther]))
-        self.assertEqual([signal.wall_id for signal in signals], ["BTCUSDT:sell:100:nearest"])
-        self.assertEqual(signals[0].side, "short")
+        self.assertEqual({signal.wall_id for signal in signals}, {
+            "BTCUSDT:sell:100:nearest", "BTCUSDT:sell:100.02:farther",
+        })
+        self.assertTrue(all(signal.side == "short" for signal in signals))
 
     def test_nearest_wall_with_invalid_rr_does_not_fall_through_to_farther_wall(self):
         strategy = BounceStrategy()
@@ -753,16 +758,18 @@ class WallStrategyTests(unittest.TestCase):
         strategy.evaluate(self.context(strategy, 100.01, 1, [nearest, farther, obstacle]))
         signals = strategy.evaluate(self.context(strategy, 100.02, 2, [nearest, farther, obstacle]))
         self.assertEqual({signal.wall_id for signal in signals}, {
-            "BTCUSDT:buy:100:nearest", "BTCUSDT:sell:100.04:obstacle"
+            "BTCUSDT:buy:100:nearest", "BTCUSDT:buy:99.98:farther",
+            "BTCUSDT:sell:100.04:obstacle",
         })
 
-    def test_new_nearer_wall_changes_priority_without_recreating_old_signal(self):
+    def test_new_nearer_wall_is_added_without_removing_old_wall_signal(self):
         strategy = BounceStrategy()
         old = self.wall("buy", 100.0, "old")
         nearer = self.wall("buy", 100.015, "new")
         signals = strategy.evaluate(self.context(strategy, 100.02, 3, [old, nearer]))
-        new_signal, = [signal for signal in signals if signal.wall_side == "buy"]
-        self.assertEqual(new_signal.wall_id, "BTCUSDT:buy:100.015:new")
+        self.assertEqual({signal.wall_id for signal in signals}, {
+            "BTCUSDT:buy:100:old", "BTCUSDT:buy:100.015:new",
+        })
 
     def test_breakout_requires_hold_above_sell_wall_and_levels_are_directional(self):
         strategy = BreakoutStrategy()
@@ -779,13 +786,15 @@ class WallStrategyTests(unittest.TestCase):
         self.assertEqual(signal.side, "short")
         self.assertEqual(signal.entry_trigger_direction, "cross_down")
 
-    def test_breakout_selects_nearest_confirmed_wall_for_each_book_side(self):
+    def test_breakout_signals_each_qualified_wall_for_book_side(self):
         strategy = BreakoutStrategy()
         farther = self.wall("sell", 100.04, "farther")
         nearer = self.wall("sell", 100.02, "nearer")
         signals = strategy.evaluate(self.context(strategy, 100.01, 6.1, [farther, nearer]))
-        self.assertEqual([signal.wall_id for signal in signals], ["BTCUSDT:sell:100.02:nearer"])
-        self.assertEqual(signals[0].side, "long")
+        self.assertEqual({signal.wall_id for signal in signals}, {
+            "BTCUSDT:sell:100.04:farther", "BTCUSDT:sell:100.02:nearer",
+        })
+        self.assertTrue(all(signal.side == "long" for signal in signals))
 
     def test_breakout_cancelled_when_price_falls_back_or_wall_is_removed(self):
         strategy = BreakoutStrategy()
@@ -929,7 +938,7 @@ class WallStrategyTests(unittest.TestCase):
 
     def test_distinct_pair_signals_are_not_blocked_by_open_trade_caps(self):
         manager = TradeManager(TradingSettings(
-            stake_usdt=10, initial_balance_usdt=100, max_open_trades=1
+            stake_usdt=10, initial_balance_usdt=100, max_open_trades=2
         ))
         btc = {
             "strategy_id": "bounce", "symbol": "BTCUSDT", "wall_side": "buy",
@@ -967,16 +976,15 @@ class WallStrategyTests(unittest.TestCase):
         self.assertTrue(side_condition["passed"])
         self.assertTrue(trace["signal_formed"])
 
-    def test_signal_forming_for_non_nearest_wall_is_reported_as_strategy_rejection(self):
+    def test_signal_forming_for_each_qualified_wall_is_accepted(self):
         strategy = BounceStrategy()
         near = self.wall(price=100, identity="near")
         far = self.wall(price=99.998, identity="far")
         signals, traces = strategy.evaluate_with_diagnostics(self.context(strategy, 100.005, 1, [near, far]))
-        self.assertEqual(len(signals), 1)
+        self.assertEqual(len(signals), 2)
         far_trace = next(trace for trace in traces if trace["wall_id"].endswith(":far"))
-        self.assertFalse(far_trace["signal_formed"])
-        self.assertFalse(far_trace["signal_accepted"])
-        self.assertIn("более близкая", far_trace["reasons"][-1])
+        self.assertTrue(far_trace["signal_formed"])
+        self.assertTrue(far_trace["signal_accepted"])
 
 
 class StrategyPipelineTests(unittest.TestCase):
@@ -1621,7 +1629,7 @@ class DealManagerTelegramTests(unittest.TestCase):
         self.assertIn("MAKER_MAKER_SIMULATION", open_text)
         self.assertIn("применено 0.0360% на вход/выход", open_text)
         self.assertIn("PENDING", pending_text)
-        self.assertIn("Резерв маржи", pending_text)
+        self.assertIn("не резервируется", pending_text)
         self.assertIn("ARMED", pending_text)
         self.assertLessEqual(len(open_text), 4096)
         self.assertLessEqual(len(pending_text), 4096)
@@ -2094,8 +2102,8 @@ class VirtualTradeTests(unittest.TestCase):
         # A pending trade reserves its stake only; it does not remove margin
         # from cash or reserve leveraged notional.
         self.assertEqual(self.manager.balance_usdt, 100)
-        self.assertEqual(self.manager.get_statistics()["reserved_margin_usdt"], 60)
-        self.assertEqual(self.manager.get_statistics()["available_balance_usdt"], 40)
+        self.assertEqual(self.manager.get_statistics()["reserved_margin_usdt"], 0)
+        self.assertEqual(self.manager.get_statistics()["available_balance_usdt"], 100)
 
         self.manager.on_price("BTCUSDT", 100)
         self.manager.on_price("ETHUSDT", 100)
@@ -2346,13 +2354,13 @@ class EngineControlTests(unittest.TestCase):
         }, settings)
         engine = TradingEngine({"BTCUSDT": settings}, manager.trading_settings,
                                trade_manager=manager, repository=repository)
-        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 90)
+        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 100)
         repository.fail_trade_saves = True
         with self.assertRaisesRegex(RuntimeError, "восстановлено"):
             run_immediate(engine.cancel_pending_trade(trade["signal_id"]))
         trade = manager.find_trade("manual-pending-1")
         self.assertEqual(trade["status"], "pending")
-        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 90)
+        self.assertEqual(manager.get_statistics()["available_balance_usdt"], 100)
 
         repository.fail_trade_saves = False
         run_immediate(engine.cancel_pending_trade(trade["signal_id"]))
@@ -2639,6 +2647,41 @@ class EngineControlTests(unittest.TestCase):
 
 
 class MarketFreshnessTests(unittest.TestCase):
+    def test_low_reported_age_and_synced_book_exposes_generation_failure(self):
+        engine = self.make_engine()
+        self.record_market_health(engine, received_age=0.25, generation=1)
+        engine.mark_orderbook_unsynchronized("BTCUSDT", generation=2)
+        # Model a synchronized new book generation before this connection has
+        # emitted a fresh ticker update.
+        engine.record_orderbook_market_data(
+            "BTCUSDT", message_time_ms=int(time() * 1000),
+            cts_ms=int(time() * 1000), sequence=2, update_id=2,
+            received_monotonic=monotonic(), received_at=datetime.now(timezone.utc),
+            delivery_lag_ms=0, synchronized=True, generation=2,
+        )
+        health = engine.get_market_data_health("BTCUSDT")
+        self.assertLess(health["price_age_seconds"], 1.0)
+        self.assertLess(health["book_age_seconds"], 1.0)
+        self.assertTrue(health["book_synchronized"])
+        self.assertIn("PRICE_GENERATION_MISMATCH", health["freshness_failures"])
+        self.assertIn(
+            "PRICE_GENERATION_MISMATCH",
+            engine.get_entry_block_reason("BTCUSDT"),
+        )
+
+    def test_exchange_delivery_lag_baseline_recalibrates_after_local_clock_step(self):
+        engine = SimpleNamespace(exchange_clock_offsets_ms={})
+        with (
+            patch("script.market_data.monotonic", side_effect=[100.0, 100.1]),
+        ):
+            first = _delivery_lag_ms(engine, "BTCUSDT", "tickers", 9000, 10000)
+            after_clock_step = _delivery_lag_ms(
+                engine, "BTCUSDT", "tickers", 10100, 13100
+            )
+        self.assertEqual(first, 0)
+        self.assertEqual(after_clock_step, 0)
+        self.assertEqual(engine.exchange_clock_offsets_ms[("BTCUSDT", "tickers")], 3000)
+
     @staticmethod
     def make_engine():
         class SignalStrategy:
