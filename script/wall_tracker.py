@@ -146,8 +146,18 @@ class WallTracker:
             is_qualified = candidate is not None
             if was_qualified and not is_qualified:
                 self.qualification_transitions["lost"] += 1
+                # A wall that stops passing the Scanner is no longer in a
+                # continuous stable qualification cycle. Keep its durable
+                # lifecycle identity, but restart the stability clock.
+                wall["first_seen"] = now
+                if wall["status"] == "stable":
+                    wall["status"] = "candidate"
             elif not was_qualified and is_qualified:
                 self.qualification_transitions["restored"] += 1
+                # Qualification must remain continuously valid for the full
+                # stability interval before the same wall can signal again.
+                wall["first_seen"] = now
+                wall["status"] = "candidate"
             wall["qualifies"] = is_qualified
             if candidate is not None:
                 wall["wall_ratio"] = candidate.get("wall_ratio", wall["wall_ratio"])

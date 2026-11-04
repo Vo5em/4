@@ -183,7 +183,8 @@ def _wall_plan_signals(
         trace["conditions"].extend((
             {"condition": "stable_wall_age", "passed": age_ok,
              "actual_seconds": age, "threshold_seconds": minimum_age},
-            {"condition": "wall_on_valid_side_of_price", "passed": side_ok,
+            {"condition": "wall_position_relative_to_price", "passed": True,
+             "informational_valid_side": side_ok,
              "actual_wall_price": price, "current_price": context.last_price},
             {"condition": "max_wall_distance_bps", "passed": distance_ok,
              "actual_bps": distance_bps,
@@ -191,8 +192,6 @@ def _wall_plan_signals(
         ))
         if not age_ok:
             trace["reasons"].append("Стена ещё не достигла минимального стабильного возраста.")
-        elif not side_ok:
-            trace["reasons"].append("BID должен быть ниже цены, ASK — выше цены.")
         elif not distance_ok:
             trace["reasons"].append("Стена находится дальше допустимой дистанции поиска.")
         else:
@@ -210,7 +209,10 @@ def _wall_plan_signals(
         trigger = "cross_down" if side == "buy" else "cross_up"
         trace["signal_formed"] = True
         trace["signal_accepted"] = True
-        trace["reasons"].append("Подходящая стабильная стена выбрана; создан план ожидания Entry.")
+        trace["reasons"].append(
+            "Квалифицированная стабильная стена выбрана; положение Last Price "
+            "относительно стены не отменяет план ожидания Entry."
+        )
         signals.append(TradeSignal(
             strategy_id=strategy_id, symbol=context.symbol, wall_side=side,
             wall_price=float(wall["price"]), wall_id=wall_id,

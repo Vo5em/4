@@ -1661,7 +1661,20 @@ class TradingEngine:
         strategy_ids = self.enabled_strategies.get(
             symbol, self._default_enabled_strategies
         )
-        eligible_plan_keys: set[tuple[str, str]] = set()
+        stable_wall_ids = {
+            _wall_id(symbol, wall) for wall in stable_walls
+        }
+        # Existing plans stay bound to their own stable wall. Strategy signals
+        # describe newly eligible plans, but are not proof that another wall
+        # has disappeared or lost Scanner qualification.
+        for trade in self.trade_manager.trades:
+            if (
+                trade.get("symbol") == symbol
+                and trade.get("status") == "pending"
+                and trade.get("strategy_id") in strategy_ids
+                and trade.get("wall_id") in stable_wall_ids
+            ):
+                eligible_pending_ids.add(trade["signal_id"])
         consumed_walls = [event for event in wall_events if event.get("event") == "CONSUMED"]
         rows = self._prepare_planner_wall_rows(
             symbol, stable_walls, strategy_ids, consumed_walls
@@ -1720,12 +1733,6 @@ class TradingEngine:
                 requires_bybit_tick = strategy.strategy_id in {"bounce", "breakout"}
                 if requires_bybit_tick and (tick_size is None or tick_size <= 0):
                     trade_rejections.append("Не получен tickSize Bybit; уровни плана не рассчитаны.")
-                    if existing is not None:
-                        trade = self.trade_manager.cancel_pending_for_plan(
-                            symbol, strategy.strategy_id, signal.wall_id,
-                            "TICK_SIZE_UNAVAILABLE",
-                        )
-                        events.extend(trade)
                     continue
                 if strategy.strategy_id in {"bounce", "breakout"}:
                     take_profit_bps, stop_loss_bps = effective_trade_level_bps(
@@ -1743,11 +1750,6 @@ class TradingEngine:
                     except ValueError as error:
                         reason = f"Уровни невалидны: {error}"
                         trade_rejections.append(reason)
-                        if existing is not None:
-                            events.extend(self.trade_manager.cancel_pending_for_plan(
-                                symbol, strategy.strategy_id, signal.wall_id,
-                                "INVALID_TRADE_LEVELS",
-                            ))
                         self._record_trade_plan_result(
                             symbol, signal.wall_id, strategy.strategy_id, None, reason
                         )
@@ -1770,7 +1772,6 @@ class TradingEngine:
                     )
                     continue
                 valid_wall_ids.add(signal.wall_id)
-                eligible_plan_keys.add((strategy.strategy_id, signal.wall_id))
                 if self.trade_manager.has_matching_pending_plan(signal, levels, settings):
                     if existing is not None:
                         eligible_pending_ids.add(existing["signal_id"])
@@ -1869,7 +1870,7 @@ class TradingEngine:
             else:
                 reconciliation["snapshot"] = "complete synchronized scanner result"
                 for pending_trade in pending_for_strategy:
-                    if pending_trade.get("wall_id") in valid_wall_ids:
+                    if pending_trade.get("wall_id") in stable_wall_ids:
                         continue
                     detail = self._pending_wall_cancel_diagnostic(
                         symbol, pending_trade, strategy.strategy_id,
@@ -1898,7 +1899,9 @@ class TradingEngine:
                         continue
                     cancel_events = self.trade_manager.cancel_pending_for_plan(
                         symbol, strategy.strategy_id, pending_trade["wall_id"],
-                        "NO_STABLE_WALL" if not stable_walls else "WALL_NO_LONGER_QUALIFIES",
+                        "NO_STABLE_WALL"
+                        if internal_reason == "WALL_MISSING_FROM_SNAPSHOT"
+                        else "WALL_NO_LONGER_QUALIFIES",
                     )
                     if not cancel_events:
                         continue
@@ -1976,7 +1979,8 @@ class TradingEngine:
                     trade["signal_id"] for trade in self.trade_manager.trades
                     if trade.get("symbol") == symbol
                     and trade.get("status") == "pending"
-                    and (trade.get("strategy_id"), trade.get("wall_id")) in eligible_plan_keys
+                    and trade.get("strategy_id") in strategy_ids
+                    and trade.get("wall_id") in stable_wall_ids
                 }
             else:
                 # A partial scanner result cannot revoke the last complete

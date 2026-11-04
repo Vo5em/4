@@ -205,11 +205,18 @@ class TradeManager:
             and str(trade.get("symbol", "")).upper() == symbol
             and trade.get("strategy_id") == strategy_id
             and trade.get("wall_side") == wall_side
-            and trade.get("status") in {"pending", "open", "closed"}
+            and (
+                trade.get("status") in {"pending", "open", "closed"}
+                or (
+                    trade.get("status") == "cancelled"
+                    and trade.get("close_reason") == "ENTRY_BLOCKED_BY_OPEN_TRADE"
+                )
+            )
             for trade in self.trades
         ):
             self.last_create_rejection_reason = (
-                "Эта стена уже использовалась указанной парой и стратегией."
+                "Эта стена уже использовалась указанной парой и стратегией "
+                "либо была заблокирована занятым OPEN-слотом."
             )
             return None
 

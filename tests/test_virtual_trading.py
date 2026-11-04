@@ -236,6 +236,35 @@ class WallTrackerTests(unittest.TestCase):
         tracker.update([tracked], book, {})
         self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
 
+    def test_qualification_loss_restarts_stability_clock_without_changing_wall_id(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=40)
+        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0}
+        tracker.update([tracked], book, {})
+        state = tracker.walls[("buy", 100.0)]
+        state["first_seen"] = monotonic() - 41
+        tracker.update([tracked], book, {})
+        original_identity = state["first_seen_at"]
+        self.assertEqual(len(tracker.get_stable_walls()), 1)
+
+        # A complete Scanner update no longer qualifies the existing level.
+        tracker.update([], book, {})
+        self.assertEqual(state["status"], "candidate")
+        self.assertFalse(state["qualifies"])
+        self.assertEqual(tracker.get_stable_walls(), [])
+
+        # Qualification returning starts a new full stable interval, while
+        # preserving identity for history and plan deduplication.
+        tracker.update([tracked], book, {})
+        self.assertEqual(state["status"], "candidate")
+        self.assertTrue(state["qualifies"])
+        self.assertEqual(state["first_seen_at"], original_identity)
+        self.assertEqual(tracker.get_stable_walls(), [])
+        state["first_seen"] = monotonic() - 41
+        tracker.update([tracked], book, {})
+        self.assertEqual(tracker.get_stable_walls()[0]["first_seen_at"], original_identity)
+
     def test_candidate_disappearing_before_forty_seconds_never_becomes_stable(self):
         book = LocalOrderBook()
         book.bids[100.0] = 100.0
@@ -789,10 +818,11 @@ class WallStrategyTests(unittest.TestCase):
         self.assertEqual(signal.side, "long")
         self.assertEqual(signal.entry_trigger_direction, "cross_up")
 
-    def test_breakout_below_buy_wall_is_short_and_single_touch_is_not_enough(self):
+    def test_breakout_buy_wall_remains_plan_eligible_after_price_moves_below_it(self):
         strategy = BreakoutStrategy()
         wall = self.wall("buy")
-        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 1, [wall])), [])
+        signal, = strategy.evaluate(self.context(strategy, 99.99, 1, [wall]))
+        self.assertEqual(signal.side, "short")
         signal, = strategy.evaluate(self.context(strategy, 100.01, 2, [wall]))
         self.assertEqual(signal.side, "short")
         self.assertEqual(signal.entry_trigger_direction, "cross_down")
@@ -983,9 +1013,16 @@ class WallStrategyTests(unittest.TestCase):
             self.context(strategy, 100.046, 1, [wall])
         )
         trace = traces[0]
-        side_condition = next(c for c in trace["conditions"] if c["condition"] == "wall_on_valid_side_of_price")
+        side_condition = next(c for c in trace["conditions"] if c["condition"] == "wall_position_relative_to_price")
         self.assertTrue(side_condition["passed"])
+        self.assertTrue(side_condition["informational_valid_side"])
         self.assertTrue(trace["signal_formed"])
+
+        crossed_wall_signals, crossed_wall_traces = strategy.evaluate_with_diagnostics(
+            self.context(strategy, 100.06, 2, [wall])
+        )
+        self.assertEqual(len(crossed_wall_signals), 1)
+        self.assertFalse(crossed_wall_traces[0]["conditions"][1]["informational_valid_side"])
 
     def test_signal_forming_for_each_qualified_wall_is_accepted(self):
         strategy = BounceStrategy()
