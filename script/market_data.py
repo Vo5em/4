@@ -453,6 +453,10 @@ def analyze_synced_orderbook(
         age_seconds = max(0.0, observed_at - float(wall.get("first_seen", observed_at)))
         stability_seconds = max(40.0, pair_settings.min_wall_age_seconds)
         tracked_walls.append({
+            "wall_id": (
+                f"{pair_settings.symbol.upper()}:{wall['side']}:{float(wall['price']):.12g}:"
+                f"{wall.get('first_seen_at', wall.get('first_seen', 'unknown'))}"
+            ),
             "side": wall["side"],
             "price": float(wall["price"]),
             "notional": current_notional,
@@ -473,6 +477,7 @@ def analyze_synced_orderbook(
         "wall_events": wall_events,
         "stable_walls": stable_walls,
         "tracked_walls": tracked_walls,
+        "qualification_transitions": dict(wall_tracker.qualification_transitions),
     }
 
 

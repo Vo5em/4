@@ -141,6 +141,7 @@ class TradingEngine:
         self.entry_event_receive_cutoff: dict[str, float] = {}
         self.market_reconciliation_required: set[str] = set()
         self._stale_data_warning_at: dict[str, float] = {}
+        self._planner_reconcile_log_at: dict[str, float] = {}
         self.market_analysis = {
             symbol: {
                 "potential_wall_count": None,
@@ -386,6 +387,39 @@ class TradingEngine:
         if not result.get("nearby_levels"):
             rejected["no_levels_within_search_distance"] = 1
         stable = result.get("stable_walls", [])
+        tracked_by_id = {
+            item.get("wall_id"): dict(item)
+            for item in tracked if item.get("wall_id")
+        }
+        scanner = result.get("scanner_diagnostics", {}) or {}
+        side_medians = scanner.get("side_medians", {}) or {}
+        level_diagnostics = {}
+        settings = self.pair_settings.get(symbol)
+        if settings is not None:
+            for level in result.get("nearby_levels", []):
+                side = level.get("side")
+                price = float(level.get("price", 0.0))
+                notional = price * float(level.get("quantity", 0.0))
+                median_notional = side_medians.get(side)
+                ratio = (
+                    notional / float(median_notional)
+                    if median_notional is not None and float(median_notional) > 0
+                    else None
+                )
+                if notional < settings.min_wall_notional_usdt:
+                    rejection = "WALL_BELOW_NOTIONAL"
+                elif ratio is None:
+                    rejection = "WALL_RATIO_UNAVAILABLE"
+                elif ratio < settings.min_wall_ratio:
+                    rejection = "WALL_BELOW_RATIO"
+                else:
+                    rejection = None
+                level_diagnostics[f"{side}:{price:.12g}"] = {
+                    "side": side, "price": price, "notional": notional,
+                    "median_notional": median_notional, "wall_ratio": ratio,
+                    "distance_bps": float(level.get("distance_bps", 0.0)),
+                    "rejection": rejection,
+                }
         if not result.get("nearby_levels"):
             reason = "Нет уровней в дистанции поиска."
         elif not result.get("candidates"):
@@ -405,6 +439,11 @@ class TradingEngine:
             "stable_count": len(stable),
             "rejected": rejected,
             "scanner_diagnostics": result.get("scanner_diagnostics", {}),
+            "tracked_walls_by_id": tracked_by_id,
+            "wall_level_diagnostics": level_diagnostics,
+            "qualification_transitions": dict(
+                result.get("qualification_transitions", {"lost": 0, "restored": 0})
+            ),
             "scanner_filters": {
                 "min_wall_ratio": self.pair_settings[symbol].min_wall_ratio,
                 "min_wall_notional_usdt": self.pair_settings[symbol].min_wall_notional_usdt,
@@ -544,6 +583,109 @@ class TradingEngine:
                     strategy["trade_planner_reason"] = rejection_reason or "TradeManager отклонил сигнал без причины."
                     strategy.setdefault("reasons", []).append(strategy["trade_planner_reason"])
                 return
+
+    def _pending_wall_cancel_diagnostic(
+        self, symbol: str, trade: dict, strategy_id: str,
+        stable_walls, wall_events, wall_candidates, last_price: float,
+    ) -> dict:
+        """Classify why one plan no longer matches a complete scanner snapshot."""
+        wall_id = str(trade.get("wall_id") or "")
+        diagnostics = self.wall_diagnostics.get(symbol, {})
+        side = trade.get("wall_side")
+        price = float(trade.get("wall_price") or 0.0)
+        level_info = (diagnostics.get("wall_level_diagnostics") or {}).get(
+            f"{side}:{price:.12g}", {}
+        )
+        settings = self.pair_settings.get(symbol)
+        distance_bps = (
+            abs(float(last_price) - price) / float(last_price) * 10000
+            if last_price > 0 and price > 0 else None
+        )
+        stable_by_id = {
+            _wall_id(symbol, wall): wall for wall in stable_walls
+        }
+        stable_wall = stable_by_id.get(wall_id)
+        tracked = (diagnostics.get("tracked_walls_by_id") or {}).get(wall_id)
+        if stable_wall is not None:
+            planner_row = next((
+                row for row in diagnostics.get("planner_wall_decisions", [])
+                if row.get("wall_id") == wall_id
+            ), {})
+            trace = next((
+                item for item in planner_row.get("strategies", [])
+                if item.get("strategy_id") == strategy_id
+            ), {})
+            conditions = {
+                item.get("condition"): item
+                for item in trace.get("conditions", [])
+            }
+            if conditions.get("max_wall_distance_bps", {}).get("passed") is False:
+                reason = "WALL_OUT_OF_DISTANCE"
+            elif conditions.get("wall_on_valid_side_of_price", {}).get("passed") is False:
+                reason = "WALL_WRONG_SIDE_OF_PRICE"
+            elif conditions.get("stable_wall_age", {}).get("passed") is False:
+                reason = "WALL_LOST_STABLE_STATUS"
+            else:
+                reason = "WALL_ID_MISMATCH"
+            return {
+                "reason": reason, "stable_wall": stable_wall, "tracked": tracked,
+                "level": level_info, "distance_bps": distance_bps,
+                "max_distance_bps": settings.max_wall_distance_bps if settings else None,
+                "minimum_wall_ratio": settings.min_wall_ratio if settings else None,
+                "minimum_notional_usdt": settings.min_wall_notional_usdt if settings else None,
+            }
+
+        removed = any(
+            event.get("event") in {"REMOVED", "CONSUMED"}
+            and _wall_id(symbol, event) == wall_id
+            for event in wall_events
+        )
+        if removed:
+            return {"reason": "WALL_MISSING_FROM_SNAPSHOT", "tracked": tracked}
+
+        candidate_is_present = any(
+            item.get("side") == side
+            and Decimal(str(item.get("price"))) == Decimal(str(price))
+            for item in (wall_candidates or ())
+        )
+        # A reconnect rebuilds the tracker stability timer from a fresh full
+        # book. Preserve the old plan while the same qualifying level is a
+        # candidate, but keep it disarmed until it becomes STABLE again.
+        if (
+            candidate_is_present and tracked is not None
+            and tracked.get("status") == "CANDIDATE"
+            and tracked.get("qualifies")
+        ):
+            return {"reason": "WALL_RESTABILIZING", "tracked": tracked,
+                    "preserve": True}
+
+        if (distance_bps is not None and settings is not None
+                and distance_bps > settings.max_wall_distance_bps):
+            reason = "WALL_OUT_OF_DISTANCE"
+        else:
+            level = level_info
+            reason = level.get("rejection")
+            if reason is None and tracked is not None and not tracked.get("qualifies", True):
+                notional = float(tracked.get("notional") or 0.0)
+                if settings is not None and notional < settings.min_wall_notional_usdt:
+                    reason = "WALL_BELOW_NOTIONAL"
+                else:
+                    ratio = level.get("wall_ratio", tracked.get("wall_ratio"))
+                    if ratio is not None and settings is not None and float(ratio) < settings.min_wall_ratio:
+                        reason = "WALL_BELOW_RATIO"
+                    else:
+                        reason = "WALL_LOST_STABLE_STATUS"
+            if reason is None:
+                reason = "WALL_MISSING_FROM_SNAPSHOT"
+        return {
+            "reason": reason,
+            "tracked": tracked,
+            "level": level_info,
+            "distance_bps": distance_bps,
+            "max_distance_bps": settings.max_wall_distance_bps if settings else None,
+            "minimum_wall_ratio": settings.min_wall_ratio if settings else None,
+            "minimum_notional_usdt": settings.min_wall_notional_usdt if settings else None,
+        }
 
     @staticmethod
     def _summarize_strategy_rejections(wall_rows: list[dict]) -> str:
@@ -1358,10 +1500,9 @@ class TradingEngine:
             )
         if settings is not None:
             self.trade_manager.set_pair_settings_for_price_check(settings)
-        eligible_pending_ids = {
-            trade["signal_id"] for trade in self.trade_manager.trades
-            if trade["symbol"] == symbol and trade["status"] == "pending"
-        }
+        # A pending entry is eligible for price-trigger processing only after
+        # its exact stable wall was accepted by an enabled strategy this tick.
+        eligible_pending_ids = set()
         if confirmed_price_update:
             for trade in self.trade_manager.trades:
                 if trade["symbol"] == symbol and trade["status"] in {"pending", "open"}:
@@ -1598,6 +1739,8 @@ class TradingEngine:
                     continue
                 valid_wall_ids.add(signal.wall_id)
                 if self.trade_manager.has_matching_pending_plan(signal, levels, settings):
+                    if existing is not None:
+                        eligible_pending_ids.add(existing["signal_id"])
                     self._record_trade_plan_result(
                         symbol, signal.wall_id, strategy.strategy_id, existing, None
                     )
@@ -1611,8 +1754,12 @@ class TradingEngine:
                             symbol, signal.wall_id, strategy.strategy_id, updated, None
                         )
                     continue
+                plan_generation = self.trade_manager.next_requalified_plan_generation(
+                    symbol, strategy.strategy_id, wall_side, signal.wall_id
+                )
                 stable_key = "|".join((
                     symbol, strategy.strategy_id, wall_side, signal.wall_id,
+                    str(plan_generation),
                 ))
                 plan_id = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:32]
                 payload = {
@@ -1653,10 +1800,134 @@ class TradingEngine:
                     )
                 else:
                     trade_rejections.append(rejection_reason or "TradeManager отклонил план без причины.")
-            reason = "NO_STABLE_WALL" if not stable_walls else "WALL_NO_LONGER_QUALIFIES"
-            events.extend(self.trade_manager.cancel_pending_not_in_wall_ids(
-                symbol, strategy.strategy_id, valid_wall_ids, reason
-            ))
+            reconciliation = {
+                "stable_count": len(stable_walls),
+                "candidate_count": len(wall_candidates) if wall_candidates is not None else None,
+                "strategy_eligible_count": len(valid_wall_ids),
+                "pending_before": len(self.trade_manager.get_pending_for_strategy(
+                    symbol, strategy.strategy_id
+                )),
+                "cancelled": 0,
+                "preserved_revalidating": 0,
+                "cancel_reasons": {},
+            }
+            pending_for_strategy = self.trade_manager.get_pending_for_strategy(
+                symbol, strategy.strategy_id
+            )
+            if wall_candidates is None:
+                for pending_trade in pending_for_strategy:
+                    removal_seen = any(
+                        event.get("event") in {"REMOVED", "CONSUMED"}
+                        and _wall_id(symbol, event) == pending_trade.get("wall_id")
+                        for event in wall_events
+                    )
+                    if removal_seen:
+                        cancel_events = self.trade_manager.cancel_pending_for_plan(
+                            symbol, strategy.strategy_id, pending_trade["wall_id"],
+                            "NO_STABLE_WALL",
+                        )
+                        for event in cancel_events:
+                            event["diagnostic_reason"] = "WALL_MISSING_FROM_SNAPSHOT"
+                        events.extend(cancel_events)
+                        reconciliation["cancelled"] += len(cancel_events)
+                        if cancel_events:
+                            reconciliation["cancel_reasons"]["WALL_MISSING_FROM_SNAPSHOT"] = 1
+                reconciliation["snapshot"] = "unavailable; cancellation skipped"
+            else:
+                reconciliation["snapshot"] = "complete synchronized scanner result"
+                for pending_trade in pending_for_strategy:
+                    if pending_trade.get("wall_id") in valid_wall_ids:
+                        continue
+                    detail = self._pending_wall_cancel_diagnostic(
+                        symbol, pending_trade, strategy.strategy_id,
+                        stable_walls, wall_events, wall_candidates, last_price,
+                    )
+                    internal_reason = detail["reason"]
+                    if detail.get("preserve"):
+                        eligible_pending_ids.discard(pending_trade["signal_id"])
+                        if pending_trade.get("entry_armed"):
+                            pending_trade["entry_armed"] = False
+                            pending_trade["entry_previous_price"] = float(last_price)
+                            events.append({
+                                "event": "PENDING_REVALIDATING",
+                                "trade": pending_trade,
+                                "reason": "WALL_RESTABILIZING",
+                            })
+                        reconciliation["preserved_revalidating"] += 1
+                        continue
+                    # This check is a second safety boundary: never cancel a
+                    # plan from a partial/old book even if an upstream caller
+                    # accidentally supplied an empty list.
+                    current_health = self.get_market_data_health(symbol)
+                    if self._has_market_data_metadata(symbol) and not current_health["fresh"]:
+                        eligible_pending_ids.discard(pending_trade["signal_id"])
+                        reconciliation["snapshot"] = "stale or unsynchronized; cancellation skipped"
+                        continue
+                    cancel_events = self.trade_manager.cancel_pending_for_plan(
+                        symbol, strategy.strategy_id, pending_trade["wall_id"],
+                        "NO_STABLE_WALL" if not stable_walls else "WALL_NO_LONGER_QUALIFIES",
+                    )
+                    if not cancel_events:
+                        continue
+                    reconciliation["cancelled"] += 1
+                    reconciliation["cancel_reasons"][internal_reason] = (
+                        reconciliation["cancel_reasons"].get(internal_reason, 0) + 1
+                    )
+                    cancel_events[0]["diagnostic_reason"] = internal_reason
+                    cancel_events[0]["diagnostic"] = detail
+                    events.extend(cancel_events)
+            diagnostics = self.wall_diagnostics.setdefault(symbol, {})
+            diagnostics["planner_reconciliation"] = reconciliation
+            if reconciliation["cancelled"] or reconciliation["preserved_revalidating"]:
+                now = monotonic()
+                last_log = self._planner_reconcile_log_at.get(symbol, 0.0)
+                if now - last_log >= 30:
+                    examples = []
+                    for pending_trade in pending_for_strategy:
+                        event = next((item for item in events
+                                      if item.get("event") == "ENTRY_CANCELLED"
+                                      and item.get("trade") is pending_trade), None)
+                        if event is None:
+                            continue
+                        detail = event.get("diagnostic", {})
+                        wall = detail.get("stable_wall") or detail.get("tracked") or {}
+                        level = detail.get("level") or {}
+                        age_seconds = None
+                        created_at = pending_trade.get("created_at")
+                        if isinstance(created_at, datetime):
+                            if created_at.tzinfo is None:
+                                created_at = created_at.replace(tzinfo=timezone.utc)
+                            age_seconds = max(0.0, (self._utc_now() - created_at).total_seconds())
+                        examples.append(
+                            f"id={pending_trade.get('wall_id')} side={pending_trade.get('wall_side')} "
+                            f"price={pending_trade.get('wall_price')} pending_age={age_seconds}s "
+                            f"wall_age={wall.get('age_seconds', wall.get('age'))}s "
+                            f"ratio={level.get('wall_ratio', wall.get('wall_ratio'))}/"
+                            f"{detail.get('minimum_wall_ratio')} notional="
+                            f"{level.get('notional', wall.get('notional'))}/"
+                            f"{detail.get('minimum_notional_usdt')} distance="
+                            f"{detail.get('distance_bps')}/{detail.get('max_distance_bps')}bps "
+                            f"stable={bool(detail.get('stable_wall'))} "
+                            f"reason={event.get('diagnostic_reason')}"
+                        )
+                        if len(examples) >= 3:
+                            break
+                    health = self.get_market_data_health(symbol)
+                    logger.warning(
+                        "%s planner wall reconciliation strategy=%s stable=%d candidates=%s "
+                        "eligible=%d pending=%d created=%d cancelled=%d preserved_revalidating=%d "
+                        "reasons=%s source=%s generation=%s examples=%s",
+                        symbol, strategy.strategy_id, reconciliation["stable_count"],
+                        reconciliation["candidate_count"],
+                        reconciliation["strategy_eligible_count"],
+                        reconciliation["pending_before"], trades_created,
+                        reconciliation["cancelled"],
+                        reconciliation["preserved_revalidating"],
+                        reconciliation["cancel_reasons"],
+                        "synchronized_orderbook" if health.get("book_synchronized") else "unavailable",
+                        health.get("connection_generation"), examples,
+                    )
+                    self._planner_reconcile_log_at[symbol] = now
         if confirmed_price_update:
             events.extend(self.trade_manager.on_price(
                 symbol, last_price, process_open=False,

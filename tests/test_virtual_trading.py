@@ -200,6 +200,17 @@ class FakeTask:
 
 
 class WallTrackerTests(unittest.TestCase):
+    def test_wall_qualification_transition_counts_measure_filter_flapping(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=0)
+        wall = {"side": "buy", "price": 100.0, "notional": 10000.0}
+        tracker.update([wall], book, {})
+        tracker.update([], book, {})
+        tracker.update([wall], book, {})
+        tracker.update([], book, {})
+        self.assertEqual(tracker.qualification_transitions, {"lost": 2, "restored": 1})
+
     def test_short_lived_candidate_disappearance_is_reported_as_removed(self):
         book = LocalOrderBook()
         book.bids[100.0] = 100.0
@@ -1117,12 +1128,13 @@ class StrategyPipelineTests(unittest.TestCase):
                 settings = PairSettings("BTCUSDT", min_wall_age_seconds=0)
                 engine = TradingEngine({"BTCUSDT": settings})
                 engine.start()
+                identity = f"lifecycle-{event_type}"
                 signal = {
                     "strategy_id": "stable_wall_v1",
                     "symbol": "BTCUSDT",
                     "wall_side": "buy",
                     "wall_price": 100.0,
-                    "wall_id": f"wall-event-{event_type}",
+                    "wall_id": f"BTCUSDT:buy:100:{identity}",
                     "wall_size": 1000.0,
                     "wall_ratio": 900.0,
                 }
@@ -1132,7 +1144,8 @@ class StrategyPipelineTests(unittest.TestCase):
                     "BTCUSDT",
                     100.0,
                     [],
-                    [{"event": event_type, "side": "buy", "price": 100.0}],
+                    [{"event": event_type, "side": "buy", "price": 100.0,
+                      "first_seen_at": identity}],
                 )
 
                 self.assertEqual(trade["status"], "cancelled")

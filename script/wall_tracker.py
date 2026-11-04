@@ -15,6 +15,7 @@ class WallTracker:
 
         self.walls = {}
         self._restored_lifecycle_identities = {}
+        self.qualification_transitions = {"lost": 0, "restored": 0}
 
     def seed_lifecycle_identities(self, identities):
         """Reuse persisted identity on first sight of a wall after restart.
@@ -141,7 +142,13 @@ class WallTracker:
             wall["current_size"] = current_size
             wall["last_seen"] = now
             candidate = current_candidates.get(key)
-            wall["qualifies"] = candidate is not None
+            was_qualified = bool(wall.get("qualifies", True))
+            is_qualified = candidate is not None
+            if was_qualified and not is_qualified:
+                self.qualification_transitions["lost"] += 1
+            elif not was_qualified and is_qualified:
+                self.qualification_transitions["restored"] += 1
+            wall["qualifies"] = is_qualified
             if candidate is not None:
                 wall["wall_ratio"] = candidate.get("wall_ratio", wall["wall_ratio"])
                 wall["median_notional"] = candidate.get(

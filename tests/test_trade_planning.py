@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+from time import monotonic
 
 from database.models import VirtualTrade
 from script.engine import EngineMode, TradingEngine
@@ -12,6 +13,9 @@ from script.trade_levels import (
     estimate_trade_outcomes,
 )
 from script.trade_manager import TradeManager
+from script.wall_tracker import WallTracker
+from script.orderbook import LocalOrderBook
+from script.market_data import analyze_synced_orderbook
 
 
 def run_immediate(coroutine):
@@ -286,6 +290,180 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertTrue(any(event.get("reason") == "INSUFFICIENT_AVAILABLE_BALANCE" for event in events))
         self.assertEqual(pending["status"], "pending")
         self.assertGreaterEqual(manager.get_statistics()["available_balance_usdt"], 0)
+
+    def test_complete_stable_snapshots_keep_breakout_pending_for_four_symbols(self):
+        for symbol in ("BTCUSDT", "ETHUSDT", "DOGEUSDT", "1000PEPEUSDT"):
+            with self.subTest(symbol=symbol):
+                settings = PairSettings(
+                    symbol, min_wall_age_seconds=0, max_wall_distance_bps=1000,
+                )
+                engine = TradingEngine(
+                    {symbol: settings},
+                    TradingSettings(stake_usdt=10, initial_balance_usdt=500),
+                    enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
+                )
+                engine.instrument_tick_sizes[symbol] = 0.0001
+                engine.start()
+                wall = {
+                    "side": "buy", "price": 100.0, "first_seen_at": f"life-{symbol}",
+                    "current_size": 10000, "initial_size": 10000,
+                    "wall_ratio": 900, "age": 50,
+                }
+                candidates = [{
+                    "side": "buy", "price": 100.0, "notional": 10000,
+                    "wall_ratio": 900,
+                }]
+                engine.on_market_update(symbol, 100.5, [wall], (), candidates)
+                plan, = engine.trade_manager.get_pending_trades()
+                engine.on_market_update(symbol, 100.5, [dict(wall, age=50.2)], (), candidates)
+                self.assertEqual(plan["status"], "pending")
+                self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
+
+    def test_other_stable_walls_do_not_cancel_existing_wall_plan(self):
+        engine, _ = self.make_engine(BREAKOUT_STRATEGY_ID)
+        original = self.wall("buy", 100, "keep-this-plan")
+        other = self.wall("sell", 101, "another-wall")
+        self.update(engine, 100.5, [original])
+        plan, = engine.trade_manager.get_pending_trades()
+        events = self.update(engine, 100.5, [original, other])
+        self.assertEqual(plan["status"], "pending")
+        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 2)
+        self.assertFalse(any(
+            event.get("trade", {}).get("signal_id") == plan["signal_id"]
+            and event.get("event") == "ENTRY_CANCELLED"
+            for event in events
+        ))
+
+    def test_incomplete_wall_snapshot_neither_cancels_nor_activates_pending(self):
+        engine, _ = self.make_engine(BREAKOUT_STRATEGY_ID)
+        wall = self.wall("buy", 100, "temporary-data-gap")
+        self.update(engine, 100.5, [wall])
+        plan, = engine.trade_manager.get_pending_trades()
+        events = engine.on_market_update("ETHUSDT", 100.0, [], (), None)
+        self.assertEqual(plan["status"], "pending")
+        self.assertFalse(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
+
+    def test_reconnecting_candidate_preserves_pending_but_waits_for_stability(self):
+        engine, _ = self.make_engine(BREAKOUT_STRATEGY_ID)
+        wall = self.wall("buy", 100, "same-lifecycle")
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        self.update(engine, 100.5, [wall])
+        plan, = engine.trade_manager.get_pending_trades()
+        candidate = {"side": "buy", "price": 100.0, "notional": 1000, "wall_ratio": 900}
+        actual_wall_id = plan["wall_id"]
+        engine.wall_diagnostics["ETHUSDT"]["tracked_walls_by_id"] = {
+            actual_wall_id: {"wall_id": actual_wall_id, "status": "CANDIDATE", "qualifies": True,
+                             "age_seconds": 2, "wall_ratio": 900, "notional": 1000}
+        }
+        engine.on_market_update("ETHUSDT", 100.5, [], (), [candidate])
+        self.assertEqual(plan["status"], "pending")
+        self.assertFalse(plan["entry_armed"])
+        engine.on_market_update("ETHUSDT", 100.5, [dict(wall, age=45)], (), [candidate])
+        self.assertEqual(plan["status"], "pending")
+
+    def test_real_wall_tracker_restart_revalidates_same_pending_identity(self):
+        symbol = "ETHUSDT"
+        settings = PairSettings(
+            symbol, min_wall_ratio=50, max_wall_distance_bps=200,
+            min_wall_age_seconds=0,
+        )
+        engine = TradingEngine(
+            {symbol: settings}, TradingSettings(initial_balance_usdt=500),
+            enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes[symbol] = 0.01
+        engine.start()
+        book = LocalOrderBook()
+        book.bids.update({100.0: 1.0, 99.9: 1.0, 99.8: 1.0, 99.7: 1.0, 99.6: 100.0})
+        book.synchronized = True
+        flow = {
+            "buy_volume_per_second": 0.0, "sell_volume_per_second": 0.0,
+            "buy_volume_by_price_total": {}, "sell_volume_by_price_total": {},
+        }
+        tracker = WallTracker(min_age_seconds=40, consumed_ratio=settings.consumed_ratio)
+        result = analyze_synced_orderbook(book, 100.5, flow, settings, tracker)
+        self.assertEqual(len(result["candidates"]), 1)
+        tracker.walls[("buy", 99.6)]["first_seen"] = monotonic() - 41
+        result = analyze_synced_orderbook(book, 100.5, flow, settings, tracker)
+        self.assertEqual(len(result["stable_walls"]), 1)
+        engine.record_wall_analysis(symbol, 100.5, result)
+        engine.on_market_update(
+            symbol, 100.5, result["stable_walls"], result["wall_events"], result["candidates"]
+        )
+        plan, = engine.trade_manager.get_pending_trades()
+        identity_before = plan["wall_id"]
+
+        restarted_tracker = WallTracker(min_age_seconds=40, consumed_ratio=settings.consumed_ratio)
+        restarted_tracker.seed_lifecycle_identities(
+            engine.trade_manager.get_wall_lifecycle_identities()
+        )
+        reconnect_result = analyze_synced_orderbook(
+            book, 100.5, flow, settings, restarted_tracker
+        )
+        self.assertEqual(reconnect_result["stable_walls"], [])
+        self.assertEqual(len(reconnect_result["candidates"]), 1)
+        engine.record_wall_analysis(symbol, 100.5, reconnect_result)
+        engine.on_market_update(
+            symbol, 100.5, reconnect_result["stable_walls"],
+            reconnect_result["wall_events"], reconnect_result["candidates"],
+        )
+        self.assertEqual(plan["status"], "pending")
+        self.assertFalse(plan["entry_armed"])
+        self.assertEqual(plan["wall_id"], identity_before)
+
+        restarted_tracker.walls[("buy", 99.6)]["first_seen"] = monotonic() - 41
+        stable_again = analyze_synced_orderbook(
+            book, 100.5, flow, settings, restarted_tracker
+        )
+        engine.record_wall_analysis(symbol, 100.5, stable_again)
+        engine.on_market_update(
+            symbol, 100.5, stable_again["stable_walls"],
+            stable_again["wall_events"], stable_again["candidates"],
+        )
+        self.assertEqual(plan["status"], "pending")
+        self.assertEqual(plan["wall_id"], identity_before)
+        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
+
+    def test_real_wall_filter_loss_cancels_with_specific_internal_reason(self):
+        engine, _ = self.make_engine(BREAKOUT_STRATEGY_ID)
+        wall = self.wall("buy", 100, "ratio-loss")
+        self.update(engine, 100.5, [wall])
+        plan, = engine.trade_manager.get_pending_trades()
+        engine.wall_diagnostics["ETHUSDT"].update({
+            "tracked_walls_by_id": {
+                plan["wall_id"]: {
+                    "wall_id": plan["wall_id"], "status": "BELOW_FILTER",
+                    "qualifies": False, "age_seconds": 52, "wall_ratio": 3.0,
+                    "notional": 1000,
+                }
+            },
+            "wall_level_diagnostics": {
+                "buy:100": {"wall_ratio": 3.0, "rejection": "WALL_BELOW_RATIO"}
+            },
+        })
+        events = engine.on_market_update("ETHUSDT", 100.5, [], (), [])
+        cancelled, = [event for event in events if event["event"] == "ENTRY_CANCELLED"]
+        self.assertEqual(plan["status"], "cancelled")
+        self.assertEqual(plan["close_reason"], "NO_STABLE_WALL")
+        self.assertEqual(cancelled["diagnostic_reason"], "WALL_BELOW_RATIO")
+        self.assertEqual(
+            engine.wall_diagnostics["ETHUSDT"]["planner_reconciliation"]["cancel_reasons"],
+            {"WALL_BELOW_RATIO": 1},
+        )
+        # Once the same lifecycle qualifies again it gets a new durable plan
+        # generation; the canceled database row remains historical.
+        engine.on_market_update(
+            "ETHUSDT", 100.5, [dict(wall, age=55)], (),
+            [{"side": "buy", "price": 100.0, "notional": 1000, "wall_ratio": 900}],
+        )
+        replacement, = engine.trade_manager.get_pending_trades()
+        self.assertNotEqual(replacement["signal_id"], plan["signal_id"])
+        self.assertEqual(plan["status"], "cancelled")
+        engine.on_market_update(
+            "ETHUSDT", 100.5, [dict(wall, age=55.2)], (),
+            [{"side": "buy", "price": 100.0, "notional": 1000, "wall_ratio": 900}],
+        )
+        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
 
     def test_each_qualified_wall_keeps_its_plan_and_unchanged_plans_are_not_recreated(self):
         engine, _ = self.make_engine()

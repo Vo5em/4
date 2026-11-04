@@ -587,6 +587,29 @@ class TradeManager:
                 and trade.get("strategy_id") == strategy_id
                 and trade.get("status") == "pending"]
 
+    def next_requalified_plan_generation(
+        self, symbol: str, strategy_id: str, wall_side: str, wall_id: str
+    ) -> int:
+        """Return a durable generation for a wall plan that lost qualification.
+
+        A canceled plan may be recreated only after the same wall qualifies
+        again. Explicit/manual or entry-blocked cancellations are not
+        requalifiable and keep their existing deduplication behavior.
+        """
+        requalifiable_reasons = {
+            "WALL_NO_LONGER_QUALIFIES", "NO_STABLE_WALL",
+            "TICK_SIZE_UNAVAILABLE", "INVALID_TRADE_LEVELS",
+        }
+        return sum(
+            1 for trade in self.trades
+            if str(trade.get("symbol", "")).upper() == symbol.upper()
+            and trade.get("strategy_id") == strategy_id
+            and trade.get("wall_side") == wall_side
+            and trade.get("wall_id") == wall_id
+            and trade.get("status") == "cancelled"
+            and trade.get("close_reason") in requalifiable_reasons
+        )
+
     def cancel_pending_not_in_wall_ids(
         self, symbol: str, strategy_id: str, valid_wall_ids: set[str], reason: str
     ) -> list[dict]:
