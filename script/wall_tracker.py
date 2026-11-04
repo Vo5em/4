@@ -146,8 +146,16 @@ class WallTracker:
             is_qualified = candidate is not None
             if was_qualified and not is_qualified:
                 self.qualification_transitions["lost"] += 1
+                # The only stability clock is the continuous Scanner-qualified
+                # period. A ratio/notional/distance miss ends it immediately.
+                wall["first_seen"] = now
+                wall["status"] = "candidate"
             elif not was_qualified and is_qualified:
                 self.qualification_transitions["restored"] += 1
+                # Requalification starts a new full period, even when the exact
+                # price level remained present in the local book.
+                wall["first_seen"] = now
+                wall["status"] = "candidate"
             wall["qualifies"] = is_qualified
             if candidate is not None:
                 wall["wall_ratio"] = candidate.get("wall_ratio", wall["wall_ratio"])

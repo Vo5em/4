@@ -690,6 +690,19 @@ class TradeManager:
         )
         return {"event": "ENTRY_CANCELLED", "trade": trade}
 
+    def cancel_pending_signal(self, signal_id: str, reason: str) -> dict | None:
+        """Cancel one non-manual PENDING while retaining its history row."""
+        trade = self.find_trade(signal_id)
+        if trade is None or trade.get("status") != "pending":
+            return None
+        trade.update(
+            status="cancelled",
+            closed_at=datetime.now(timezone.utc),
+            close_reason=str(reason),
+            entry_armed=False,
+        )
+        return {"event": "ENTRY_CANCELLED", "trade": trade, "reason": reason}
+
     def close_trade(self, signal_id: str, price: float) -> dict | None:
         trade = self.find_trade(signal_id)
         if trade is None or trade.get("status") != "open":

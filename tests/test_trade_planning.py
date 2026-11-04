@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import replace
 from time import monotonic
+from unittest.mock import patch
 
 from database.models import VirtualTrade
 from script.engine import EngineMode, TradingEngine
@@ -222,6 +223,31 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 0)
         self.assertEqual(engine.trade_manager.get_statistics()["available_balance_usdt"], 1000)
 
+    def test_candidate_gets_pending_only_after_40_continuous_scanner_seconds(self):
+        engine, settings = self.make_engine()
+        book = LocalOrderBook()
+        book.bids[100.0] = 10.0
+        tracker = WallTracker(min_age_seconds=40)
+        candidate = {"side": "buy", "price": 100.0, "notional": 1000.0,
+                     "wall_ratio": 900.0}
+        clock = [100.0]
+
+        with patch("script.wall_tracker.time.monotonic", side_effect=lambda: clock[0]):
+            tracker.update([candidate], book, {})
+            clock[0] = 139.0
+            tracker.update([candidate], book, {})
+            self.update(engine, 100.5, tracker.get_stable_walls(), price_updated=False)
+            self.assertEqual(engine.trade_manager.get_pending_trades(), [])
+
+            clock[0] = 140.0
+            tracker.update([candidate], book, {})
+            stable = tracker.get_stable_walls()
+            self.assertEqual(len(stable), 1)
+            created = self.update(engine, 100.5, stable, price_updated=False)
+
+        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
+        self.assertEqual([event["event"] for event in created], ["TRADE_CREATED"])
+
     def test_pending_plans_have_stable_identity_and_restore_without_duplicates(self):
         engine, settings = self.make_engine()
         wall = self.wall("buy", 100, "restart-wall")
@@ -343,7 +369,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(plan["status"], "pending")
         self.assertFalse(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
 
-    def test_reconnecting_candidate_preserves_pending_but_waits_for_stability(self):
+    def test_reconnecting_candidate_cancels_old_pending_until_full_requalification(self):
         engine, _ = self.make_engine(BREAKOUT_STRATEGY_ID)
         wall = self.wall("buy", 100, "same-lifecycle")
         engine.instrument_tick_sizes["ETHUSDT"] = 0.01
@@ -355,11 +381,15 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             actual_wall_id: {"wall_id": actual_wall_id, "status": "CANDIDATE", "qualifies": True,
                              "age_seconds": 2, "wall_ratio": 900, "notional": 1000}
         }
-        engine.on_market_update("ETHUSDT", 100.5, [], (), [candidate])
-        self.assertEqual(plan["status"], "pending")
-        self.assertFalse(plan["entry_armed"])
+        for _ in range(3):
+            engine.on_market_update("ETHUSDT", 100.5, [], (), [candidate])
+            self.assertEqual(plan["status"], "cancelled")
+            self.assertEqual(engine.trade_manager.get_pending_trades(), [])
+        self.assertEqual(plan["close_reason"], "NO_STABLE_WALL")
         engine.on_market_update("ETHUSDT", 100.5, [dict(wall, age=45)], (), [candidate])
-        self.assertEqual(plan["status"], "pending")
+        replacement, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(replacement["wall_id"], actual_wall_id)
+        self.assertNotEqual(replacement["signal_id"], plan["signal_id"])
 
     def test_real_wall_tracker_restart_revalidates_same_pending_identity(self):
         symbol = "ETHUSDT"
@@ -407,8 +437,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             symbol, 100.5, reconnect_result["stable_walls"],
             reconnect_result["wall_events"], reconnect_result["candidates"],
         )
-        self.assertEqual(plan["status"], "pending")
-        self.assertFalse(plan["entry_armed"])
+        self.assertEqual(plan["status"], "cancelled")
         self.assertEqual(plan["wall_id"], identity_before)
 
         restarted_tracker.walls[("buy", 99.6)]["first_seen"] = monotonic() - 41
@@ -420,9 +449,11 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             symbol, 100.5, stable_again["stable_walls"],
             stable_again["wall_events"], stable_again["candidates"],
         )
-        self.assertEqual(plan["status"], "pending")
+        self.assertEqual(plan["status"], "cancelled")
         self.assertEqual(plan["wall_id"], identity_before)
-        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
+        replacement, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(replacement["wall_id"], identity_before)
+        self.assertNotEqual(replacement["signal_id"], plan["signal_id"])
 
     def test_real_wall_filter_loss_cancels_with_specific_internal_reason(self):
         engine, _ = self.make_engine(BREAKOUT_STRATEGY_ID)
@@ -445,10 +476,10 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         cancelled, = [event for event in events if event["event"] == "ENTRY_CANCELLED"]
         self.assertEqual(plan["status"], "cancelled")
         self.assertEqual(plan["close_reason"], "NO_STABLE_WALL")
-        self.assertEqual(cancelled["diagnostic_reason"], "WALL_BELOW_RATIO")
+        self.assertEqual(cancelled["diagnostic_reason"], "WALL_RATIO_FAILED")
         self.assertEqual(
             engine.wall_diagnostics["ETHUSDT"]["planner_reconciliation"]["cancel_reasons"],
-            {"WALL_BELOW_RATIO": 1},
+            {"WALL_RATIO_FAILED": 1},
         )
         # Once the same lifecycle qualifies again it gets a new durable plan
         # generation; the canceled database row remains historical.
@@ -480,6 +511,47 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             "ETHUSDT:buy:99:far", "ETHUSDT:buy:100:near",
         })
         self.assertEqual(first["status"], "pending")
+
+    def test_ten_eligible_stable_walls_create_exactly_ten_pending_plans(self):
+        engine, _ = self.make_engine(max_open=1)
+        walls = [
+            self.wall("buy", 100.0 - index * 0.05, f"ten-wall-{index}")
+            for index in range(10)
+        ]
+
+        created = self.update(engine, 100.5, walls)
+        pending = engine.trade_manager.get_pending_trades()
+        self.assertEqual(len([event for event in created if event["event"] == "TRADE_CREATED"]), 10)
+        self.assertEqual(len(pending), 10)
+        self.assertEqual(len({trade["wall_id"] for trade in pending}), 10)
+        reconciliation = engine.wall_diagnostics["ETHUSDT"]["planner_reconciliation"]
+        self.assertEqual(reconciliation["status"], "complete")
+        self.assertEqual(reconciliation["available_stable_count"], 10)
+        self.assertEqual(reconciliation["pending_after"], 10)
+        self.assertEqual(reconciliation["stable_without_pending"], 0)
+        self.assertEqual(reconciliation["pending_without_stable"], 0)
+
+        repeated = self.update(engine, 100.5, walls)
+        self.assertEqual(repeated, [])
+        self.assertEqual(len(engine.trade_manager.get_pending_trades()), 10)
+
+    def test_reconciliation_repairs_duplicate_pending_for_one_physical_wall(self):
+        engine, _ = self.make_engine()
+        wall = self.wall("buy", 100.0, "dedupe-wall")
+        self.update(engine, 100.5, [wall])
+        original, = engine.trade_manager.get_pending_trades()
+        duplicate = dict(original)
+        duplicate["signal_id"] = original["signal_id"] + ":restored-duplicate"
+        engine.trade_manager.trades.append(duplicate)
+
+        events = self.update(engine, 100.5, [wall])
+
+        active = engine.trade_manager.get_pending_trades()
+        self.assertEqual(len(active), 1)
+        self.assertIs(active[0], original)
+        self.assertEqual(duplicate["status"], "cancelled")
+        self.assertEqual(duplicate["close_reason"], "DUPLICATE_PENDING")
+        self.assertIn("ENTRY_CANCELLED", [event["event"] for event in events])
 
     def test_adding_wall_persists_only_new_plan_without_changing_old_pending(self):
         engine, _ = self.make_engine()
