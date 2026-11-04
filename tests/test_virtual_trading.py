@@ -236,34 +236,59 @@ class WallTrackerTests(unittest.TestCase):
         tracker.update([tracked], book, {})
         self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
 
-    def test_qualification_loss_restarts_stability_clock_without_changing_wall_id(self):
+    def test_brief_ratio_change_above_threshold_does_not_reset_wall_or_qualification_age(self):
         book = LocalOrderBook()
         book.bids[100.0] = 100.0
         tracker = WallTracker(min_age_seconds=40)
-        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0}
+        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0,
+                   "wall_ratio": 900.0}
         tracker.update([tracked], book, {})
         state = tracker.walls[("buy", 100.0)]
         state["first_seen"] = monotonic() - 41
         tracker.update([tracked], book, {})
+        first_seen = state["first_seen"]
+        qualified_since = state["qualified_since"]
+
+        tracker.update([dict(tracked, wall_ratio=889.0)], book, {})
+
+        self.assertEqual(state["first_seen"], first_seen)
+        self.assertEqual(state["qualified_since"], qualified_since)
+        self.assertEqual(len(tracker.get_stable_walls()), 1)
+
+    def test_qualification_loss_preserves_physical_stable_age_and_wall_id(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=40)
+        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0,
+                   "wall_ratio": 900.0}
+        tracker.update([tracked], book, {})
+        state = tracker.walls[("buy", 100.0)]
+        state["first_seen"] = monotonic() - 41
+        tracker.update([tracked], book, {})
+        original_first_seen = state["first_seen"]
         original_identity = state["first_seen_at"]
         self.assertEqual(len(tracker.get_stable_walls()), 1)
 
-        # A complete Scanner update no longer qualifies the existing level.
+        # A complete Scanner update temporarily drops qualification. Physical
+        # lifetime and STABLE state do not restart, but this wall leaves the
+        # qualifying STABLE output until the Scanner admits it again.
         tracker.update([], book, {})
-        self.assertEqual(state["status"], "candidate")
+        self.assertEqual(state["status"], "stable")
         self.assertFalse(state["qualifies"])
+        self.assertEqual(state["first_seen"], original_first_seen)
+        self.assertIsNone(state["qualified_since"])
         self.assertEqual(tracker.get_stable_walls(), [])
 
-        # Qualification returning starts a new full stable interval, while
-        # preserving identity for history and plan deduplication.
+        # Qualification returning restores the old physical wall age and
+        # identity. The separate qualification age starts at recovery.
         tracker.update([tracked], book, {})
-        self.assertEqual(state["status"], "candidate")
+        self.assertEqual(state["status"], "stable")
         self.assertTrue(state["qualifies"])
+        self.assertEqual(state["first_seen"], original_first_seen)
         self.assertEqual(state["first_seen_at"], original_identity)
-        self.assertEqual(tracker.get_stable_walls(), [])
-        state["first_seen"] = monotonic() - 41
-        tracker.update([tracked], book, {})
-        self.assertEqual(tracker.get_stable_walls()[0]["first_seen_at"], original_identity)
+        stable_wall, = tracker.get_stable_walls()
+        self.assertEqual(stable_wall["first_seen_at"], original_identity)
+        self.assertLess(stable_wall["qualification_age"], 40)
 
     def test_candidate_disappearing_before_forty_seconds_never_becomes_stable(self):
         book = LocalOrderBook()

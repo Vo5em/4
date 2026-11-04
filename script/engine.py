@@ -1661,9 +1661,10 @@ class TradingEngine:
         strategy_ids = self.enabled_strategies.get(
             symbol, self._default_enabled_strategies
         )
-        stable_wall_ids = {
-            _wall_id(symbol, wall) for wall in stable_walls
+        stable_walls_by_id = {
+            _wall_id(symbol, wall): wall for wall in stable_walls
         }
+        stable_wall_ids = set(stable_walls_by_id)
         # Existing plans stay bound to their own stable wall. Strategy signals
         # describe newly eligible plans, but are not proof that another wall
         # has disappeared or lost Scanner qualification.
@@ -1791,6 +1792,28 @@ class TradingEngine:
                 plan_generation = self.trade_manager.next_requalified_plan_generation(
                     symbol, strategy.strategy_id, wall_side, signal.wall_id
                 )
+                if plan_generation:
+                    qualification_age = stable_walls_by_id.get(
+                        signal.wall_id, {}
+                    ).get("qualification_age", stable_walls_by_id.get(
+                        signal.wall_id, {}
+                    ).get("age"))
+                    required_qualification_age = max(
+                        40.0, settings.min_wall_age_seconds
+                    )
+                    if (
+                        qualification_age is None
+                        or float(qualification_age) < required_qualification_age
+                    ):
+                        reason = (
+                            "Повторный PENDING ожидает непрерывную Scanner-квалификацию "
+                            f"{required_qualification_age:g} с после её восстановления."
+                        )
+                        trade_rejections.append(reason)
+                        self._record_trade_plan_result(
+                            symbol, signal.wall_id, strategy.strategy_id, None, reason
+                        )
+                        continue
                 stable_key = "|".join((
                     symbol, strategy.strategy_id, wall_side, signal.wall_id,
                     str(plan_generation),

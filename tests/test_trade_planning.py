@@ -349,14 +349,19 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(original["close_reason"], "WALL_NO_LONGER_QUALIFIES")
         self.assertTrue(any(event["event"] == "ENTRY_CANCELLED" for event in lost_events))
 
-        # Qualification returns, but the tracker must earn the full age again.
+        # Qualification returns the old physical wall to STABLE immediately,
+        # but a replacement plan waits for a full continuous qualification.
         tracker.update([candidate], book, flow)
+        stable_restored = tracker.get_nearest_stable_walls(100.5)
+        self.assertEqual(stable_restored[0]["status"], "stable")
+        self.assertEqual(stable_restored[0]["age"] >= 40, True)
+        self.assertLess(stable_restored[0]["qualification_age"], 40)
         engine.wall_diagnostics[symbol].update({
             "tracked_walls_by_id": {}, "wall_level_diagnostics": {},
         })
-        engine.on_market_update(symbol, 100.5, [], (), [candidate])
+        engine.on_market_update(symbol, 100.5, stable_restored, (), [candidate])
         self.assertEqual(engine.trade_manager.get_pending_trades(), [])
-        tracker.walls[("buy", 100.0)]["first_seen"] = monotonic() - 41
+        tracker.walls[("buy", 100.0)]["qualified_since"] = monotonic() - 41
         tracker.update([candidate], book, flow)
         stable_again = tracker.get_nearest_stable_walls(100.5)
         self.assertEqual(stable_again[0]["first_seen_at"], original_wall_id.split(":", 3)[3])
@@ -727,14 +732,14 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         # Once the same lifecycle qualifies again it gets a new durable plan
         # generation; the canceled database row remains historical.
         engine.on_market_update(
-            "ETHUSDT", 100.5, [dict(wall, age=55)], (),
+            "ETHUSDT", 100.5, [dict(wall, age=55, qualification_age=55)], (),
             [{"side": "buy", "price": 100.0, "notional": 1000, "wall_ratio": 900}],
         )
         replacement, = engine.trade_manager.get_pending_trades()
         self.assertNotEqual(replacement["signal_id"], plan["signal_id"])
         self.assertEqual(plan["status"], "cancelled")
         engine.on_market_update(
-            "ETHUSDT", 100.5, [dict(wall, age=55.2)], (),
+            "ETHUSDT", 100.5, [dict(wall, age=55.2, qualification_age=55.2)], (),
             [{"side": "buy", "price": 100.0, "notional": 1000, "wall_ratio": 900}],
         )
         self.assertEqual(len(engine.trade_manager.get_pending_trades()), 1)
