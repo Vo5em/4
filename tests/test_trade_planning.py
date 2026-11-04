@@ -1,9 +1,10 @@
 import unittest
 from dataclasses import replace
-from time import monotonic
+from datetime import datetime, timezone
+from time import monotonic, time
 
 from database.models import VirtualTrade
-from script.engine import EngineMode, TradingEngine
+from script.engine import EngineMode, MARKET_PRICE_SOURCE, TradingEngine
 from script.settings import PairSettings, TradingSettings
 from app.runtime import RuntimeController
 from script.strategies import BOUNCE_STRATEGY_ID, BREAKOUT_STRATEGY_ID
@@ -169,6 +170,34 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             "ETHUSDT", price, walls, (), walls, price_updated=price_updated
         )
 
+    @staticmethod
+    def record_fresh_market(engine, symbol, price, *, stale_price=False, synchronized=True):
+        now_mono = monotonic()
+        now_ms = int(time() * 1000)
+        received = now_mono - (2.0 if stale_price else 0.0)
+        received_at = datetime.now(timezone.utc)
+        engine.record_price_market_data(
+            symbol, event_time_ms=now_ms, message_time_ms=now_ms,
+            sequence=now_ms, trade_id=str(now_ms), received_monotonic=received,
+            received_at=received_at, delivery_lag_ms=0, price_value=price,
+            source=MARKET_PRICE_SOURCE, connection_generation=1,
+            value_updated_at_ms=now_ms, value_updated_monotonic=received,
+        )
+        engine.record_orderbook_market_data(
+            symbol, message_time_ms=now_ms, cts_ms=now_ms,
+            sequence=now_ms, update_id=now_ms, received_monotonic=now_mono,
+            received_at=received_at, delivery_lag_ms=0,
+            synchronized=synchronized, generation=1,
+        )
+
+    @staticmethod
+    def breakout_wall(side="sell", price=0.075, identity="wall"):
+        return {
+            "side": side, "price": price, "first_seen_at": identity,
+            "current_size": 1_000_000, "initial_size": 1_000_000,
+            "wall_ratio": 900, "age": 45,
+        }
+
     class Repository:
         def __init__(self):
             self.fail = False
@@ -221,6 +250,135 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         self.assertEqual(plans["sell"]["accounting_version"], 1)
         self.assertEqual(engine.trade_manager.get_statistics()["reserved_margin_usdt"], 0)
         self.assertEqual(engine.trade_manager.get_statistics()["available_balance_usdt"], 1000)
+
+    def test_fast_breakout_cross_is_processed_before_wall_reconciliation(self):
+        symbol = "DOGEUSDT"
+        settings = PairSettings(
+            symbol, min_wall_age_seconds=0, max_wall_distance_bps=1000,
+        )
+        engine = TradingEngine(
+            {symbol: settings}, TradingSettings(stake_usdt=10, initial_balance_usdt=500),
+            enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes[symbol] = 0.000001
+        engine.start()
+        wall = self.breakout_wall()
+
+        self.record_fresh_market(engine, symbol, 0.074980)
+        created = engine.on_market_update(symbol, 0.074980, [wall], (), [wall])
+        pending, = engine.trade_manager.get_pending_trades()
+        self.assertAlmostEqual(pending["entry_price"], 0.074989, places=5)
+        self.assertTrue(any(event["event"] == "TRADE_CREATED" for event in created))
+
+        # The wall is absent from the new scanner result, and the single Last
+        # Price jump crosses Entry and the wall. The prior valid plan must get
+        # its crossing check before this snapshot cancels plans.
+        self.record_fresh_market(engine, symbol, 0.075050)
+        events = engine.on_market_update(symbol, 0.075050, [], (), [])
+        self.assertEqual(pending["status"], "open")
+        self.assertAlmostEqual(pending["entry_fill_price"], 0.075050)
+        self.assertTrue(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
+        self.record_fresh_market(engine, symbol, 0.075051)
+        repeated = engine.on_market_update(symbol, 0.075051, [], (), [])
+        self.assertEqual(sum(t["signal_id"] == pending["signal_id"]
+                             for t in engine.trade_manager.trades), 1)
+        self.assertFalse(any(event["event"] == "ENTRY_ACTIVATED" for event in repeated))
+
+    def test_wall_cancelled_before_cross_cannot_open_later(self):
+        symbol = "DOGEUSDT"
+        settings = PairSettings(symbol, min_wall_age_seconds=0, max_wall_distance_bps=1000)
+        engine = TradingEngine(
+            {symbol: settings}, TradingSettings(stake_usdt=10, initial_balance_usdt=500),
+            enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes[symbol] = 0.000001
+        engine.start()
+        wall = self.breakout_wall(identity="cancel-before-cross")
+        self.record_fresh_market(engine, symbol, 0.074980)
+        engine.on_market_update(symbol, 0.074980, [wall], (), [wall])
+        pending, = engine.trade_manager.get_pending_trades()
+
+        # Complete synchronized book update removes the wall while price is
+        # still below Entry. This cancellation must invalidate saved eligibility.
+        self.record_fresh_market(engine, symbol, 0.074980)
+        engine.on_market_update(symbol, 0.074980, [], (), [], price_updated=False)
+        self.assertEqual(pending["status"], "cancelled")
+
+        self.record_fresh_market(engine, symbol, 0.075050)
+        events = engine.on_market_update(symbol, 0.075050, [], (), [])
+        self.assertNotEqual(pending["status"], "open")
+        self.assertFalse(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
+
+    def test_pair_open_slot_cancels_crossed_pending_but_other_pair_remains_independent(self):
+        btc = PairSettings("BTCUSDT", min_wall_age_seconds=0, max_wall_distance_bps=1000)
+        eth = PairSettings("ETHUSDT", min_wall_age_seconds=0, max_wall_distance_bps=1000)
+        engine = TradingEngine(
+            {"BTCUSDT": btc, "ETHUSDT": eth},
+            TradingSettings(stake_usdt=10, initial_balance_usdt=500, max_open_trades=3),
+            enabled_strategies={
+                "BTCUSDT": {BREAKOUT_STRATEGY_ID},
+                "ETHUSDT": {BREAKOUT_STRATEGY_ID},
+            },
+        )
+        engine.instrument_tick_sizes.update({"BTCUSDT": 0.01, "ETHUSDT": 0.01})
+        engine.start()
+        open_btc = engine.trade_manager.create_trade({
+            "signal_id": "existing-open-btc", "strategy_id": BREAKOUT_STRATEGY_ID,
+            "symbol": "BTCUSDT", "wall_side": "sell", "wall_price": 101,
+            "wall_id": "existing-open-wall", "wall_size": 1000, "wall_ratio": 900,
+            "side": "long", "entry_price": 100, "stop_loss": 99,
+            "take_profit": 102, "entry_mode": "market", "reference_price": 100,
+        }, btc)
+        self.assertEqual(open_btc["status"], "open")
+
+        eth_wall = self.wall("sell", 101, "eth-ask")
+        self.record_fresh_market(engine, "ETHUSDT", 100.5)
+        engine.on_market_update("ETHUSDT", 100.5, [eth_wall], (), [eth_wall])
+        eth_pending, = engine.trade_manager.get_pending_trades()
+        self.record_fresh_market(engine, "ETHUSDT", 101.0)
+        events = engine.on_market_update("ETHUSDT", 101.0, [], (), [])
+        self.assertEqual(eth_pending["status"], "open")
+        self.assertTrue(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
+
+        # A second pending on ETH is cancelled on its crossing because ETH's
+        # own one-OPEN-per-symbol limit is now occupied.
+        second = engine.trade_manager.create_trade({
+            "signal_id": "second-eth-pending", "strategy_id": BREAKOUT_STRATEGY_ID,
+            "symbol": "ETHUSDT", "wall_side": "sell", "wall_price": 102,
+            "wall_id": "second-eth-wall", "wall_size": 1000, "wall_ratio": 900,
+            "side": "long", "entry_price": 101.5, "stop_loss": 100.5,
+            "take_profit": 102.5, "entry_trigger_direction": "cross_up",
+            "reference_price": 101,
+        }, eth)
+        self.assertEqual(second["status"], "pending")
+        events = engine.trade_manager.on_price("ETHUSDT", 102, eligible_signal_ids={second["signal_id"]})
+        self.assertEqual(second["status"], "cancelled")
+        self.assertTrue(any(event.get("reason") == "ENTRY_BLOCKED_BY_OPEN_TRADE" for event in events))
+
+    def test_stale_or_unsynchronized_feed_cannot_activate_saved_plan(self):
+        symbol = "DOGEUSDT"
+        settings = PairSettings(symbol, min_wall_age_seconds=0, max_wall_distance_bps=1000)
+        engine = TradingEngine(
+            {symbol: settings}, TradingSettings(stake_usdt=10, initial_balance_usdt=500),
+            enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes[symbol] = 0.000001
+        engine.start()
+        wall = self.breakout_wall(identity="stale-cross")
+        self.record_fresh_market(engine, symbol, 0.074980)
+        engine.on_market_update(symbol, 0.074980, [wall], (), [wall])
+        pending, = engine.trade_manager.get_pending_trades()
+
+        self.record_fresh_market(engine, symbol, 0.075050, stale_price=True)
+        events = engine.on_market_update(symbol, 0.075050, [wall], (), [wall])
+        self.assertEqual(pending["status"], "pending")
+        self.assertFalse(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
+        self.assertFalse(engine._entry_eligible_signal_ids.get(symbol))
+
+        self.record_fresh_market(engine, symbol, 0.075050, synchronized=False)
+        events = engine.on_market_update(symbol, 0.075050, [wall], (), [wall])
+        self.assertEqual(pending["status"], "pending")
+        self.assertFalse(any(event["event"] == "ENTRY_ACTIVATED" for event in events))
 
     def test_pending_plans_have_stable_identity_and_restore_without_duplicates(self):
         engine, settings = self.make_engine()

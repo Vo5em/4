@@ -142,6 +142,10 @@ class TradingEngine:
         self.market_reconciliation_required: set[str] = set()
         self._stale_data_warning_at: dict[str, float] = {}
         self._planner_reconcile_log_at: dict[str, float] = {}
+        # PENDING IDs approved by the most recent complete strategy snapshot.
+        # A fresh ticker crossing is evaluated against this prior state before
+        # the same ticker's price-relative wall checks can invalidate it.
+        self._entry_eligible_signal_ids: dict[str, set[str]] = {}
         self.market_analysis = {
             symbol: {
                 "potential_wall_count": None,
@@ -198,6 +202,7 @@ class TradingEngine:
         self.feed_status[symbol] = status
         self.wall_diagnostics.setdefault(symbol, {})["feed_state"] = status
         if status != "connected":
+            self._entry_eligible_signal_ids.pop(symbol, None)
             self._market_health(symbol)["book_synchronized"] = False
             self.trade_manager.disarm_pending_for_symbol(symbol)
             self.wall_diagnostics[symbol]["book_synchronized"] = False
@@ -367,6 +372,7 @@ class TradingEngine:
     def mark_orderbook_unsynchronized(
         self, symbol: str, generation: int | None = None
     ) -> None:
+        self._entry_eligible_signal_ids.pop(symbol.upper(), None)
         health = self._market_health(symbol)
         health["book_synchronized"] = False
         self.trade_manager.disarm_pending_for_symbol(symbol)
@@ -1322,6 +1328,9 @@ class TradingEngine:
             ]
             previous_balance = self.trade_manager.balance_usdt
             previous_prices = dict(self.trade_manager.last_prices)
+            previous_entry_eligible = {
+                key: set(value) for key, value in self._entry_eligible_signal_ids.items()
+            }
             previous_pending_persistence = {
                 key: dict(value) for key, value in self._pending_persistence.items()
             }
@@ -1351,6 +1360,7 @@ class TradingEngine:
                     previous_pending_persistence,
                 )
                 self.trade_manager.last_prices = previous_prices
+                self._entry_eligible_signal_ids = previous_entry_eligible
                 self.trade_manager.discard_deferred_entry_tick(symbol)
                 if diagnostics is not None:
                     diagnostics["planner_decision"] = (
@@ -1373,6 +1383,7 @@ class TradingEngine:
     ) -> list[dict]:
         symbol = symbol.upper()
         if self.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
+            self._entry_eligible_signal_ids.pop(symbol, None)
             self._record_planner_blocked(
                 symbol, stable_walls, set(), "Движок остановлен; стратегии не запускались."
             )
@@ -1381,6 +1392,7 @@ class TradingEngine:
             numeric_price = float(last_price)
             decimal_price = Decimal(str(last_price))
         except (TypeError, ValueError, InvalidOperation):
+            self._entry_eligible_signal_ids.pop(symbol, None)
             logger.warning("%s ignoring invalid market price %r", symbol, last_price)
             self._record_planner_blocked(
                 symbol, stable_walls, self.get_enabled_strategy_ids(symbol),
@@ -1388,6 +1400,7 @@ class TradingEngine:
             )
             return []
         if not isfinite(numeric_price) or decimal_price <= 0:
+            self._entry_eligible_signal_ids.pop(symbol, None)
             logger.warning("%s ignoring invalid market price %r", symbol, last_price)
             self._record_planner_blocked(
                 symbol, stable_walls, self.get_enabled_strategy_ids(symbol),
@@ -1399,6 +1412,7 @@ class TradingEngine:
         self.latest_market_prices[symbol] = numeric_price
 
         if self.diagnostic_only:
+            self._entry_eligible_signal_ids.pop(symbol, None)
             diagnostics = self.wall_diagnostics.setdefault(symbol, {})
             settings = self.pair_settings.get(symbol)
             if settings is None:
@@ -1487,12 +1501,14 @@ class TradingEngine:
             price_updated and health is None
         )
         if settings is not None and not settings.enabled:
+            self._entry_eligible_signal_ids.pop(symbol, None)
             events.extend(
                 self.trade_manager.cancel_pending_for_symbol(
                     symbol, "PAIR_DISABLED"
                 )
             )
         elif self.mode == EngineMode.ENTRIES_PAUSED:
+            self._entry_eligible_signal_ids.pop(symbol, None)
             events.extend(
                 self.trade_manager.cancel_pending_for_symbol(
                     symbol, "ENTRIES_PAUSED"
@@ -1563,6 +1579,7 @@ class TradingEngine:
             self.trade_manager.discard_deferred_entry_tick(symbol)
             return events
         if self.repository is not None and self._pending_persistence:
+            self._entry_eligible_signal_ids.pop(symbol, None)
             self._record_planner_blocked(
                 symbol, stable_walls, self.get_enabled_strategy_ids(symbol),
                 f"Trade Planner приостановлен: в PostgreSQL ожидают сохранения {len(self._pending_persistence)} записи.",
@@ -1572,6 +1589,7 @@ class TradingEngine:
         if (health is not None and not health["fresh"]) or (
             health is None and not strategy_price_valid and price_updated
         ):
+            self._entry_eligible_signal_ids.pop(symbol, None)
             reason = (
                 self.get_entry_block_reason(symbol)
                 if health is not None and not health["fresh"] else
@@ -1605,6 +1623,7 @@ class TradingEngine:
             self.trade_manager.discard_deferred_entry_tick(symbol)
             return events
         if not self._entry_event_is_after_resume(symbol):
+            self._entry_eligible_signal_ids.pop(symbol, None)
             health = self._market_health(symbol)
             logger.info(
                 "%s ignored pre-resume entry event: trade_id=%s event_time=%s cutoff=%s",
@@ -1618,6 +1637,18 @@ class TradingEngine:
             self.trade_manager.discard_deferred_entry_tick(symbol)
             return events
 
+        # Resolve a ticker crossing against the last complete planner snapshot
+        # before the current snapshot can cancel a plan because its wall has
+        # already moved through price or disappeared. The saved IDs are refreshed
+        # only by a successfully processed strategy snapshot below.
+        if confirmed_price_update:
+            previously_eligible = self._entry_eligible_signal_ids.get(symbol, set())
+            if previously_eligible:
+                events.extend(self.trade_manager.on_price(
+                    symbol, last_price, process_open=False,
+                    eligible_signal_ids=set(previously_eligible),
+                ))
+
         context = StrategyContext(
             symbol=symbol,
             last_price=last_price,
@@ -1630,6 +1661,7 @@ class TradingEngine:
         strategy_ids = self.enabled_strategies.get(
             symbol, self._default_enabled_strategies
         )
+        eligible_plan_keys: set[tuple[str, str]] = set()
         consumed_walls = [event for event in wall_events if event.get("event") == "CONSUMED"]
         rows = self._prepare_planner_wall_rows(
             symbol, stable_walls, strategy_ids, consumed_walls
@@ -1738,6 +1770,7 @@ class TradingEngine:
                     )
                     continue
                 valid_wall_ids.add(signal.wall_id)
+                eligible_plan_keys.add((strategy.strategy_id, signal.wall_id))
                 if self.trade_manager.has_matching_pending_plan(signal, levels, settings):
                     if existing is not None:
                         eligible_pending_ids.add(existing["signal_id"])
@@ -1933,6 +1966,26 @@ class TradingEngine:
                 symbol, last_price, process_open=False,
                 eligible_signal_ids=eligible_pending_ids,
             ))
+        if health is not None and health["fresh"] and health_matches_price:
+            active_pending_ids = {
+                trade["signal_id"] for trade in self.trade_manager.trades
+                if trade.get("symbol") == symbol and trade.get("status") == "pending"
+            }
+            if wall_candidates is not None:
+                self._entry_eligible_signal_ids[symbol] = {
+                    trade["signal_id"] for trade in self.trade_manager.trades
+                    if trade.get("symbol") == symbol
+                    and trade.get("status") == "pending"
+                    and (trade.get("strategy_id"), trade.get("wall_id")) in eligible_plan_keys
+                }
+            else:
+                # A partial scanner result cannot revoke the last complete
+                # eligibility decision, but it also cannot qualify a new plan.
+                self._entry_eligible_signal_ids[symbol] = (
+                    self._entry_eligible_signal_ids.get(symbol, set()) & active_pending_ids
+                )
+        else:
+            self._entry_eligible_signal_ids.pop(symbol, None)
         diagnostics = self.wall_diagnostics.setdefault(symbol, {})
         diagnostics["planner_evaluated"] = True
         if trade_rejections:
