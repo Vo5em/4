@@ -1,5 +1,58 @@
+import json
+import logging
 import time
 from datetime import datetime, timezone
+
+
+logger = logging.getLogger(__name__)
+
+
+def wall_lifecycle_id(symbol, side, price, first_seen_at):
+    return f"{str(symbol).upper()}:{side}:{float(price):.12g}:{first_seen_at or 'unknown'}"
+
+
+def log_stable_wall_transition(
+    *, symbol, generation, wall, previous_status, new_status, reason,
+    previous_notional=None, current_notional=None,
+    previous_median=None, current_median=None,
+    previous_ratio=None, current_ratio=None,
+    min_wall_ratio=None, min_wall_notional_usdt=None,
+    previous_distance_bps=None, current_distance_bps=None,
+    max_wall_distance_bps=None, stable_age_seconds=None,
+    active_pending=None, reason_detail=None,
+):
+    """Emit one structured diagnostic record for a lost STABLE wall."""
+    payload = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "symbol": str(symbol).upper() if symbol else None,
+        "websocket_generation": generation,
+        "wall_id": wall_lifecycle_id(
+            symbol, wall.get("side"), wall.get("price"), wall.get("first_seen_at")
+        ) if symbol else None,
+        "side": "BID" if wall.get("side") == "buy" else "ASK",
+        "price": wall.get("price"),
+        "previous_status": str(previous_status).upper(),
+        "new_status": str(new_status).upper(),
+        "reason": reason,
+        "reason_detail": reason_detail,
+        "previous_notional_usdt": previous_notional,
+        "current_notional_usdt": current_notional,
+        "previous_side_median_usdt": previous_median,
+        "current_side_median_usdt": current_median,
+        "previous_wall_ratio": previous_ratio,
+        "current_wall_ratio": current_ratio,
+        "min_wall_ratio": min_wall_ratio,
+        "min_wall_notional_usdt": min_wall_notional_usdt,
+        "previous_distance_bps": previous_distance_bps,
+        "current_distance_bps": current_distance_bps,
+        "max_wall_distance_bps": max_wall_distance_bps,
+        "stable_age_seconds": stable_age_seconds,
+        "active_pending": active_pending,
+    }
+    logger.warning(
+        "wall_state_transition=%s",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
+    )
 
 
 class WallTracker:
@@ -14,6 +67,7 @@ class WallTracker:
 
 
         self.walls = {}
+        self._diagnostic_distance_bps = {}
         self._restored_lifecycle_identities = {}
         self.qualification_transitions = {"lost": 0, "restored": 0}
 
@@ -34,8 +88,11 @@ class WallTracker:
         detected_walls,
         orderbook,
         trade_flow,
+        *,
+        diagnostic_context=None,
     ):
         now = time.monotonic()
+        diagnostic_context = diagnostic_context or {}
 
         events = []
 
@@ -87,6 +144,9 @@ class WallTracker:
 
                 "status": "candidate",
             }
+            self._diagnostic_distance_bps[key] = self._distance_bps(
+                wall["price"], diagnostic_context.get("last_price")
+            )
 
         # ---------------------------------------------
         # 2. Проверяем все отслеживаемые стены
@@ -102,6 +162,11 @@ class WallTracker:
             # Получаем текущий размер стены
             # -----------------------------------------
 
+            previous_size = wall.get("current_size")
+            previous_status = wall.get("status", "candidate")
+            previous_distance_bps = self._diagnostic_distance_bps.get(key)
+            previous_ratio = wall.get("wall_ratio")
+            previous_median = wall.get("median_notional")
             current_size = self._get_current_wall_size(
                 wall,
                 orderbook,
@@ -114,6 +179,17 @@ class WallTracker:
             if current_size is None:
 
                 age = now - wall["first_seen"]
+                if str(previous_status).lower() == "stable":
+                    self._log_stable_loss(
+                        wall, previous_status, "removed", "WALL_REMOVED",
+                        previous_size, None, previous_median, previous_ratio,
+                        previous_distance_bps,
+                        self._distance_bps(
+                            wall["price"], diagnostic_context.get("last_price")
+                        ),
+                        age, diagnostic_context,
+                        "Уровень отсутствует в синхронизированном локальном стакане.",
+                    )
                 current_relevant_total = self._relevant_total(wall, trade_flow)
                 flow_delta = self._flow_delta(
                     current_relevant_total, wall["last_relevant_total"]
@@ -132,6 +208,7 @@ class WallTracker:
                 events.append(event)
 
                 del self.walls[key]
+                self._diagnostic_distance_bps.pop(key, None)
 
                 continue
 
@@ -146,6 +223,16 @@ class WallTracker:
             is_qualified = candidate is not None
             if was_qualified and not is_qualified:
                 self.qualification_transitions["lost"] += 1
+                if str(previous_status).lower() == "stable":
+                    self._log_stable_loss(
+                        wall, previous_status, "candidate", None,
+                        previous_size, current_size, previous_median, previous_ratio,
+                        previous_distance_bps,
+                        self._distance_bps(
+                            wall["price"], diagnostic_context.get("last_price")
+                        ),
+                        max(0.0, now - wall["first_seen"]), diagnostic_context,
+                    )
                 # The only stability clock is the continuous Scanner-qualified
                 # period. A ratio/notional/distance miss ends it immediately.
                 wall["first_seen"] = now
@@ -157,6 +244,9 @@ class WallTracker:
                 wall["first_seen"] = now
                 wall["status"] = "candidate"
             wall["qualifies"] = is_qualified
+            self._diagnostic_distance_bps[key] = self._distance_bps(
+                wall["price"], diagnostic_context.get("last_price")
+            )
             if candidate is not None:
                 wall["wall_ratio"] = candidate.get("wall_ratio", wall["wall_ratio"])
                 wall["median_notional"] = candidate.get(
@@ -201,6 +291,99 @@ class WallTracker:
                 wall["status"] = "stable"
 
         return events
+
+    @staticmethod
+    def _distance_bps(price, last_price):
+        try:
+            last = float(last_price)
+            if last <= 0:
+                return None
+            return abs(float(price) - last) / last * 10000
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    @staticmethod
+    def _log_stable_loss(
+        wall, previous_status, new_status, forced_reason,
+        previous_notional, current_notional, previous_median, previous_ratio,
+        previous_distance_bps, current_distance_bps, stable_age_seconds,
+        diagnostic_context, reason_detail=None,
+    ):
+        side = wall.get("side")
+        side_medians = diagnostic_context.get("side_medians") or {}
+        current_median = side_medians.get(side)
+        min_ratio = diagnostic_context.get("min_wall_ratio")
+        min_notional = diagnostic_context.get("min_wall_notional_usdt")
+        max_distance = diagnostic_context.get("max_wall_distance_bps")
+        current_ratio = None
+        try:
+            if current_notional is not None and current_median is not None and float(current_median) > 0:
+                current_ratio = float(current_notional) / float(current_median)
+        except (TypeError, ValueError, ZeroDivisionError):
+            current_ratio = None
+
+        reason = forced_reason
+        if reason is None:
+            required_diagnostics = {
+                "last_price", "min_wall_ratio", "min_wall_notional_usdt",
+                "max_wall_distance_bps", "side_medians",
+            }
+            if (
+                not required_diagnostics.issubset(diagnostic_context)
+                or diagnostic_context.get("last_price") is None
+                or min_ratio is None or min_notional is None or max_distance is None
+            ):
+                reason = "UNKNOWN"
+                reason_detail = "Контекст Scanner неполон для установления причины потери квалификации."
+            elif current_distance_bps is None:
+                reason = "UNKNOWN"
+                reason_detail = "Невозможно вычислить текущую дистанцию стены до цены."
+            elif current_distance_bps is not None and max_distance is not None and current_distance_bps > float(max_distance):
+                reason = "OUT_OF_SCANNER_RANGE"
+                reason_detail = "Дистанция текущего уровня выше max_wall_distance_bps."
+            elif current_notional is not None and min_notional is not None and float(current_notional) < float(min_notional):
+                reason = "WALL_NOTIONAL_FAILED"
+                reason_detail = "Текущий notional ниже min_wall_notional_usdt."
+            elif current_median is None or float(current_median) <= 0:
+                reason = "MEDIAN_UNAVAILABLE"
+                reason_detail = "Для текущего снимка Scanner не получил медиану этой стороны."
+            elif current_ratio is not None and min_ratio is not None and current_ratio < float(min_ratio):
+                reason = "WALL_RATIO_FAILED"
+                reason_detail = "Текущий wall_ratio ниже min_wall_ratio."
+            else:
+                reason = "OTHER"
+                reason_detail = (
+                    "Scanner не передал уровень, но доступных значений недостаточно "
+                    "для установления конкретного фильтра."
+                )
+
+        symbol = diagnostic_context.get("symbol")
+        identity = wall_lifecycle_id(
+            symbol, side, wall.get("price"), wall.get("first_seen_at")
+        ) if symbol else None
+        pending_ids = diagnostic_context.get("active_pending_wall_ids")
+        log_stable_wall_transition(
+            symbol=symbol,
+            generation=diagnostic_context.get("connection_generation"),
+            wall=wall,
+            previous_status=previous_status,
+            new_status=new_status,
+            reason=reason,
+            previous_notional=previous_notional,
+            current_notional=current_notional,
+            previous_median=previous_median,
+            current_median=current_median,
+            previous_ratio=previous_ratio,
+            current_ratio=current_ratio,
+            min_wall_ratio=min_ratio,
+            min_wall_notional_usdt=min_notional,
+            previous_distance_bps=previous_distance_bps,
+            current_distance_bps=current_distance_bps,
+            max_wall_distance_bps=max_distance,
+            stable_age_seconds=stable_age_seconds,
+            active_pending=(identity in pending_ids) if pending_ids is not None and identity else None,
+            reason_detail=reason_detail,
+        )
 
     # =================================================
     # Получение текущего размера стены

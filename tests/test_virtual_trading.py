@@ -31,6 +31,7 @@ from script.market_data import (
     _update_ticker_price,
     _delivery_lag_ms,
     _fetch_snapshot_while_buffering,
+    _log_reconnect_stable_resets,
     analyze_synced_orderbook,
     apply_orderbook_delta,
     buffer_orderbook_delta,
@@ -200,6 +201,135 @@ class FakeTask:
 
 
 class WallTrackerTests(unittest.TestCase):
+    def test_stable_loss_logs_classify_notional_distance_median_and_removal(self):
+        scenarios = (
+            ("WALL_NOTIONAL_FAILED", 100.0, 2000.0, 1000.0, 1500.0, {"buy": 1.0}, 200.0),
+            ("OUT_OF_SCANNER_RANGE", 100.6, 2000.0, 2000.0, 500.0, {"buy": 1.0}, 50.0),
+            ("MEDIAN_UNAVAILABLE", 100.0, 2000.0, 2000.0, 500.0, {"buy": None}, 200.0),
+        )
+        for expected, current_price, initial_size, current_size, minimum, medians, max_distance in scenarios:
+            with self.subTest(reason=expected):
+                book = LocalOrderBook()
+                book.bids[100.0] = initial_size / 100.0
+                tracker = WallTracker(min_age_seconds=0)
+                candidate = {
+                    "side": "buy", "price": 100.0, "notional": initial_size,
+                    "wall_ratio": 1000.0, "median_notional": initial_size / 1000,
+                }
+                context = {
+                    "symbol": "ETHUSDT", "connection_generation": 3,
+                    "last_price": 100.0, "min_wall_ratio": 888.0,
+                    "min_wall_notional_usdt": minimum,
+                    "max_wall_distance_bps": max_distance,
+                    "side_medians": {"buy": initial_size / 1000},
+                    "active_pending_wall_ids": set(),
+                }
+                tracker.update([candidate], book, {}, diagnostic_context=context)
+                self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
+                book.bids[100.0] = current_size / 100.0
+                context.update(last_price=current_price, side_medians=medians)
+
+                with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+                    tracker.update([], book, {}, diagnostic_context=context)
+
+                record = json.loads(
+                    captured.records[0].getMessage().split("wall_state_transition=", 1)[1]
+                )
+                self.assertEqual(record["reason"], expected)
+                self.assertEqual(record["new_status"], "CANDIDATE")
+                self.assertEqual(tracker.get_stable_walls(), [])
+
+        book = LocalOrderBook()
+        book.bids[100.0] = 20.0
+        tracker = WallTracker(min_age_seconds=0)
+        candidate = {"side": "buy", "price": 100.0, "notional": 2000.0,
+                     "wall_ratio": 1000.0, "median_notional": 2.0}
+        tracker.update([candidate], book, {})
+        book.bids.pop(100.0)
+        with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+            tracker.update([], book, {})
+        record = json.loads(
+            captured.records[0].getMessage().split("wall_state_transition=", 1)[1]
+        )
+        self.assertEqual(record["reason"], "WALL_REMOVED")
+        self.assertEqual(record["new_status"], "REMOVED")
+
+    def test_stable_loss_log_is_one_shot_and_does_not_change_tracker_behavior(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 10.0
+        observed = WallTracker(min_age_seconds=40)
+        control = WallTracker(min_age_seconds=40)
+        candidate = {
+            "side": "buy", "price": 100.0, "notional": 1000.0,
+            "wall_ratio": 900.0, "median_notional": 1000.0 / 900.0,
+        }
+        clock = [100.0]
+        context = {
+            "symbol": "ETHUSDT", "connection_generation": 7,
+            "last_price": 100.5, "min_wall_ratio": 888.0,
+            "min_wall_notional_usdt": 500.0,
+            "max_wall_distance_bps": 200.0,
+            "side_medians": {"buy": candidate["median_notional"]},
+            "active_pending_wall_ids": set(),
+        }
+
+        with patch("script.wall_tracker.time.monotonic", side_effect=lambda: clock[0]):
+            observed.update([candidate], book, {}, diagnostic_context=context)
+            control.update([candidate], book, {})
+            observed.walls[("buy", 100.0)]["first_seen"] = 100.0
+            control.walls[("buy", 100.0)]["first_seen"] = 100.0
+            clock[0] = 140.0
+            with self.assertNoLogs("script.wall_tracker", level="WARNING"):
+                observed.update([candidate], book, {}, diagnostic_context=context)
+                control.update([candidate], book, {})
+            self.assertEqual(observed.walls[("buy", 100.0)]["status"], "stable")
+            self.assertEqual(control.walls[("buy", 100.0)]["status"], "stable")
+
+            observed_wall = observed.walls[("buy", 100.0)]
+            context["active_pending_wall_ids"] = {
+                f"ETHUSDT:buy:100:{observed_wall['first_seen_at']}"
+            }
+            context["last_price"] = 100.6
+            context["side_medians"] = {"buy": 2.0}
+            clock[0] = 141.0
+            with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+                observed.update([], book, {}, diagnostic_context=context)
+            with self.assertLogs("script.wall_tracker", level="WARNING"):
+                control.update([], book, {})
+
+        logged = [
+            json.loads(record.getMessage().split("wall_state_transition=", 1)[1])
+            for record in captured.records
+        ]
+        self.assertEqual(len(logged), 1)
+        transition = logged[0]
+        self.assertEqual(transition["timestamp_utc"][-6:], "+00:00")
+        self.assertEqual(transition["symbol"], "ETHUSDT")
+        self.assertEqual(transition["websocket_generation"], 7)
+        self.assertEqual(transition["wall_id"], next(iter(context["active_pending_wall_ids"])))
+        self.assertEqual(transition["side"], "BID")
+        self.assertEqual(transition["previous_status"], "STABLE")
+        self.assertEqual(transition["new_status"], "CANDIDATE")
+        self.assertEqual(transition["reason"], "WALL_RATIO_FAILED")
+        self.assertEqual(transition["previous_notional_usdt"], 1000.0)
+        self.assertEqual(transition["current_notional_usdt"], 1000.0)
+        self.assertAlmostEqual(transition["previous_side_median_usdt"], 1000 / 900)
+        self.assertEqual(transition["current_side_median_usdt"], 2.0)
+        self.assertEqual(transition["previous_wall_ratio"], 900.0)
+        self.assertEqual(transition["current_wall_ratio"], 500.0)
+        self.assertEqual(transition["min_wall_ratio"], 888.0)
+        self.assertIsNotNone(transition["previous_distance_bps"])
+        self.assertIsNotNone(transition["current_distance_bps"])
+        self.assertEqual(transition["max_wall_distance_bps"], 200.0)
+        self.assertEqual(transition["stable_age_seconds"], 41.0)
+        self.assertTrue(transition["active_pending"])
+
+        observed_wall = observed.walls[("buy", 100.0)]
+        control_wall = control.walls[("buy", 100.0)]
+        for field in ("status", "qualifies", "first_seen", "current_size", "wall_ratio"):
+            self.assertEqual(observed_wall[field], control_wall[field])
+        self.assertEqual(observed.qualification_transitions, control.qualification_transitions)
+
     def test_wall_qualification_transition_counts_measure_filter_flapping(self):
         book = LocalOrderBook()
         book.bids[100.0] = 100.0
@@ -713,6 +843,35 @@ class MarketDataSnapshotHandshakeTests(unittest.TestCase):
 
 
 class MarketDataReconnectTests(unittest.TestCase):
+    def test_reconnect_logs_stable_wall_reset_with_pending_and_generation(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        engine._market_health("BTCUSDT")["connection_generation"] = 7
+        wall = {
+            "side": "buy", "price": 100.0,
+            "first_seen_at": "reconnect-lifecycle", "current_size": 2000.0,
+            "wall_ratio": 900.0, "median_notional": 2.22,
+            "distance_bps": 25.0, "age": 120.0,
+        }
+        engine.latest_stable_walls["BTCUSDT"] = (wall,)
+        engine.trade_manager.trades.append({
+            "symbol": "BTCUSDT", "status": "pending",
+            "wall_id": "BTCUSDT:buy:100:reconnect-lifecycle",
+        })
+
+        with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+            _log_reconnect_stable_resets(
+                "BTCUSDT", engine, engine.pair_settings["BTCUSDT"]
+            )
+
+        record = json.loads(
+            captured.records[0].getMessage().split("wall_state_transition=", 1)[1]
+        )
+        self.assertEqual(record["reason"], "RECONNECT")
+        self.assertEqual(record["websocket_generation"], 7)
+        self.assertTrue(record["active_pending"])
+        self.assertEqual(record["previous_status"], "STABLE")
+        self.assertEqual(record["new_status"], "CANDIDATE")
+
     def test_reconnection_reuses_worker_and_clears_error_after_sync(self):
         engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
         engine.start()
