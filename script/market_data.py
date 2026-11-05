@@ -858,6 +858,10 @@ async def _run_connection(
                 health = engine.get_market_data_health(symbol)
                 if not health["fresh"]:
                     continue
+                # Consume a fresh crossing for plans admitted by the prior
+                # complete snapshot before Scanner/WallTracker can invalidate
+                # their wall on this same market move.
+                await engine.process_confirmed_entry_tick(symbol, last_price)
                 flow = trade_flow.get_flow()
                 pair_settings = engine.pair_settings.get(symbol, pair_settings)
                 result = analyze_synced_orderbook(
@@ -871,6 +875,7 @@ async def _run_connection(
                 await engine.process_market_update(
                     symbol, last_price, stable_walls, result["wall_events"],
                     result["candidates"], price_updated=True,
+                    entry_preprocessed=True,
                 )
                 pending_reconciled = True
                 if needs_reconciliation:

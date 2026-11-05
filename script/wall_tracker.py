@@ -73,7 +73,6 @@ class WallTracker:
                 "qualifies": True,
 
                 "first_seen": now,
-                "qualified_since": now,
                 "first_seen_at": self._restored_lifecycle_identities.pop(
                     key, datetime.now(timezone.utc).isoformat()
                 ),
@@ -147,12 +146,16 @@ class WallTracker:
             is_qualified = candidate is not None
             if was_qualified and not is_qualified:
                 self.qualification_transitions["lost"] += 1
-                wall["qualified_since"] = None
+                # The only stability clock is the continuous Scanner-qualified
+                # period. A ratio/notional/distance miss ends it immediately.
+                wall["first_seen"] = now
+                wall["status"] = "candidate"
             elif not was_qualified and is_qualified:
                 self.qualification_transitions["restored"] += 1
-                # Keep the physical wall age/status intact. The planner uses
-                # this timestamp only before re-issuing a canceled plan.
-                wall["qualified_since"] = now
+                # Requalification starts a new full period, even when the exact
+                # price level remained present in the local book.
+                wall["first_seen"] = now
+                wall["status"] = "candidate"
             wall["qualifies"] = is_qualified
             if candidate is not None:
                 wall["wall_ratio"] = candidate.get("wall_ratio", wall["wall_ratio"])
@@ -291,14 +294,10 @@ class WallTracker:
                 continue
 
             age = now - wall["first_seen"]
-            qualified_since = wall.get("qualified_since", wall["first_seen"])
 
             stable.append({
                 **wall,
                 "age": age,
-                "qualification_age": max(
-                    0.0, now - float(qualified_since)
-                ) if qualified_since is not None else 0.0,
             })
 
         return stable

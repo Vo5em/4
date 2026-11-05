@@ -205,18 +205,11 @@ class TradeManager:
             and str(trade.get("symbol", "")).upper() == symbol
             and trade.get("strategy_id") == strategy_id
             and trade.get("wall_side") == wall_side
-            and (
-                trade.get("status") in {"pending", "open", "closed"}
-                or (
-                    trade.get("status") == "cancelled"
-                    and trade.get("close_reason") == "ENTRY_BLOCKED_BY_OPEN_TRADE"
-                )
-            )
+            and trade.get("status") in {"pending", "open", "closed"}
             for trade in self.trades
         ):
             self.last_create_rejection_reason = (
-                "Эта стена уже использовалась указанной парой и стратегией "
-                "либо была заблокирована занятым OPEN-слотом."
+                "Эта стена уже использовалась указанной парой и стратегией."
             )
             return None
 
@@ -696,6 +689,19 @@ class TradeManager:
             str(trade["wall_side"]), float(trade["wall_price"]),
         )
         return {"event": "ENTRY_CANCELLED", "trade": trade}
+
+    def cancel_pending_signal(self, signal_id: str, reason: str) -> dict | None:
+        """Cancel one non-manual PENDING while retaining its history row."""
+        trade = self.find_trade(signal_id)
+        if trade is None or trade.get("status") != "pending":
+            return None
+        trade.update(
+            status="cancelled",
+            closed_at=datetime.now(timezone.utc),
+            close_reason=str(reason),
+            entry_armed=False,
+        )
+        return {"event": "ENTRY_CANCELLED", "trade": trade, "reason": reason}
 
     def close_trade(self, signal_id: str, price: float) -> dict | None:
         trade = self.find_trade(signal_id)

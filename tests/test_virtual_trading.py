@@ -211,6 +211,54 @@ class WallTrackerTests(unittest.TestCase):
         tracker.update([], book, {})
         self.assertEqual(tracker.qualification_transitions, {"lost": 2, "restored": 1})
 
+    def test_scanner_qualification_loss_resets_the_single_stability_period(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=40)
+        wall = {"side": "buy", "price": 100.0, "notional": 10000.0,
+                "wall_ratio": 900.0}
+
+        tracker.update([wall], book, {})
+        tracked = tracker.walls[("buy", 100.0)]
+        tracked["first_seen"] = monotonic() - 41
+        tracker.update([wall], book, {})
+        self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
+
+        # A complete Scanner result without this level represents a confirmed
+        # ratio/notional/distance qualification failure; the level is still in
+        # the synchronized book, so this is not a physical-removal event.
+        prior_first_seen = tracked["first_seen"]
+        tracker.update([], book, {})
+        self.assertEqual(tracker.get_stable_walls(), [])
+        self.assertEqual(tracked["status"], "candidate")
+        self.assertFalse(tracked["qualifies"])
+        self.assertGreater(tracked["first_seen"], prior_first_seen)
+
+        tracker.update([wall], book, {})
+        self.assertEqual(tracked["status"], "candidate")
+        self.assertTrue(tracked["qualifies"])
+        self.assertLess(monotonic() - tracked["first_seen"], 40)
+        self.assertEqual(tracker.get_stable_walls(), [])
+
+        tracked["first_seen"] = monotonic() - 41
+        tracker.update([wall], book, {})
+        self.assertEqual(len(tracker.get_stable_walls()), 1)
+
+    def test_continuous_scanner_qualification_requires_40_seconds(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 100.0
+        tracker = WallTracker(min_age_seconds=40)
+        wall = {"side": "buy", "price": 100.0, "notional": 10000.0}
+        clock = [100.0]
+        with patch("script.wall_tracker.time.monotonic", side_effect=lambda: clock[0]):
+            tracker.update([wall], book, {})
+            clock[0] = 139.0
+            tracker.update([wall], book, {})
+            self.assertEqual(tracker.get_stable_walls(), [])
+            clock[0] = 140.0
+            tracker.update([wall], book, {})
+            self.assertEqual(len(tracker.get_stable_walls()), 1)
+
     def test_short_lived_candidate_disappearance_is_reported_as_removed(self):
         book = LocalOrderBook()
         book.bids[100.0] = 100.0
@@ -235,60 +283,6 @@ class WallTrackerTests(unittest.TestCase):
         tracker.walls[("buy", 100.0)]["first_seen"] = monotonic() - 41
         tracker.update([tracked], book, {})
         self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
-
-    def test_brief_ratio_change_above_threshold_does_not_reset_wall_or_qualification_age(self):
-        book = LocalOrderBook()
-        book.bids[100.0] = 100.0
-        tracker = WallTracker(min_age_seconds=40)
-        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0,
-                   "wall_ratio": 900.0}
-        tracker.update([tracked], book, {})
-        state = tracker.walls[("buy", 100.0)]
-        state["first_seen"] = monotonic() - 41
-        tracker.update([tracked], book, {})
-        first_seen = state["first_seen"]
-        qualified_since = state["qualified_since"]
-
-        tracker.update([dict(tracked, wall_ratio=889.0)], book, {})
-
-        self.assertEqual(state["first_seen"], first_seen)
-        self.assertEqual(state["qualified_since"], qualified_since)
-        self.assertEqual(len(tracker.get_stable_walls()), 1)
-
-    def test_qualification_loss_preserves_physical_stable_age_and_wall_id(self):
-        book = LocalOrderBook()
-        book.bids[100.0] = 100.0
-        tracker = WallTracker(min_age_seconds=40)
-        tracked = {"side": "buy", "price": 100.0, "notional": 10000.0,
-                   "wall_ratio": 900.0}
-        tracker.update([tracked], book, {})
-        state = tracker.walls[("buy", 100.0)]
-        state["first_seen"] = monotonic() - 41
-        tracker.update([tracked], book, {})
-        original_first_seen = state["first_seen"]
-        original_identity = state["first_seen_at"]
-        self.assertEqual(len(tracker.get_stable_walls()), 1)
-
-        # A complete Scanner update temporarily drops qualification. Physical
-        # lifetime and STABLE state do not restart, but this wall leaves the
-        # qualifying STABLE output until the Scanner admits it again.
-        tracker.update([], book, {})
-        self.assertEqual(state["status"], "stable")
-        self.assertFalse(state["qualifies"])
-        self.assertEqual(state["first_seen"], original_first_seen)
-        self.assertIsNone(state["qualified_since"])
-        self.assertEqual(tracker.get_stable_walls(), [])
-
-        # Qualification returning restores the old physical wall age and
-        # identity. The separate qualification age starts at recovery.
-        tracker.update([tracked], book, {})
-        self.assertEqual(state["status"], "stable")
-        self.assertTrue(state["qualifies"])
-        self.assertEqual(state["first_seen"], original_first_seen)
-        self.assertEqual(state["first_seen_at"], original_identity)
-        stable_wall, = tracker.get_stable_walls()
-        self.assertEqual(stable_wall["first_seen_at"], original_identity)
-        self.assertLess(stable_wall["qualification_age"], 40)
 
     def test_candidate_disappearing_before_forty_seconds_never_becomes_stable(self):
         book = LocalOrderBook()
@@ -843,11 +837,10 @@ class WallStrategyTests(unittest.TestCase):
         self.assertEqual(signal.side, "long")
         self.assertEqual(signal.entry_trigger_direction, "cross_up")
 
-    def test_breakout_buy_wall_remains_plan_eligible_after_price_moves_below_it(self):
+    def test_breakout_below_buy_wall_is_short_and_single_touch_is_not_enough(self):
         strategy = BreakoutStrategy()
         wall = self.wall("buy")
-        signal, = strategy.evaluate(self.context(strategy, 99.99, 1, [wall]))
-        self.assertEqual(signal.side, "short")
+        self.assertEqual(strategy.evaluate(self.context(strategy, 99.99, 1, [wall])), [])
         signal, = strategy.evaluate(self.context(strategy, 100.01, 2, [wall]))
         self.assertEqual(signal.side, "short")
         self.assertEqual(signal.entry_trigger_direction, "cross_down")
@@ -1038,16 +1031,9 @@ class WallStrategyTests(unittest.TestCase):
             self.context(strategy, 100.046, 1, [wall])
         )
         trace = traces[0]
-        side_condition = next(c for c in trace["conditions"] if c["condition"] == "wall_position_relative_to_price")
+        side_condition = next(c for c in trace["conditions"] if c["condition"] == "wall_on_valid_side_of_price")
         self.assertTrue(side_condition["passed"])
-        self.assertTrue(side_condition["informational_valid_side"])
         self.assertTrue(trace["signal_formed"])
-
-        crossed_wall_signals, crossed_wall_traces = strategy.evaluate_with_diagnostics(
-            self.context(strategy, 100.06, 2, [wall])
-        )
-        self.assertEqual(len(crossed_wall_signals), 1)
-        self.assertFalse(crossed_wall_traces[0]["conditions"][1]["informational_valid_side"])
 
     def test_signal_forming_for_each_qualified_wall_is_accepted(self):
         strategy = BounceStrategy()
@@ -2366,10 +2352,10 @@ class EngineControlTests(unittest.TestCase):
         engine.set_feed_status("BTCUSDT", "connected")
         wall = {"side": "buy", "price": 100.0, "notional": 1000.0, "age": 50.0}
         MarketFreshnessTests.record_market_health(engine, price_value=100.1)
-        events = engine.on_market_update("BTCUSDT", 100.1, [wall])
+        events = engine.on_market_update("BTCUSDT", 100.1, [wall], (), [wall])
         pending = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
         run_immediate(engine.cancel_pending_trade(pending["signal_id"]))
-        self.assertEqual(engine.on_market_update("BTCUSDT", 100.1, [wall]), [])
+        self.assertEqual(engine.on_market_update("BTCUSDT", 100.1, [wall], (), [wall]), [])
         self.assertEqual(engine.trade_manager.get_pending_trades(), [])
         self.assertTrue(engine.trade_manager.is_wall_manually_cancelled(
             "BTCUSDT", "manual_cancel_test", "BTCUSDT:buy:100:lifecycle-old"
@@ -2380,7 +2366,7 @@ class EngineControlTests(unittest.TestCase):
         engine = MarketFreshnessTests.make_engine()
         engine.repository = repository
         MarketFreshnessTests.record_market_health(engine, price_value=100.0)
-        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
         trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
         MarketFreshnessTests.record_market_health(engine, price_value=100.25)
         engine.trade_manager.on_price("BTCUSDT", 100.25, process_open=False)
@@ -2398,7 +2384,7 @@ class EngineControlTests(unittest.TestCase):
         engine.repository = repository
         engine.instrument_tick_sizes["BTCUSDT"] = 0.01
         MarketFreshnessTests.record_market_health(engine, price_value=100.0)
-        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
         trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
 
         run_immediate(engine.update_open_trade_level(
@@ -2815,7 +2801,7 @@ class MarketFreshnessTests(unittest.TestCase):
         engine = self.make_engine()
         self.record_market_health(engine, received_age=2.0)
 
-        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
 
         self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
         self.assertEqual(engine.trade_manager.trades, [])
@@ -2837,24 +2823,24 @@ class MarketFreshnessTests(unittest.TestCase):
             "wall_ratio": 900.0, "age": 45.0,
         }
         self.record_market_health(engine, price_value=100.1)
-        engine.on_market_update("BTCUSDT", 100.1, [wall])
+        engine.on_market_update("BTCUSDT", 100.1, [wall], (), [wall])
         pending, = engine.trade_manager.get_pending_trades()
         self.assertTrue(pending["entry_armed"])
 
         # Price crossed Entry while the stream was stale. It must not use the
         # old pre-gap price as evidence of a continuous crossing.
         self.record_market_health(engine, received_age=2.0, price_value=99.9)
-        engine.on_market_update("BTCUSDT", 99.9, [wall])
+        engine.on_market_update("BTCUSDT", 99.9, [wall], (), [wall])
         self.assertEqual(pending["status"], "pending")
         self.assertFalse(pending["entry_armed"])
 
         self.record_market_health(engine, price_value=100.1)
-        engine.on_market_update("BTCUSDT", 100.1, [wall])
+        engine.on_market_update("BTCUSDT", 100.1, [wall], (), [wall])
         self.assertEqual(pending["status"], "pending")
         self.assertTrue(pending["entry_armed"])
 
         self.record_market_health(engine, price_value=100.01)
-        events = engine.on_market_update("BTCUSDT", 100.01, [wall])
+        events = engine.on_market_update("BTCUSDT", 100.01, [wall], (), [wall])
         self.assertIn("ENTRY_ACTIVATED", [event["event"] for event in events])
         self.assertEqual(pending["status"], "open")
 
@@ -2867,15 +2853,183 @@ class MarketFreshnessTests(unittest.TestCase):
         self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
         self.assertEqual(engine.get_entry_block_reason("BTCUSDT"), "Локальный стакан не синхронизирован.")
 
+    def test_confirmed_ticker_crossing_precedes_same_tick_wall_cancellation(self):
+        settings = PairSettings(
+            "BTCUSDT", max_wall_distance_bps=200, min_wall_age_seconds=0,
+        )
+        engine = TradingEngine(
+            {"BTCUSDT": settings},
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        wall = {
+            "side": "buy", "price": 100.0, "first_seen_at": "cross-priority",
+            "current_size": 10000.0, "initial_size": 10000.0,
+            "wall_ratio": 900.0, "age": 45.0,
+        }
+
+        self.record_market_health(engine, price_value=100.1)
+        run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [wall], (), [wall],
+        ))
+        pending, = engine.trade_manager.get_pending_trades()
+        # One successful complete snapshot authorizes this existing plan for
+        # the next ticker, not for the tick that created it.
+        run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [wall], (), [wall],
+        ))
+        self.assertTrue(pending["entry_armed"])
+
+        self.record_market_health(engine, price_value=99.99)
+        entry_events = run_immediate(
+            engine.process_confirmed_entry_tick("BTCUSDT", 99.99)
+        )
+        self.assertIn("ENTRY_ACTIVATED", [event["event"] for event in entry_events])
+
+        # The same tick's Scanner result no longer includes the wall. The
+        # already-open position must survive that reconciliation.
+        events = run_immediate(engine.process_market_update(
+            "BTCUSDT", 99.99, [], (), [], entry_preprocessed=True,
+        ))
+        self.assertEqual(pending["status"], "open")
+        self.assertNotIn("ENTRY_CANCELLED", [event["event"] for event in events])
+
+    def test_orderbook_first_cancels_plan_before_later_ticker_crossing(self):
+        settings = PairSettings(
+            "BTCUSDT", max_wall_distance_bps=200, min_wall_age_seconds=0,
+        )
+        engine = TradingEngine(
+            {"BTCUSDT": settings},
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        wall = {
+            "side": "buy", "price": 100.0, "first_seen_at": "book-first",
+            "current_size": 10000.0, "initial_size": 10000.0,
+            "wall_ratio": 900.0, "age": 45.0,
+        }
+        self.record_market_health(engine, price_value=100.1)
+        run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [wall], (), [wall],
+        ))
+        pending, = engine.trade_manager.get_pending_trades()
+        run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [wall], (), [wall],
+        ))
+
+        # A complete book update reports the wall gone before the ticker arrives.
+        events = run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [], (), [], price_updated=False,
+        ))
+        self.assertEqual(pending["status"], "cancelled")
+        self.assertIn("ENTRY_CANCELLED", [event["event"] for event in events])
+        self.record_market_health(engine, price_value=99.99)
+        self.assertEqual(run_immediate(
+            engine.process_confirmed_entry_tick("BTCUSDT", 99.99)
+        ), [])
+        self.assertEqual(pending["status"], "cancelled")
+
     def test_fresh_synchronized_tick_is_the_virtual_entry_price(self):
         engine = self.make_engine()
         self.record_market_health(engine, price_value=100.125)
 
-        events = engine.on_market_update("BTCUSDT", 100.125, [])
+        events = engine.on_market_update("BTCUSDT", 100.125, [], (), [])
 
         trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
         self.assertEqual(trade["entry_price"], 100.125)
         self.assertEqual(engine.trade_manager.last_prices.get("BTCUSDT"), 100.125)
+
+    def test_incomplete_scanner_snapshot_cannot_create_pending_with_live_metadata(self):
+        engine = self.make_engine()
+        self.record_market_health(engine, price_value=100.0)
+
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), None)
+
+        self.assertNotIn("TRADE_CREATED", [event["event"] for event in events])
+        self.assertEqual(engine.trade_manager.get_pending_trades(), [])
+        self.assertEqual(
+            engine.wall_diagnostics["BTCUSDT"]["planner_reconciliation"]["status"],
+            "skipped",
+        )
+
+    def test_new_pending_is_not_opened_by_entry_crossing_before_its_creation(self):
+        engine = TradingEngine(
+            {"BTCUSDT": PairSettings(
+                "BTCUSDT", min_wall_age_seconds=0, max_wall_distance_bps=200,
+            )},
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        wall = {
+            "side": "buy", "price": 100.0, "first_seen_at": "past-cross",
+            "current_size": 10000.0, "initial_size": 10000.0,
+            "wall_ratio": 900.0, "age": 45.0,
+        }
+        # The market crossed Entry before this Scanner snapshot admitted the
+        # newly visible wall. BID remains below the current price, so the wall
+        # is still a valid candidate even though Entry is now behind price.
+        engine.trade_manager.last_prices["BTCUSDT"] = 100.03
+        self.record_market_health(engine, price_value=100.01)
+        self.assertEqual(
+            run_immediate(engine.process_confirmed_entry_tick("BTCUSDT", 100.01)),
+            [],
+        )
+        events = run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.01, [wall], (), [wall], entry_preprocessed=True,
+        ))
+
+        self.assertIn("TRADE_CREATED", [event["event"] for event in events])
+        pending, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(pending["status"], "pending")
+        self.assertFalse(pending["entry_armed"])
+
+    def test_entry_crossing_rolls_back_if_postgres_does_not_save(self):
+        repository = FakeRepository()
+        settings = PairSettings(
+            "BTCUSDT", min_wall_age_seconds=0, max_wall_distance_bps=200,
+        )
+        engine = TradingEngine(
+            {"BTCUSDT": settings}, repository=repository,
+            enabled_strategies={"BTCUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["BTCUSDT"] = 0.01
+        engine.start()
+        engine.set_feed_status("BTCUSDT", "connected")
+        wall = {
+            "side": "buy", "price": 100.0, "first_seen_at": "persist-cross",
+            "current_size": 10000.0, "initial_size": 10000.0,
+            "wall_ratio": 900.0, "age": 45.0,
+        }
+        self.record_market_health(engine, price_value=100.1)
+        run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [wall], (), [wall],
+        ))
+        run_immediate(engine.process_market_update(
+            "BTCUSDT", 100.1, [wall], (), [wall],
+        ))
+        pending, = engine.trade_manager.get_pending_trades()
+        balance_before = engine.trade_manager.balance_usdt
+
+        repository.fail_trade_saves = True
+        self.record_market_health(engine, price_value=99.99)
+        self.assertEqual(run_immediate(
+            engine.process_confirmed_entry_tick("BTCUSDT", 99.99)
+        ), [])
+
+        restored_pending, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(restored_pending["status"], "pending")
+        self.assertEqual(engine.trade_manager.balance_usdt, balance_before)
+        self.assertEqual(engine._entry_eligible_pending_ids.get("BTCUSDT"), None)
+        self.assertEqual(
+            engine.wall_diagnostics["BTCUSDT"]["planner_reconciliation"]["reason"],
+            "PERSISTENCE_FAILED",
+        )
 
     def test_public_trade_batch_uses_last_accepted_trade_and_records_sequence(self):
         cursor = TradeEventCursor()
@@ -2931,12 +3085,12 @@ class MarketFreshnessTests(unittest.TestCase):
     def test_open_position_continues_to_be_managed_while_entries_are_paused(self):
         engine = self.make_engine()
         self.record_market_health(engine)
-        created = engine.on_market_update("BTCUSDT", 100.0, [])
+        created = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
         trade = next(event["trade"] for event in created if event["event"] == "TRADE_CREATED")
         engine.pause_new_entries()
         self.record_market_health(engine, price_value=98.0)
 
-        events = engine.on_market_update("BTCUSDT", 98.0, [])
+        events = engine.on_market_update("BTCUSDT", 98.0, [], (), [])
 
         self.assertEqual(trade["status"], "closed")
         self.assertEqual(trade["close_reason"], "STOP_LOSS")
@@ -2944,7 +3098,7 @@ class MarketFreshnessTests(unittest.TestCase):
 
     def _open_position(self, engine):
         self.record_market_health(engine, price_value=100.0)
-        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
         return next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
 
     def test_open_trade_does_not_close_on_stale_price_past_stop(self):
@@ -3054,7 +3208,7 @@ class MarketFreshnessTests(unittest.TestCase):
 
         engine = self.make_engine()
         self.record_market_health(engine)
-        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
         trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
         callback = FakeCallback()
 
@@ -3095,7 +3249,7 @@ class MarketFreshnessTests(unittest.TestCase):
     def test_book_only_refresh_does_not_reuse_old_price_for_stop_management(self):
         engine = self.make_engine()
         self.record_market_health(engine)
-        events = engine.on_market_update("BTCUSDT", 100.0, [])
+        events = engine.on_market_update("BTCUSDT", 100.0, [], (), [])
         trade = next(event["trade"] for event in events if event["event"] == "TRADE_CREATED")
         trade["status"] = "open"
         engine._market_health("BTCUSDT")["price_received_monotonic"] = monotonic() - 2.0

@@ -1717,6 +1717,8 @@ def _planner_wall_line(wall: dict) -> str:
             status += "; стратегия не выбрала стену"
         if trace.get("pending_created"):
             status += "; PENDING создан"
+        elif trace.get("pending_preserved"):
+            status += "; существующий PENDING сохранён"
         elif trace.get("trade_planner_reason"):
             status += "; TradeManager отказал"
         lines.append(f"  {strategy_id}: стена передана · {status}")
@@ -1755,6 +1757,44 @@ def stable_walls_text(
             if rejected else "нет"
         )
         planner_walls = data.get("planner_wall_decisions") or []
+        reconciliation = data.get("planner_reconciliation") or {}
+        reconciliation_status = str(reconciliation.get("status", "нет данных")).upper()
+        reconciliation_lines = [
+            f"Полная сверка: {escape(reconciliation_status)} · "
+            f"поколение {escape(str(data.get('scanner_snapshot_generation') or 'нет данных'))} · "
+            f"снимок <code>{escape(str(data.get('scanner_snapshot_id') or 'нет данных'))}</code>"
+        ]
+        reconciliation_strategies = reconciliation.get("strategies") or data.get(
+            "planner_reconciliation_by_strategy", {}
+        )
+        for strategy_id, counts in sorted(reconciliation_strategies.items()):
+            if counts.get("status") != "complete":
+                reconciliation_lines.append(
+                    f"{escape(str(strategy_id))}: {escape(str(counts.get('reason', counts.get('status', 'нет данных'))))}"
+                )
+                continue
+            reconciliation_lines.append(
+                f"{escape(str(strategy_id))}: STABLE {counts.get('stable_count', 0)} · "
+                f"доступно {counts.get('available_stable_count', 0)} · "
+                f"использовано {counts.get('used_stable_count', 0)} · "
+                f"ручной блок {counts.get('manual_block_count', 0)} · "
+                f"PENDING {counts.get('pending_after', 0)} · "
+                f"STABLE без плана {counts.get('stable_without_pending', 0)} · "
+                f"PENDING без STABLE {counts.get('pending_without_stable', 0)} · "
+                f"создано/отменено {counts.get('pending_created_this_snapshot', 0)}/"
+                f"{counts.get('pending_cancelled_this_snapshot', 0)} · "
+                f"сохранено при смене стороны {counts.get('pending_preserved_by_price_side', 0)}"
+            )
+        entry_outcomes = data.get("last_entry_outcomes") or []
+        if entry_outcomes:
+            outcome_lines = []
+            for outcome in entry_outcomes[-5:]:
+                outcome_lines.append(
+                    f"Вход: {escape(str(outcome.get('event', 'нет данных')))} · "
+                    f"{escape(str(outcome.get('strategy_id') or ''))} · "
+                    f"{escape(str(outcome.get('reason') or 'без отказа'))}"
+                )
+            reconciliation_lines.extend(outcome_lines)
         scanner = data.get("scanner_diagnostics") or {}
         medians = scanner.get("side_medians") or {}
         sweep = scanner.get("ratio_sweep") or {}
@@ -1796,6 +1836,7 @@ def stable_walls_text(
             f"Крупнейшие уровни: {escape('; '.join(largest) or 'нет данных')}\n"
             f"Стратегии пары: {escape(', '.join(data.get('planner_strategies') or []) or 'нет данных')}\n"
             f"Trade Planner: {escape(_compact_planner_decision(data.get('planner_decision')))}\n"
+            + "\n".join(reconciliation_lines) + "\n"
             f"Оценка стен · стр. {page + 1}/{total_pages}:"
         )
         body = summary + "\n" + ("\n".join(_planner_wall_line(wall) for wall in selected) or "Нет оценённых стабильных стен.")
