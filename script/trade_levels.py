@@ -11,6 +11,7 @@ BOUNCE_STRATEGY_ID = "bounce"
 BREAKOUT_STRATEGY_ID = "breakout"
 BPS_DENOMINATOR = Decimal("10000")
 ENTRY_DISTANCE_BPS = Decimal("1.5")
+FALSE_BREAKOUT_PENDING_TIMEOUT_SECONDS = 900
 
 
 def effective_trade_level_bps(pair_settings, trading_settings) -> tuple[float, float]:
@@ -26,6 +27,22 @@ def effective_trade_level_bps(pair_settings, trading_settings) -> tuple[float, f
         else pair_settings.stop_loss_bps
     )
     return float(take_profit), float(stop_loss)
+
+
+def effective_strategy_trade_level_bps(
+    pair_settings, trading_settings, strategy_id: str,
+) -> tuple[float, float]:
+    """Resolve strategy-specific pair overrides, then legacy pair/global defaults."""
+    if strategy_id not in {"bounce", "breakout"}:
+        return effective_trade_level_bps(pair_settings, trading_settings)
+    prefix = strategy_id
+    take_profit = getattr(pair_settings, f"{prefix}_take_profit_bps", None)
+    stop_loss = getattr(pair_settings, f"{prefix}_stop_loss_bps", None)
+    legacy_tp, legacy_sl = effective_trade_level_bps(pair_settings, trading_settings)
+    return (
+        float(legacy_tp if take_profit is None else take_profit),
+        float(legacy_sl if stop_loss is None else stop_loss),
+    )
 
 
 def estimate_trade_outcomes(
@@ -175,3 +192,51 @@ def calculate_trade_levels(
         "take_profit": take_profit,
         "entry_trigger_direction": trigger,
     }
+
+
+def calculate_false_breakout_points(
+    *, wall_side: str, wall_price, tick_size, point_1_offset_bps, point_2_distance_bps,
+) -> tuple[Decimal, Decimal]:
+    """Calculate tick-aligned False Breakout points measured successively."""
+    wall = Decimal(str(wall_price))
+    tick = Decimal(str(tick_size))
+    offset = Decimal(str(point_1_offset_bps)) / BPS_DENOMINATOR
+    distance = Decimal(str(point_2_distance_bps)) / BPS_DENOMINATOR
+    if wall <= 0 or tick <= 0 or wall_side not in {"buy", "sell"}:
+        raise ValueError("wall, tickSize and side must be valid")
+    if offset <= 0 or distance <= 0 or offset >= 1 or distance >= 1:
+        raise ValueError("False Breakout point distances must be positive and below 10000 bps")
+    direction = Decimal(1) if wall_side == "sell" else Decimal(-1)
+    rounding = ROUND_CEILING if direction > 0 else ROUND_FLOOR
+    point_1 = _round_to_tick(wall * (Decimal(1) + direction * offset), tick, rounding)
+    point_2 = _round_to_tick(
+        point_1 * (Decimal(1) + direction * distance), tick, rounding
+    )
+    if direction > 0 and not wall < point_1 < point_2:
+        raise ValueError("Rounded ASK False Breakout points are not strictly increasing")
+    if direction < 0 and not point_2 < point_1 < wall:
+        raise ValueError("Rounded BID False Breakout points are not strictly decreasing")
+    return point_1, point_2
+
+
+def calculate_levels_from_entry(
+    *, side: str, entry_price, tick_size, take_profit_bps, stop_loss_bps,
+) -> dict:
+    """Calculate tick-rounded TP/SL from a known virtual fill price."""
+    entry = Decimal(str(entry_price))
+    tick = Decimal(str(tick_size))
+    tp_bps = Decimal(str(take_profit_bps)) / BPS_DENOMINATOR
+    sl_bps = Decimal(str(stop_loss_bps)) / BPS_DENOMINATOR
+    if side not in {"long", "short"} or entry <= 0 or tick <= 0 or tp_bps <= 0 or sl_bps <= 0:
+        raise ValueError("False Breakout fill levels are invalid")
+    if side == "long":
+        take_profit = _round_to_tick(entry * (1 + tp_bps), tick, ROUND_CEILING)
+        stop_loss = _round_to_tick(entry * (1 - sl_bps), tick, ROUND_FLOOR)
+        if not stop_loss < entry < take_profit:
+            raise ValueError("Rounded LONG TP/SL are not ordered around fill")
+    else:
+        take_profit = _round_to_tick(entry * (1 - tp_bps), tick, ROUND_FLOOR)
+        stop_loss = _round_to_tick(entry * (1 + sl_bps), tick, ROUND_CEILING)
+        if not take_profit < entry < stop_loss:
+            raise ValueError("Rounded SHORT TP/SL are not ordered around fill")
+    return {"entry_price": entry, "take_profit": take_profit, "stop_loss": stop_loss}

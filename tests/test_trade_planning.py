@@ -143,7 +143,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
     def make_engine(self, strategy=BOUNCE_STRATEGY_ID, *, max_open=3, balance=1000):
         settings = PairSettings(
             "ETHUSDT", max_wall_distance_bps=1000, max_open_trades=max_open,
-            min_wall_age_seconds=0,
+            max_wall_level_distance_bps=1000, min_wall_age_seconds=0,
         )
         engine = TradingEngine(
             {"ETHUSDT": settings},
@@ -154,6 +154,11 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             enabled_strategies={"ETHUSDT": {strategy}},
         )
         engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        touch_count = 2 if strategy == BREAKOUT_STRATEGY_ID else 1
+        engine.set_historical_levels("ETHUSDT", (
+            {"price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": touch_count},
+            {"price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": touch_count},
+        ))
         engine.start()
         return engine, settings
 
@@ -307,6 +312,9 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             enabled_strategies={"ETHUSDT": {BOUNCE_STRATEGY_ID}},
         )
         restarted_engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        restarted_engine.set_historical_levels("ETHUSDT", (
+            {"price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1},
+        ))
         restarted_engine.start()
         restarted_engine.on_market_update("ETHUSDT", 100.5, [wall], (), [wall])
         self.assertEqual(len(restored.get_pending_trades()), 1)
@@ -368,6 +376,7 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             with self.subTest(symbol=symbol):
                 settings = PairSettings(
                     symbol, min_wall_age_seconds=0, max_wall_distance_bps=1000,
+                    max_wall_level_distance_bps=1000,
                 )
                 engine = TradingEngine(
                     {symbol: settings},
@@ -375,6 +384,9 @@ class TradingPlanLifecycleTests(unittest.TestCase):
                     enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
                 )
                 engine.instrument_tick_sizes[symbol] = 0.0001
+                engine.set_historical_levels(symbol, (
+                    {"price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2},
+                ))
                 engine.start()
                 wall = {
                     "side": "buy", "price": 100.0, "first_seen_at": f"life-{symbol}",
@@ -441,13 +453,16 @@ class TradingPlanLifecycleTests(unittest.TestCase):
         symbol = "ETHUSDT"
         settings = PairSettings(
             symbol, min_wall_ratio=50, max_wall_distance_bps=200,
-            min_wall_age_seconds=0,
+            max_wall_level_distance_bps=1000, min_wall_age_seconds=0,
         )
         engine = TradingEngine(
             {symbol: settings}, TradingSettings(initial_balance_usdt=500),
             enabled_strategies={symbol: {BREAKOUT_STRATEGY_ID}},
         )
         engine.instrument_tick_sizes[symbol] = 0.01
+        engine.set_historical_levels(symbol, (
+            {"price": 99.6, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2},
+        ))
         engine.start()
         book = LocalOrderBook()
         book.bids.update({100.0: 1.0, 99.9: 1.0, 99.8: 1.0, 99.7: 1.0, 99.6: 100.0})

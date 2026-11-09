@@ -12,11 +12,12 @@ import aiohttp
 import websockets
 
 from .engine import EngineMode, MARKET_PRICE_SOURCE, TradingEngine
+from .historical_levels import fetch_historical_levels
 from .orderbook import LocalOrderBook
 from .scanner import diagnose_wall_levels, find_nearby_levels, find_walls
 from .settings import PairSettings
 from .trade_flow import TradeFlow
-from .wall_tracker import WallTracker
+from .wall_tracker import WallTracker, log_stable_wall_transition, wall_lifecycle_id
 
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
@@ -423,6 +424,9 @@ def analyze_synced_orderbook(
     flow: dict,
     pair_settings: PairSettings,
     wall_tracker: WallTracker,
+    *,
+    connection_generation: int | None = None,
+    active_pending_wall_ids: set[str] | None = None,
 ) -> dict:
     """Run wall scanning only against a successfully synchronized local book."""
     if not orderbook.synchronized:
@@ -443,7 +447,19 @@ def analyze_synced_orderbook(
         min_wall_notional=pair_settings.min_wall_notional_usdt,
         min_wall_ratio=pair_settings.min_wall_ratio,
     )
-    wall_events = wall_tracker.update(candidates, orderbook, flow)
+    wall_events = wall_tracker.update(
+        candidates, orderbook, flow,
+        diagnostic_context={
+            "symbol": pair_settings.symbol,
+            "connection_generation": connection_generation,
+            "last_price": last_price,
+            "min_wall_ratio": pair_settings.min_wall_ratio,
+            "min_wall_notional_usdt": pair_settings.min_wall_notional_usdt,
+            "max_wall_distance_bps": pair_settings.max_wall_distance_bps,
+            "side_medians": scanner_diagnostics.get("side_medians", {}),
+            "active_pending_wall_ids": active_pending_wall_ids,
+        },
+    )
     stable_walls = wall_tracker.get_nearest_stable_walls(last_price)
     observed_at = monotonic()
     tracked_walls = []
@@ -479,6 +495,48 @@ def analyze_synced_orderbook(
         "tracked_walls": tracked_walls,
         "qualification_transitions": dict(wall_tracker.qualification_transitions),
     }
+
+
+def _active_pending_wall_ids(engine: TradingEngine, symbol: str) -> set[str]:
+    return {
+        str(trade.get("wall_id"))
+        for trade in engine.trade_manager.get_pending_trades()
+        if str(trade.get("symbol", "")).upper() == symbol.upper()
+        and trade.get("wall_id")
+    }
+
+
+def _log_reconnect_stable_resets(
+    symbol: str, engine: TradingEngine, pair_settings: PairSettings,
+) -> None:
+    health = engine.get_market_data_health(symbol)
+    pending_ids = _active_pending_wall_ids(engine, symbol)
+    for wall in engine.latest_stable_walls.get(symbol.upper(), ()):
+        identity = wall_lifecycle_id(
+            symbol, wall.get("side"), wall.get("price"), wall.get("first_seen_at")
+        )
+        log_stable_wall_transition(
+            symbol=symbol,
+            generation=health.get("connection_generation"),
+            wall=wall,
+            previous_status="stable",
+            new_status="candidate",
+            reason="RECONNECT",
+            previous_notional=wall.get("current_size"),
+            current_notional=None,
+            previous_median=wall.get("median_notional"),
+            current_median=None,
+            previous_ratio=wall.get("wall_ratio"),
+            current_ratio=None,
+            min_wall_ratio=pair_settings.min_wall_ratio,
+            min_wall_notional_usdt=pair_settings.min_wall_notional_usdt,
+            previous_distance_bps=wall.get("distance_bps"),
+            current_distance_bps=None,
+            max_wall_distance_bps=pair_settings.max_wall_distance_bps,
+            stable_age_seconds=wall.get("age"),
+            active_pending=identity in pending_ids,
+            reason_detail="Поток соединения прерван; новый WallTracker начинает непрерывную квалификацию заново.",
+        )
 
 
 def _log_analysis_if_due(
@@ -817,7 +875,9 @@ async def _run_connection(
         ):
             pair_settings = engine.pair_settings.get(symbol, pair_settings)
             result = analyze_synced_orderbook(
-                orderbook, last_price, flow, pair_settings, wall_tracker
+                orderbook, last_price, flow, pair_settings, wall_tracker,
+                connection_generation=buffered_deltas.generation,
+                active_pending_wall_ids=_active_pending_wall_ids(engine, symbol),
             )
             engine.record_wall_analysis(symbol, last_price, result)
             stable_walls = result["stable_walls"]
@@ -865,7 +925,9 @@ async def _run_connection(
                 flow = trade_flow.get_flow()
                 pair_settings = engine.pair_settings.get(symbol, pair_settings)
                 result = analyze_synced_orderbook(
-                    orderbook, last_price, flow, pair_settings, wall_tracker
+                    orderbook, last_price, flow, pair_settings, wall_tracker,
+                    connection_generation=buffered_deltas.generation,
+                    active_pending_wall_ids=_active_pending_wall_ids(engine, symbol),
                 )
                 engine.record_wall_analysis(symbol, last_price, result)
                 stable_walls = result["stable_walls"]
@@ -927,7 +989,9 @@ async def _run_connection(
             ):
                 continue
             result = analyze_synced_orderbook(
-                orderbook, last_price, flow, pair_settings, wall_tracker
+                orderbook, last_price, flow, pair_settings, wall_tracker,
+                connection_generation=buffered_deltas.generation,
+                active_pending_wall_ids=_active_pending_wall_ids(engine, symbol),
             )
             engine.record_wall_analysis(symbol, last_price, result)
             walls = result["candidates"]
@@ -944,6 +1008,33 @@ async def _run_connection(
                 )
 
 
+async def _historical_level_worker(symbol: str, engine: TradingEngine) -> None:
+    while (
+        engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
+        and engine.should_run_market_feed(symbol)
+    ):
+        settings = engine.pair_settings.get(symbol.upper())
+        if settings is None:
+            return
+        try:
+            levels = await fetch_historical_levels(symbol, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            engine.set_historical_levels(symbol, (), f"{type(error).__name__}: {error}")
+            logger.warning(
+                "%s historical level refresh failed (%s)", symbol, type(error).__name__
+            )
+        else:
+            engine.set_historical_levels(symbol, levels)
+            logger.info(
+                "%s historical levels refreshed timeframe=%s candles=%d levels=%d",
+                symbol, settings.historical_level_timeframe,
+                settings.historical_level_candle_count, len(levels),
+            )
+        await asyncio.sleep(max(1.0, float(settings.historical_level_refresh_seconds)))
+
+
 async def market_data_worker(
     symbol: str,
     engine: TradingEngine,
@@ -951,37 +1042,50 @@ async def market_data_worker(
 ) -> None:
     delay = 1.0
     last_log_at = 0.0
-    while (
-        engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
-        and engine.should_run_market_feed(symbol)
-    ):
-        engine.set_feed_status(symbol, "connecting")
-        try:
-            await _run_connection(symbol, engine, pair_settings)
-            delay = 1.0
-            if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
-                engine.set_feed_status(symbol, "stopped")
-            elif not engine.pair_settings.get(symbol, pair_settings).enabled:
-                engine.set_feed_status(symbol, "stopped")
-        except asyncio.CancelledError:
-            engine.set_feed_status(symbol, "stopped")
-            raise
-        except Exception as error:
-            engine.set_feed_status(symbol, "reconnecting", error)
-            now = monotonic()
-            if now - last_log_at >= 30:
-                logger.warning(
-                    "Market feed %s disconnected; reconnecting in %.1fs",
-                    symbol,
-                    delay,
-                    exc_info=(type(error), error, error.__traceback__),
+    levels_task = asyncio.create_task(
+        _historical_level_worker(symbol, engine),
+        name=f"historical-levels-{symbol.lower()}",
+    )
+    try:
+        while (
+            engine.mode not in {EngineMode.STOPPING, EngineMode.STOPPED}
+            and engine.should_run_market_feed(symbol)
+        ):
+            engine.set_feed_status(symbol, "connecting")
+            try:
+                await _run_connection(
+                    symbol, engine, engine.pair_settings.get(symbol.upper(), pair_settings)
                 )
-                last_log_at = now
-            if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
-                break
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30.0)
-    engine.set_feed_status(symbol, "stopped")
+                delay = 1.0
+                if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
+                    engine.set_feed_status(symbol, "stopped")
+                elif not engine.pair_settings.get(symbol, pair_settings).enabled:
+                    engine.set_feed_status(symbol, "stopped")
+            except asyncio.CancelledError:
+                engine.set_feed_status(symbol, "stopped")
+                raise
+            except Exception as error:
+                if engine.feed_status.get(symbol) == "connected":
+                    _log_reconnect_stable_resets(
+                        symbol, engine, engine.pair_settings.get(symbol, pair_settings)
+                    )
+                engine.set_feed_status(symbol, "reconnecting", error)
+                now = monotonic()
+                if now - last_log_at >= 30:
+                    logger.warning(
+                        "Market feed %s disconnected; reconnecting in %.1fs",
+                        symbol, delay,
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                    last_log_at = now
+                if engine.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
+                    break
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+    finally:
+        levels_task.cancel()
+        await asyncio.gather(levels_task, return_exceptions=True)
+        engine.set_feed_status(symbol, "stopped")
 
 
 async def main() -> None:

@@ -37,6 +37,19 @@ class PairSettings:
     maintenance_margin_rate: float = 0.005
     take_profit_bps: float | None = None
     stop_loss_bps: float | None = None
+    bounce_take_profit_bps: float | None = None
+    bounce_stop_loss_bps: float | None = None
+    breakout_take_profit_bps: float | None = None
+    breakout_stop_loss_bps: float | None = None
+    historical_level_timeframe: str = "5m"
+    historical_level_candle_count: int = 500
+    historical_level_refresh_seconds: float = 300.0
+    max_wall_level_distance_bps: float = 13.0
+    false_breakout_point_1_offset_bps: float | None = None
+    false_breakout_point_2_distance_bps: float | None = None
+    false_breakout_observation_timeout_seconds: float | None = None
+    false_breakout_take_profit_bps: float | None = None
+    false_breakout_stop_loss_bps: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_pair_symbol(self.symbol))
@@ -80,6 +93,14 @@ class PairSettings:
         for name, value in (
             ("take_profit_bps", self.take_profit_bps),
             ("stop_loss_bps", self.stop_loss_bps),
+            ("bounce_take_profit_bps", self.bounce_take_profit_bps),
+            ("bounce_stop_loss_bps", self.bounce_stop_loss_bps),
+            ("breakout_take_profit_bps", self.breakout_take_profit_bps),
+            ("breakout_stop_loss_bps", self.breakout_stop_loss_bps),
+            ("false_breakout_point_1_offset_bps", self.false_breakout_point_1_offset_bps),
+            ("false_breakout_point_2_distance_bps", self.false_breakout_point_2_distance_bps),
+            ("false_breakout_take_profit_bps", self.false_breakout_take_profit_bps),
+            ("false_breakout_stop_loss_bps", self.false_breakout_stop_loss_bps),
         ):
             try:
                 valid = value is None or (isfinite(value) and value > 0)
@@ -87,6 +108,28 @@ class PairSettings:
                 valid = False
             if not valid:
                 raise ValueError(f"{name} override must be a positive finite number or None")
+        if self.false_breakout_observation_timeout_seconds is not None:
+            try:
+                valid = (
+                    isfinite(self.false_breakout_observation_timeout_seconds)
+                    and self.false_breakout_observation_timeout_seconds > 0
+                )
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError("false_breakout_observation_timeout_seconds must be positive or None")
+        if not isinstance(self.historical_level_timeframe, str) or self.historical_level_timeframe not in {
+            "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w", "1M"
+        }:
+            raise ValueError("Unsupported Bybit historical level timeframe")
+        if isinstance(self.historical_level_candle_count, bool) or not isinstance(self.historical_level_candle_count, int):
+            raise ValueError("historical_level_candle_count must be an integer")
+        if not 5 <= self.historical_level_candle_count <= 1000:
+            raise ValueError("historical_level_candle_count must be between 5 and 1000")
+        if not isfinite(self.historical_level_refresh_seconds) or self.historical_level_refresh_seconds <= 0:
+            raise ValueError("historical_level_refresh_seconds must be positive")
+        if not isfinite(self.max_wall_level_distance_bps) or self.max_wall_level_distance_bps <= 0:
+            raise ValueError("max_wall_level_distance_bps must be positive")
 
 
 @dataclass(frozen=True)

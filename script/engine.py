@@ -11,13 +11,17 @@ from .settings import PairSettings, TradingSettings
 from .execution import ExecutionBackend
 from .strategies import (
     DEFAULT_STRATEGY_ID,
+    FALSE_BREAKOUT_STRATEGY_ID,
     StrategyContext,
     StrategyRegistry,
     build_strategy_registry,
     _wall_id,
 )
 from .trade_manager import TradeManager
-from .trade_levels import calculate_trade_levels, effective_trade_level_bps
+from .trade_levels import (
+    calculate_trade_levels, effective_strategy_trade_level_bps,
+    effective_trade_level_bps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,7 @@ class TradingEngine:
         strategy_registry: StrategyRegistry | None = None,
         enabled_strategies: dict[str, set[str]] | None = None,
         strategy_versions: dict[str, int] | None = None,
+        strategy_states: dict[str, dict] | None = None,
         trade_manager: ExecutionBackend | None = None,
         repository=None,
         last_market_update_at: dict[str, datetime] | None = None,
@@ -82,10 +87,18 @@ class TradingEngine:
             )
         for strategy_ids in self.enabled_strategies.values():
             self.strategy_registry.get_enabled(strategy_ids)
+        for symbol, per_strategy in (strategy_states or {}).items():
+            for strategy in self.strategy_registry.get_enabled():
+                restore = getattr(strategy, "restore_symbol_state", None)
+                if callable(restore):
+                    restore(symbol, (per_strategy or {}).get(strategy.strategy_id))
         self.strategy_errors: dict[str, dict[str, str]] = {}
         self.trade_manager = trade_manager or TradeManager(self.trading_settings)
         self.instrument_tick_sizes: dict[str, float] = {}
         self.repository = repository
+        self.historical_levels: dict[str, tuple[dict, ...]] = {}
+        self.historical_levels_updated_at: dict[str, datetime | None] = {}
+        self.historical_level_errors: dict[str, str | None] = {}
         self.diagnostic_only = diagnostic_only
         self.diagnostic_symbols = {
             symbol.upper() for symbol in (diagnostic_symbols or set())
@@ -194,6 +207,39 @@ class TradingEngine:
             if reset is not None:
                 reset(symbol)
 
+    def reset_strategy_price_tracking(self, symbol: str) -> None:
+        for strategy in self.strategy_registry.get_enabled():
+            reset = getattr(strategy, "reset_price_tracking", None)
+            if reset is not None:
+                reset(symbol)
+
+    def export_strategy_states(self, symbol: str) -> dict:
+        symbol = symbol.upper()
+        state = {}
+        for strategy in self.strategy_registry.get_enabled():
+            export = getattr(strategy, "export_symbol_state", None)
+            if callable(export):
+                state[strategy.strategy_id] = export(symbol)
+        return state
+
+    def restore_strategy_states(self, symbol: str, state: dict) -> None:
+        for strategy in self.strategy_registry.get_enabled():
+            restore = getattr(strategy, "restore_symbol_state", None)
+            if callable(restore):
+                restore(symbol, (state or {}).get(strategy.strategy_id))
+
+    def set_historical_levels(
+        self, symbol: str, levels: tuple[dict, ...], error: str | None = None,
+    ) -> None:
+        symbol = symbol.upper()
+        self.historical_levels[symbol] = tuple(dict(level) for level in levels)
+        self.historical_levels_updated_at[symbol] = self._utc_now() if error is None else None
+        self.historical_level_errors[symbol] = error
+        diagnostics = self.wall_diagnostics.setdefault(symbol, {})
+        diagnostics["historical_levels"] = [dict(level) for level in levels]
+        diagnostics["historical_level_updated_at"] = self.historical_levels_updated_at[symbol]
+        diagnostics["historical_level_error"] = error
+
     @staticmethod
     def _utc_now() -> datetime:
         return datetime.now(timezone.utc)
@@ -203,6 +249,7 @@ class TradingEngine:
         self.feed_status[symbol] = status
         self.wall_diagnostics.setdefault(symbol, {})["feed_state"] = status
         if status != "connected":
+            self.reset_strategy_price_tracking(symbol)
             self._entry_eligible_pending_ids.pop(symbol, None)
             if status in {"connecting", "reconnecting"}:
                 self._reconnect_reconciliation_required.add(symbol)
@@ -419,6 +466,14 @@ class TradingEngine:
             previous_pending_persistence = {
                 key: dict(value) for key, value in self._pending_persistence.items()
             }
+            timeout_events = self.trade_manager.cancel_expired_false_breakout_pending()
+            if timeout_events and not await self.persist_events(timeout_events):
+                self.restore_trade_state(
+                    previous_trades, previous_balance, previous_pending_persistence
+                )
+                self._entry_eligible_pending_ids.pop(symbol, None)
+                self.trade_manager.discard_deferred_entry_tick(symbol)
+                return []
             events = self.trade_manager.on_price(
                 symbol, price, process_open=False,
                 eligible_signal_ids=eligible_ids,
@@ -1158,7 +1213,9 @@ class TradingEngine:
         for symbol in self.feed_status:
             self.feed_status[symbol] = "stopped"
 
-    async def persist_events(self, events: list[dict]) -> bool:
+    async def persist_events(
+        self, events: list[dict], *, strategy_states: dict[str, dict] | None = None,
+    ) -> bool:
         async with self._persistence_lock:
             for event in events:
                 trade = event.get("trade")
@@ -1168,17 +1225,27 @@ class TradingEngine:
                 self._pending_persistence.clear()
                 self._log_trade_lifecycle_events(events)
                 return True
-            if not self._pending_persistence:
+            if not self._pending_persistence and not strategy_states:
                 return True
             snapshot_refs = dict(self._pending_persistence)
             snapshot = [dict(trade) for trade in snapshot_refs.values()]
             balance_snapshot = self.trade_manager.balance_usdt
             try:
-                await self.repository.save_trades(
-                    snapshot,
-                    balance_snapshot,
-                    engine_mode=self.mode.value,
-                )
+                if strategy_states:
+                    save_with_state = getattr(
+                        self.repository, "save_trades_with_strategy_states", None
+                    )
+                    if not callable(save_with_state):
+                        raise RuntimeError(
+                            "Repository does not support persistent strategy state"
+                        )
+                    await save_with_state(
+                        snapshot, balance_snapshot, self.mode.value, strategy_states
+                    )
+                else:
+                    await self.repository.save_trades(
+                        snapshot, balance_snapshot, engine_mode=self.mode.value,
+                    )
             except Exception as error:
                 self.record_database_error(error)
                 print(f"Database trade save failed: {type(error).__name__}")
@@ -1211,6 +1278,22 @@ class TradingEngine:
                 self.last_cancelled_cleanup_deleted = int(result["deleted_count"])
                 self.record_database_success()
                 return int(result["deleted_count"])
+
+    async def expire_false_breakout_pending(self) -> int:
+        """Run the fixed 15-minute expiry under the same lock as market updates."""
+        async with self.state_lock:
+            previous_trades = [dict(trade) for trade in self.trade_manager.trades]
+            previous_balance = self.trade_manager.balance_usdt
+            previous_pending = {
+                key: dict(value) for key, value in self._pending_persistence.items()
+            }
+            events = self.trade_manager.cancel_expired_false_breakout_pending()
+            if not events:
+                return 0
+            if not await self.persist_events(events):
+                self.restore_trade_state(previous_trades, previous_balance, previous_pending)
+                return 0
+            return len(events)
 
     def _log_trade_lifecycle_events(self, events: list[dict]) -> None:
         for event in events:
@@ -1446,11 +1529,15 @@ class TradingEngine:
             previous_pending_persistence = {
                 key: dict(value) for key, value in self._pending_persistence.items()
             }
+            previous_strategy_state = self.export_strategy_states(symbol)
+            timeout_events = self.trade_manager.cancel_expired_false_breakout_pending()
             events = self.on_market_update(
                 symbol, last_price, stable_walls, wall_events, wall_candidates,
                 price_updated=price_updated,
                 entry_preprocessed=entry_preprocessed,
             )
+            if timeout_events:
+                events = timeout_events + events
             now = self._utc_now()
             self.last_market_update_at[symbol] = now
             self.last_algorithm_update_at[symbol] = now
@@ -1464,7 +1551,14 @@ class TradingEngine:
                     if diagnostics.get("planner_evaluated")
                     else self.get_entry_block_reason(symbol)
                 )
-            if not await self.persist_events(events):
+            current_strategy_state = self.export_strategy_states(symbol)
+            changed_strategy_states = (
+                {symbol: current_strategy_state}
+                if current_strategy_state != previous_strategy_state else None
+            )
+            if not await self.persist_events(
+                events, strategy_states=changed_strategy_states
+            ):
                 # Do not leave a replacement/open/close visible in memory when
                 # its corresponding PostgreSQL transaction failed. The next
                 # market update will derive the desired transition again.
@@ -1472,6 +1566,7 @@ class TradingEngine:
                     previous_trades, previous_balance,
                     previous_pending_persistence,
                 )
+                self.restore_strategy_states(symbol, previous_strategy_state)
                 self.trade_manager.last_prices = previous_prices
                 self.trade_manager.discard_deferred_entry_tick(symbol)
                 # The newer snapshot was not committed. Do not allow its
@@ -1553,6 +1648,11 @@ class TradingEngine:
                 settings=settings,
                 now=monotonic(),
                 price_updated=price_updated,
+                historical_levels=self.historical_levels.get(symbol, ()),
+                trade_states=tuple(dict(trade) for trade in self.trade_manager.trades),
+                tick_size=self.instrument_tick_sizes.get(symbol),
+                default_take_profit_bps=self.trading_settings.default_take_profit_bps,
+                default_stop_loss_bps=self.trading_settings.default_stop_loss_bps,
             )
             planned = 0
             for strategy in self.strategy_registry.get_enabled(strategy_ids):
@@ -1798,6 +1898,11 @@ class TradingEngine:
             settings=settings,
             now=monotonic(),
             price_updated=price_updated,
+            historical_levels=self.historical_levels.get(symbol, ()),
+            trade_states=tuple(dict(trade) for trade in self.trade_manager.trades),
+            tick_size=self.instrument_tick_sizes.get(symbol),
+            default_take_profit_bps=self.trading_settings.default_take_profit_bps,
+            default_stop_loss_bps=self.trading_settings.default_stop_loss_bps,
         )
         strategy_ids = self.enabled_strategies.get(
             symbol, self._default_enabled_strategies
@@ -1879,7 +1984,12 @@ class TradingEngine:
                 existing = self.trade_manager.get_pending_for_wall(
                     symbol, strategy.strategy_id, wall_side, signal.wall_id
                 )
-                requires_bybit_tick = strategy.strategy_id in {"bounce", "breakout"}
+                level_policy = signal.level_policy_strategy_id or strategy.strategy_id
+                plan_take_profit_bps = signal.take_profit_bps
+                plan_stop_loss_bps = signal.stop_loss_bps
+                requires_bybit_tick = level_policy in {
+                    "bounce", "breakout", "combined", "false_breakout"
+                }
                 if requires_bybit_tick and (tick_size is None or tick_size <= 0):
                     trade_rejections.append("Не получен tickSize Bybit; уровни плана не рассчитаны.")
                     if existing is not None:
@@ -1889,13 +1999,15 @@ class TradingEngine:
                         )
                         events.extend(trade)
                     continue
-                if strategy.strategy_id in {"bounce", "breakout"}:
-                    take_profit_bps, stop_loss_bps = effective_trade_level_bps(
-                        settings, self.trading_settings
+                if level_policy in {"bounce", "breakout"}:
+                    take_profit_bps, stop_loss_bps = effective_strategy_trade_level_bps(
+                        settings, self.trading_settings, level_policy
                     )
+                    plan_take_profit_bps = take_profit_bps
+                    plan_stop_loss_bps = stop_loss_bps
                     try:
                         levels = calculate_trade_levels(
-                            strategy_id=strategy.strategy_id,
+                            strategy_id=level_policy,
                             wall_side=wall_side,
                             wall_price=signal.wall_price,
                             tick_size=tick_size,
@@ -1931,8 +2043,15 @@ class TradingEngine:
                         f"Стратегия {strategy.strategy_id} не предоставила готовые уровни сделки."
                     )
                     continue
+                lifecycle_signal = {
+                    **signal.__dict__,
+                    "level_policy_strategy_id": level_policy,
+                    "take_profit_bps": plan_take_profit_bps,
+                    "stop_loss_bps": plan_stop_loss_bps,
+                    "tick_size": tick_size,
+                }
                 valid_wall_ids.add(signal.wall_id)
-                if self.trade_manager.has_matching_pending_plan(signal, levels, settings):
+                if self.trade_manager.has_matching_pending_plan(lifecycle_signal, levels, settings):
                     if existing is not None:
                         eligible_pending_ids.add(existing["signal_id"])
                     self._record_trade_plan_result(
@@ -1940,7 +2059,7 @@ class TradingEngine:
                     )
                     continue
                 if existing is not None:
-                    updated = self.trade_manager.update_pending_plan(signal, levels, settings)
+                    updated = self.trade_manager.update_pending_plan(lifecycle_signal, levels, settings)
                     if updated is not None:
                         eligible_pending_ids.discard(updated["signal_id"])
                         events.append({"event": "PENDING_UPDATED", "trade": updated})
@@ -1967,6 +2086,10 @@ class TradingEngine:
                     **levels,
                     "entry_mode": signal.entry_mode or "cross",
                     "entry_trigger_direction": levels["entry_trigger_direction"],
+                    "level_policy_strategy_id": level_policy,
+                    "take_profit_bps": plan_take_profit_bps,
+                    "stop_loss_bps": plan_stop_loss_bps,
+                    "tick_size": tick_size,
                     "reference_price": last_price,
                     "signal_id": f"plan:{strategy.strategy_id}:{plan_id}",
                 }
@@ -1987,6 +2110,7 @@ class TradingEngine:
                 )
                 if trade is not None:
                     trades_created += 1
+                    eligible_pending_ids.add(trade["signal_id"])
                     events.append({"event": "TRADE_CREATED", "trade": trade})
                     logger.info(
                         "%s PENDING created strategy=%s wall=%s@%s side=%s entry=%s sl=%s tp=%s trigger=%s tick=%s",

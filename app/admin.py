@@ -212,6 +212,21 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
         f"{stats['win_rate_percent']:.1f}%"
         if stats["win_rate_percent"] is not None else "нет данных"
     )
+    levels = engine.historical_levels.get(symbol, ())
+    levels_text = "нет данных" if not levels else "; ".join(
+        f"{level.get('type')} {float(level.get('price', 0)):g} "
+        f"({level.get('touch_count', '?')} кас., {level.get('timeframe', '?')})"
+        for level in levels[:8]
+    ) + (f"; ещё {len(levels) - 8}" if len(levels) > 8 else "")
+    false_strategy = next((
+        strategy for strategy in engine.strategy_registry.get_enabled()
+        if strategy.strategy_id == "false_breakout"
+    ), None)
+    false_diag = (
+        false_strategy.diagnostics(symbol, tuple(engine.trade_manager.trades))
+        if false_strategy and callable(getattr(false_strategy, "diagnostics", None))
+        else {}
+    )
     return (
         f"<b>Статистика пары · {symbol}</b>\n\n"
         f"Состояние: {'включена' if settings.enabled else 'выключена'}\n"
@@ -228,6 +243,14 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
         f"{settings.breakout_buffer_bps:g} б.п.; разрыв обновлений до "
         f"{settings.breakout_max_update_gap_seconds:g} с\n"
         f"Порог потребления: {settings.consumed_ratio:.0%}\n"
+        f"Исторические уровни ({settings.historical_level_timeframe}): {escape(levels_text)}\n"
+        f"False Breakout: Point1 {settings.false_breakout_point_1_offset_bps if settings.false_breakout_point_1_offset_bps is not None else 'не задана'} б.п.; "
+        f"Point2 {settings.false_breakout_point_2_distance_bps if settings.false_breakout_point_2_distance_bps is not None else 'не задана'} б.п.; "
+        f"срок наблюдения {settings.false_breakout_observation_timeout_seconds if settings.false_breakout_observation_timeout_seconds is not None else 'не задан'} с; "
+        f"PENDING timeout 15 мин; сценарии наблюдение/Point1/PENDING/OPEN/отменено "
+        f"{false_diag.get('observing', 0)}/{false_diag.get('point_1_reached', 0)}/"
+        f"{false_diag.get('point_2_reached', 0)}/{false_diag.get('pending', 0)}/"
+        f"{false_diag.get('open', 0)}/{false_diag.get('cancelled_scenarios', 0)}\n"
         f"Потенциальные стены: {potential if potential is not None else 'нет данных'}; "
         f"подтверждённые: {stable if stable is not None else 'нет данных'}\n"
         f"Сделки: открыто {stats['open_trades']}, ожидают входа "
@@ -722,8 +745,17 @@ async def request_pair_settings(callback: CallbackQuery, state: FSMContext) -> N
             "min_wall_age_seconds, consumed_ratio, entry_distance_bps, "
             "stop_distance_bps, bounce_reversal_bps, "
             "breakout_confirm_seconds, breakout_buffer_bps, "
-            "breakout_max_update_gap_seconds</code>.\n"
-            "Пример: <code>BTCUSDT entry_distance_bps 1.5</code>",
+            "breakout_max_update_gap_seconds, historical_level_timeframe, "
+            "historical_level_candle_count, historical_level_refresh_seconds, "
+            "max_wall_level_distance_bps, bounce_take_profit_bps, bounce_stop_loss_bps, "
+            "breakout_take_profit_bps, breakout_stop_loss_bps, "
+            "false_breakout_point_1_offset_bps, false_breakout_point_2_distance_bps, "
+            "false_breakout_observation_timeout_seconds, false_breakout_take_profit_bps, "
+            "false_breakout_stop_loss_bps</code>. Для nullable False Breakout параметров "
+            "значение <code>none</code> отключает сценарии, пока обязательные точки не заданы.\n"
+            "Примеры: <code>BTCUSDT historical_level_timeframe 15m</code>; "
+            "<code>ETHUSDT false_breakout_point_1_offset_bps 8</code>.\n"
+            "Также: <code>BTCUSDT entry_distance_bps 1.5</code>.",
             reply_markup=kb.cancel_input,
         )
     await callback.answer()
@@ -771,8 +803,29 @@ async def request_strategy_settings(
 def _strategy_label(strategy_ids: set[str]) -> str:
     if not strategy_ids:
         return "Отключено"
-    names = {"bounce": "Отскок", "breakout": "Пробой", "stable_wall_v1": "Устаревший режим"}
+    names = {
+        "bounce": "Отскок", "breakout": "Пробой",
+        "false_breakout": "Ложный пробой", "combined": "Комбинированная",
+        "stable_wall_v1": "Устаревший режим",
+    }
     return ", ".join(names.get(item, item) for item in sorted(strategy_ids))
+
+
+def _strategy_selection_buttons(symbol: str, selected: set[str], version: int):
+    strategies = (
+        ("bounce", "Bounce · Отскок"),
+        ("breakout", "Breakout · Пробой"),
+        ("false_breakout", "False Breakout · Ложный пробой"),
+        ("combined", "Combined · Комбинированная"),
+    )
+    rows = [[InlineKeyboardButton(
+        text=("✓ " if strategy_id in selected else "") + label,
+        callback_data=f"stratset:{symbol}:{strategy_id}:{version}",
+    )] for strategy_id, label in strategies]
+    rows.append([InlineKeyboardButton(
+        text="Отключить все", callback_data=f"stratset:{symbol}:off:{version}"
+    )])
+    return rows
 
 
 @admin.callback_query(Admin(), F.data.startswith("stratpair:"))
@@ -783,16 +836,15 @@ async def choose_strategy_pair(callback: CallbackQuery, runtime: RuntimeControll
         await callback.answer("Пара больше не настроена", show_alert=True)
         return
     current = runtime.engine.get_enabled_strategy_ids(symbol)
-    buttons = [
-        [InlineKeyboardButton(text=("✓ " if current == {strategy_id} else "") + label,
-                              callback_data=f"stratset:{symbol}:{strategy_id}:{runtime.engine.strategy_versions.get(symbol, 0)}")]
-        for strategy_id, label in (("bounce", "Отскок от стены"), ("breakout", "Пробой стены"), ("off", "Отключено"))
-    ]
+    buttons = _strategy_selection_buttons(
+        symbol, current, runtime.engine.strategy_versions.get(symbol, 0)
+    )
     buttons.append([InlineKeyboardButton(text="К списку пар", callback_data="settings_strategy")])
     if callback.message is not None:
         await edit_message_if_changed(
             callback.message,
-            f"<b>{escape(symbol)}</b> · выбран режим: {_strategy_label(current)}\nВыберите режим:",
+            f"<b>{escape(symbol)}</b> · активны: {_strategy_label(current)}\n"
+            "Нажмите стратегию, чтобы включить или выключить её:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
     await callback.answer()
@@ -811,10 +863,14 @@ async def set_pair_strategy(callback: CallbackQuery, runtime: RuntimeController)
     except ValueError:
         await callback.answer("Некорректная версия настройки", show_alert=True)
         return
-    if symbol not in runtime.engine.pair_settings or strategy_id not in {"bounce", "breakout", "off"}:
+    strategy_ids = set(runtime.engine.strategy_registry.strategy_ids)
+    if symbol not in runtime.engine.pair_settings or strategy_id not in strategy_ids | {"off"}:
         await callback.answer("Некорректная пара или стратегия", show_alert=True)
         return
-    selected = set() if strategy_id == "off" else {strategy_id}
+    selected = (
+        set() if strategy_id == "off"
+        else runtime.engine.get_enabled_strategy_ids(symbol) ^ {strategy_id}
+    )
     worker_error = False
     try:
         await runtime.update_enabled_strategies(
@@ -854,17 +910,15 @@ async def set_pair_strategy(callback: CallbackQuery, runtime: RuntimeController)
         await callback.answer(confirmation, show_alert=worker_error)
     except Exception:
         logger.exception("Telegram could not acknowledge saved strategy for %s", symbol)
-    rows = [
-        [InlineKeyboardButton(text=("✓ " if current_selection == {key} else "") + label,
-                              callback_data=f"stratset:{symbol}:{key}:{runtime.engine.strategy_versions.get(symbol, 0)}")]
-        for key, label in (("bounce", "Отскок от стены"), ("breakout", "Пробой стены"), ("off", "Отключено"))
-    ]
+    rows = _strategy_selection_buttons(
+        symbol, current_selection, runtime.engine.strategy_versions.get(symbol, 0)
+    )
     rows.append([InlineKeyboardButton(text="К списку пар", callback_data="settings_strategy")])
     if callback.message is not None:
         text = (
             f"<b>{escape(symbol)}</b> · режим сохранён: {escape(mode_text)}\n"
             f"Данные: {escape(feed_text)}\n"
-            "Ожидающие входы прежней стратегии отменены; открытые виртуальные сделки продолжают сопровождаться."
+            "Ожидающие входы отключённых стратегий отменены; открытые виртуальные сделки продолжают сопровождаться."
         )
         markup = InlineKeyboardMarkup(inline_keyboard=rows)
         try:
@@ -964,15 +1018,35 @@ async def update_pair_settings(
         "min_wall_ratio", "min_wall_notional_usdt", "max_wall_distance_bps", "min_wall_age_seconds",
         "consumed_ratio", "entry_distance_bps", "stop_distance_bps", "bounce_reversal_bps",
         "breakout_confirm_seconds", "breakout_buffer_bps", "breakout_max_update_gap_seconds",
+        "historical_level_candle_count", "historical_level_refresh_seconds",
+        "max_wall_level_distance_bps", "bounce_take_profit_bps", "bounce_stop_loss_bps",
+        "breakout_take_profit_bps", "breakout_stop_loss_bps",
+        "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
+        "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
+        "false_breakout_stop_loss_bps",
+    }
+    nullable_fields = {
+        "bounce_take_profit_bps", "bounce_stop_loss_bps",
+        "breakout_take_profit_bps", "breakout_stop_loss_bps",
+        "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
+        "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
+        "false_breakout_stop_loss_bps",
     }
     if parameter == "enabled":
         if raw_value.lower() not in {"true", "false", "1", "0", "on", "off"}:
             await message.answer("Для enabled используйте true/false.")
             return
         value = raw_value.lower() in {"true", "1", "on"}
+    elif parameter == "historical_level_timeframe":
+        value = raw_value
+    elif parameter in numeric_fields and parameter in nullable_fields and raw_value.lower() == "none":
+        value = None
     elif parameter in numeric_fields:
         try:
-            value = float(raw_value)
+            value = (
+                int(raw_value) if parameter == "historical_level_candle_count"
+                else float(raw_value)
+            )
         except ValueError:
             await message.answer("Для этого параметра нужно числовое значение.")
             return

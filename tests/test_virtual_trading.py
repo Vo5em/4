@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import unittest
@@ -31,6 +32,7 @@ from script.market_data import (
     _update_ticker_price,
     _delivery_lag_ms,
     _fetch_snapshot_while_buffering,
+    _log_reconnect_stable_resets,
     analyze_synced_orderbook,
     apply_orderbook_delta,
     buffer_orderbook_delta,
@@ -133,6 +135,15 @@ def run_immediate(coroutine):
     raise AssertionError("Coroutine suspended; it needs a running event loop")
 
 
+def seed_matching_historical_level(engine, wall, *, touch_count=1):
+    side = str(wall["side"]).lower()
+    engine.set_historical_levels(wall.get("symbol", "BTCUSDT"), ({
+        "type": "support" if side in {"buy", "bid"} else "resistance",
+        "price": float(wall["price"]), "touch_count": touch_count,
+        "timeframe": engine.pair_settings[wall.get("symbol", "BTCUSDT")].historical_level_timeframe,
+    },))
+
+
 class FakeRepository:
     def __init__(self):
         self.fail_trade_saves = False
@@ -200,6 +211,135 @@ class FakeTask:
 
 
 class WallTrackerTests(unittest.TestCase):
+    def test_stable_loss_logs_classify_notional_distance_median_and_removal(self):
+        scenarios = (
+            ("WALL_NOTIONAL_FAILED", 100.0, 2000.0, 1000.0, 1500.0, {"buy": 1.0}, 200.0),
+            ("OUT_OF_SCANNER_RANGE", 100.6, 2000.0, 2000.0, 500.0, {"buy": 1.0}, 50.0),
+            ("MEDIAN_UNAVAILABLE", 100.0, 2000.0, 2000.0, 500.0, {"buy": None}, 200.0),
+        )
+        for expected, current_price, initial_size, current_size, minimum, medians, max_distance in scenarios:
+            with self.subTest(reason=expected):
+                book = LocalOrderBook()
+                book.bids[100.0] = initial_size / 100.0
+                tracker = WallTracker(min_age_seconds=0)
+                candidate = {
+                    "side": "buy", "price": 100.0, "notional": initial_size,
+                    "wall_ratio": 1000.0, "median_notional": initial_size / 1000,
+                }
+                context = {
+                    "symbol": "ETHUSDT", "connection_generation": 3,
+                    "last_price": 100.0, "min_wall_ratio": 888.0,
+                    "min_wall_notional_usdt": minimum,
+                    "max_wall_distance_bps": max_distance,
+                    "side_medians": {"buy": initial_size / 1000},
+                    "active_pending_wall_ids": set(),
+                }
+                tracker.update([candidate], book, {}, diagnostic_context=context)
+                self.assertEqual(tracker.get_stable_walls()[0]["status"], "stable")
+                book.bids[100.0] = current_size / 100.0
+                context.update(last_price=current_price, side_medians=medians)
+
+                with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+                    tracker.update([], book, {}, diagnostic_context=context)
+
+                record = json.loads(
+                    captured.records[0].getMessage().split("wall_state_transition=", 1)[1]
+                )
+                self.assertEqual(record["reason"], expected)
+                self.assertEqual(record["new_status"], "CANDIDATE")
+                self.assertEqual(tracker.get_stable_walls(), [])
+
+        book = LocalOrderBook()
+        book.bids[100.0] = 20.0
+        tracker = WallTracker(min_age_seconds=0)
+        candidate = {"side": "buy", "price": 100.0, "notional": 2000.0,
+                     "wall_ratio": 1000.0, "median_notional": 2.0}
+        tracker.update([candidate], book, {})
+        book.bids.pop(100.0)
+        with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+            tracker.update([], book, {})
+        record = json.loads(
+            captured.records[0].getMessage().split("wall_state_transition=", 1)[1]
+        )
+        self.assertEqual(record["reason"], "WALL_REMOVED")
+        self.assertEqual(record["new_status"], "REMOVED")
+
+    def test_stable_loss_log_is_one_shot_and_does_not_change_tracker_behavior(self):
+        book = LocalOrderBook()
+        book.bids[100.0] = 10.0
+        observed = WallTracker(min_age_seconds=40)
+        control = WallTracker(min_age_seconds=40)
+        candidate = {
+            "side": "buy", "price": 100.0, "notional": 1000.0,
+            "wall_ratio": 900.0, "median_notional": 1000.0 / 900.0,
+        }
+        clock = [100.0]
+        context = {
+            "symbol": "ETHUSDT", "connection_generation": 7,
+            "last_price": 100.5, "min_wall_ratio": 888.0,
+            "min_wall_notional_usdt": 500.0,
+            "max_wall_distance_bps": 200.0,
+            "side_medians": {"buy": candidate["median_notional"]},
+            "active_pending_wall_ids": set(),
+        }
+
+        with patch("script.wall_tracker.time.monotonic", side_effect=lambda: clock[0]):
+            observed.update([candidate], book, {}, diagnostic_context=context)
+            control.update([candidate], book, {})
+            observed.walls[("buy", 100.0)]["first_seen"] = 100.0
+            control.walls[("buy", 100.0)]["first_seen"] = 100.0
+            clock[0] = 140.0
+            with self.assertNoLogs("script.wall_tracker", level="WARNING"):
+                observed.update([candidate], book, {}, diagnostic_context=context)
+                control.update([candidate], book, {})
+            self.assertEqual(observed.walls[("buy", 100.0)]["status"], "stable")
+            self.assertEqual(control.walls[("buy", 100.0)]["status"], "stable")
+
+            observed_wall = observed.walls[("buy", 100.0)]
+            context["active_pending_wall_ids"] = {
+                f"ETHUSDT:buy:100:{observed_wall['first_seen_at']}"
+            }
+            context["last_price"] = 100.6
+            context["side_medians"] = {"buy": 2.0}
+            clock[0] = 141.0
+            with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+                observed.update([], book, {}, diagnostic_context=context)
+            with self.assertLogs("script.wall_tracker", level="WARNING"):
+                control.update([], book, {})
+
+        logged = [
+            json.loads(record.getMessage().split("wall_state_transition=", 1)[1])
+            for record in captured.records
+        ]
+        self.assertEqual(len(logged), 1)
+        transition = logged[0]
+        self.assertEqual(transition["timestamp_utc"][-6:], "+00:00")
+        self.assertEqual(transition["symbol"], "ETHUSDT")
+        self.assertEqual(transition["websocket_generation"], 7)
+        self.assertEqual(transition["wall_id"], next(iter(context["active_pending_wall_ids"])))
+        self.assertEqual(transition["side"], "BID")
+        self.assertEqual(transition["previous_status"], "STABLE")
+        self.assertEqual(transition["new_status"], "CANDIDATE")
+        self.assertEqual(transition["reason"], "WALL_RATIO_FAILED")
+        self.assertEqual(transition["previous_notional_usdt"], 1000.0)
+        self.assertEqual(transition["current_notional_usdt"], 1000.0)
+        self.assertAlmostEqual(transition["previous_side_median_usdt"], 1000 / 900)
+        self.assertEqual(transition["current_side_median_usdt"], 2.0)
+        self.assertEqual(transition["previous_wall_ratio"], 900.0)
+        self.assertEqual(transition["current_wall_ratio"], 500.0)
+        self.assertEqual(transition["min_wall_ratio"], 888.0)
+        self.assertIsNotNone(transition["previous_distance_bps"])
+        self.assertIsNotNone(transition["current_distance_bps"])
+        self.assertEqual(transition["max_wall_distance_bps"], 200.0)
+        self.assertEqual(transition["stable_age_seconds"], 41.0)
+        self.assertTrue(transition["active_pending"])
+
+        observed_wall = observed.walls[("buy", 100.0)]
+        control_wall = control.walls[("buy", 100.0)]
+        for field in ("status", "qualifies", "first_seen", "current_size", "wall_ratio"):
+            self.assertEqual(observed_wall[field], control_wall[field])
+        self.assertEqual(observed.qualification_transitions, control.qualification_transitions)
+
     def test_wall_qualification_transition_counts_measure_filter_flapping(self):
         book = LocalOrderBook()
         book.bids[100.0] = 100.0
@@ -617,6 +757,8 @@ class BybitOrderbookSyncTests(unittest.TestCase):
             diagnostic_symbols={"BTCUSDT"},
         )
         engine.start()
+        diagnostic_wall = {"side": "buy", "price": 99.9, "symbol": "BTCUSDT"}
+        seed_matching_historical_level(engine, diagnostic_wall)
         result = engine.on_market_update(
             "BTCUSDT", 100,
             [{"side": "buy", "price": 99.9, "age": 40, "wall_ratio": 900}],
@@ -713,6 +855,35 @@ class MarketDataSnapshotHandshakeTests(unittest.TestCase):
 
 
 class MarketDataReconnectTests(unittest.TestCase):
+    def test_reconnect_logs_stable_wall_reset_with_pending_and_generation(self):
+        engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
+        engine._market_health("BTCUSDT")["connection_generation"] = 7
+        wall = {
+            "side": "buy", "price": 100.0,
+            "first_seen_at": "reconnect-lifecycle", "current_size": 2000.0,
+            "wall_ratio": 900.0, "median_notional": 2.22,
+            "distance_bps": 25.0, "age": 120.0,
+        }
+        engine.latest_stable_walls["BTCUSDT"] = (wall,)
+        engine.trade_manager.trades.append({
+            "symbol": "BTCUSDT", "status": "pending",
+            "wall_id": "BTCUSDT:buy:100:reconnect-lifecycle",
+        })
+
+        with self.assertLogs("script.wall_tracker", level="WARNING") as captured:
+            _log_reconnect_stable_resets(
+                "BTCUSDT", engine, engine.pair_settings["BTCUSDT"]
+            )
+
+        record = json.loads(
+            captured.records[0].getMessage().split("wall_state_transition=", 1)[1]
+        )
+        self.assertEqual(record["reason"], "RECONNECT")
+        self.assertEqual(record["websocket_generation"], 7)
+        self.assertTrue(record["active_pending"])
+        self.assertEqual(record["previous_status"], "STABLE")
+        self.assertEqual(record["new_status"], "CANDIDATE")
+
     def test_reconnection_reuses_worker_and_clears_error_after_sync(self):
         engine = TradingEngine({"BTCUSDT": PairSettings("BTCUSDT")})
         engine.start()
@@ -728,8 +899,21 @@ class MarketDataReconnectTests(unittest.TestCase):
         async def no_sleep(_delay):
             return None
 
+        class CompletedTask:
+            def cancel(self):
+                return None
+
+        def close_background_coroutine(coroutine, **_kwargs):
+            coroutine.close()
+            return CompletedTask()
+
+        async def complete_gather(*_tasks, **_kwargs):
+            return []
+
         with patch("script.market_data._run_connection", side_effect=connection), \
-             patch("script.market_data.asyncio.sleep", side_effect=no_sleep):
+             patch("script.market_data.asyncio.sleep", side_effect=no_sleep), \
+             patch("script.market_data.asyncio.create_task", side_effect=close_background_coroutine), \
+             patch("script.market_data.asyncio.gather", side_effect=complete_gather):
             run_immediate(
                 market_data_worker("BTCUSDT", engine, engine.pair_settings["BTCUSDT"])
             )
@@ -755,8 +939,16 @@ class WallStrategyTests(unittest.TestCase):
         }
 
     def context(self, strategy, price, now, walls=None, events=()):
+        walls = tuple(walls or ())
+        touches = 1 if strategy.strategy_id == BOUNCE_STRATEGY_ID else 2
+        historical_levels = tuple({
+            "type": "support" if wall["side"] == "buy" else "resistance",
+            "price": float(wall["price"]), "touch_count": touches,
+            "timeframe": self.settings.historical_level_timeframe,
+        } for wall in walls)
         return StrategyContext(
-            "BTCUSDT", price, tuple(walls or ()), tuple(events), self.settings, now
+            "BTCUSDT", price, walls, tuple(events), self.settings, now,
+            historical_levels=historical_levels,
         )
 
     def test_bounce_support_creates_plan_immediately_without_reversal_confirmation(self):
@@ -869,7 +1061,10 @@ class WallStrategyTests(unittest.TestCase):
         strategy = BreakoutStrategy()
         wall = self.wall("sell", 100.05)
         no_price_context = StrategyContext(
-            "BTCUSDT", 100.02, (wall,), (), self.settings, 1, False
+            "BTCUSDT", 100.02, (wall,), (), self.settings, 1, False,
+            historical_levels=({
+                "type": "resistance", "price": 100.05, "touch_count": 2,
+            },),
         )
         self.assertEqual(len(strategy.evaluate(no_price_context)), 1)
         self.assertEqual(len(strategy.evaluate(self.context(strategy, 100.02, 1, [wall]))), 1)
@@ -1074,6 +1269,7 @@ class StrategyPipelineTests(unittest.TestCase):
             "current_size": 1000.0, "initial_size": 1000.0,
             "wall_ratio": 900.0, "age": 55.0,
         }
+        seed_matching_historical_level(engine, wall)
         engine.on_market_update("BTCUSDT", 100.01, [wall])
         engine.on_market_update("BTCUSDT", 100.02, [wall])
 
@@ -1544,7 +1740,7 @@ class StrategyCallbackTests(unittest.TestCase):
 
         run_immediate(set_pair_strategy(callback, RuntimeController(engine)))
 
-        self.assertEqual(engine.get_enabled_strategy_ids("BTCUSDT"), {"breakout"})
+        self.assertEqual(engine.get_enabled_strategy_ids("BTCUSDT"), {"bounce", "breakout"})
         self.assertEqual(repository.saved_admin_user_ids, [admin_user_id])
         self.assertIn("сохранён", callback.message.edit_text.await_args.args[0])
         self.assertEqual(callback.answer.await_count, 1)
@@ -1557,11 +1753,16 @@ class StrategyCallbackTests(unittest.TestCase):
 
         run_immediate(set_pair_strategy(callback, runtime))
 
-        self.assertEqual(engine.get_enabled_strategy_ids("BTCUSDT"), {"breakout"})
+        self.assertEqual(
+            engine.get_enabled_strategy_ids("BTCUSDT"),
+            {"stable_wall_v1", "breakout"},
+        )
         self.assertEqual(engine.strategy_versions["BTCUSDT"], 1)
         self.assertIn("сохранён", callback.answer.await_args.args[0])
         self.assertIn("сохранён в PostgreSQL", callback.message.answer.await_args.args[0])
-        self.assertEqual(repository.saved_enabled_strategies, [("BTCUSDT", {"breakout"})])
+        self.assertEqual(repository.saved_enabled_strategies, [
+            ("BTCUSDT", {"stable_wall_v1", "breakout"})
+        ])
 
     def test_database_save_failure_keeps_previous_runtime_mode(self):
         repository = FakeRepository()
@@ -2521,8 +2722,13 @@ class EngineControlTests(unittest.TestCase):
         self.assertEqual(engine.get_enabled_strategy_ids("BTCUSDT"), {BOUNCE_STRATEGY_ID})
         self.assertEqual(engine.get_enabled_strategy_ids("ETHUSDT"), {"stable_wall_v1"})
         self.assertEqual(repository.saved_enabled_strategies[-1], ("BTCUSDT", {BOUNCE_STRATEGY_ID}))
-        with self.assertRaisesRegex(ValueError, "only one"):
-            run_immediate(runtime.update_enabled_strategies("BTCUSDT", {BOUNCE_STRATEGY_ID, BREAKOUT_STRATEGY_ID}))
+        run_immediate(runtime.update_enabled_strategies(
+            "BTCUSDT", {BOUNCE_STRATEGY_ID, BREAKOUT_STRATEGY_ID}
+        ))
+        self.assertEqual(
+            engine.get_enabled_strategy_ids("BTCUSDT"),
+            {BOUNCE_STRATEGY_ID, BREAKOUT_STRATEGY_ID},
+        )
         run_immediate(runtime.update_enabled_strategies("BTCUSDT", set(), 7319))
         self.assertEqual(engine.get_enabled_strategy_ids("BTCUSDT"), set())
         self.assertEqual(engine.get_enabled_strategy_ids("ETHUSDT"), {"stable_wall_v1"})
@@ -2822,6 +3028,7 @@ class MarketFreshnessTests(unittest.TestCase):
             "current_size": 10000.0, "initial_size": 10000.0,
             "wall_ratio": 900.0, "age": 45.0,
         }
+        seed_matching_historical_level(engine, wall)
         self.record_market_health(engine, price_value=100.1)
         engine.on_market_update("BTCUSDT", 100.1, [wall], (), [wall])
         pending, = engine.trade_manager.get_pending_trades()
@@ -2869,6 +3076,7 @@ class MarketFreshnessTests(unittest.TestCase):
             "current_size": 10000.0, "initial_size": 10000.0,
             "wall_ratio": 900.0, "age": 45.0,
         }
+        seed_matching_historical_level(engine, wall)
 
         self.record_market_health(engine, price_value=100.1)
         run_immediate(engine.process_market_update(
@@ -2912,6 +3120,7 @@ class MarketFreshnessTests(unittest.TestCase):
             "current_size": 10000.0, "initial_size": 10000.0,
             "wall_ratio": 900.0, "age": 45.0,
         }
+        seed_matching_historical_level(engine, wall)
         self.record_market_health(engine, price_value=100.1)
         run_immediate(engine.process_market_update(
             "BTCUSDT", 100.1, [wall], (), [wall],
@@ -2971,6 +3180,7 @@ class MarketFreshnessTests(unittest.TestCase):
             "current_size": 10000.0, "initial_size": 10000.0,
             "wall_ratio": 900.0, "age": 45.0,
         }
+        seed_matching_historical_level(engine, wall)
         # The market crossed Entry before this Scanner snapshot admitted the
         # newly visible wall. BID remains below the current price, so the wall
         # is still a valid candidate even though Entry is now behind price.
@@ -3006,6 +3216,7 @@ class MarketFreshnessTests(unittest.TestCase):
             "current_size": 10000.0, "initial_size": 10000.0,
             "wall_ratio": 900.0, "age": 45.0,
         }
+        seed_matching_historical_level(engine, wall)
         self.record_market_health(engine, price_value=100.1)
         run_immediate(engine.process_market_update(
             "BTCUSDT", 100.1, [wall], (), [wall],

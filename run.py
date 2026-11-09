@@ -45,6 +45,7 @@ async def build_runtime() -> tuple[RuntimeController, bool]:
         trading_settings=state["trading_settings"],
         enabled_strategies=state["enabled_strategies"],
         strategy_versions=state.get("strategy_versions", {}),
+        strategy_states=state.get("strategy_states", {}),
         repository=database,
         last_market_update_at=state.get("last_price_observed_at", {}),
     )
@@ -88,6 +89,7 @@ async def main() -> None:
     dispatcher = Dispatcher()
     dispatcher.include_router(admin)
     runtime.start_cancelled_trade_cleanup()
+    runtime.start_false_breakout_timeout_service()
 
     try:
         if not initialized:

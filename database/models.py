@@ -68,6 +68,37 @@ class TradingPairSetting(Base):
     taker_fee_rate: Mapped[float] = mapped_column(Numeric(18, 10, asdecimal=False), nullable=False, default=0.001)
     take_profit_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
     stop_loss_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    bounce_take_profit_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    bounce_stop_loss_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    breakout_take_profit_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    breakout_stop_loss_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    historical_level_timeframe: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="5m", server_default=text("'5m'")
+    )
+    historical_level_candle_count: Mapped[int] = mapped_column(
+        nullable=False, default=500, server_default=text("500")
+    )
+    historical_level_refresh_seconds: Mapped[float] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=False, default=300.0, server_default=text("300")
+    )
+    max_wall_level_distance_bps: Mapped[float] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=False, default=13.0, server_default=text("13")
+    )
+    false_breakout_point_1_offset_bps: Mapped[float | None] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=True
+    )
+    false_breakout_point_2_distance_bps: Mapped[float | None] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=True
+    )
+    false_breakout_observation_timeout_seconds: Mapped[float | None] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=True
+    )
+    false_breakout_take_profit_bps: Mapped[float | None] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=True
+    )
+    false_breakout_stop_loss_bps: Mapped[float | None] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -77,6 +108,7 @@ class PairStrategyConfig(Base):
     symbol: Mapped[str] = mapped_column(String(30), primary_key=True)
     enabled_strategy_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     version: Mapped[int] = mapped_column(nullable=False, default=1)
+    strategy_state: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default=text("'{}'"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -156,6 +188,10 @@ class VirtualTrade(Base):
     wall_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
     entry_trigger_direction: Mapped[str | None] = mapped_column(String(12), nullable=True)
     entry_armed: Mapped[bool] = mapped_column(nullable=False, default=False)
+    take_profit_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    stop_loss_bps: Mapped[float | None] = mapped_column(Numeric(18, 8, asdecimal=False), nullable=True)
+    level_policy_strategy_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    tick_size: Mapped[float | None] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=True)
     stop_loss: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
     take_profit: Mapped[float] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=False)
     exit_price: Mapped[float | None] = mapped_column(Numeric(30, 12, asdecimal=False), nullable=True)
@@ -187,6 +223,24 @@ async def async_main() -> None:
         await connection.execute(text(
             "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS "
             "breakout_max_update_gap_seconds NUMERIC(18, 8) NOT NULL DEFAULT 2.0"
+        ))
+        for column, sql_type in (
+            ("historical_level_timeframe", "VARCHAR(8) NOT NULL DEFAULT '5m'"),
+            ("historical_level_candle_count", "INTEGER NOT NULL DEFAULT 500"),
+            ("historical_level_refresh_seconds", "NUMERIC(18,8) NOT NULL DEFAULT 300"),
+            ("max_wall_level_distance_bps", "NUMERIC(18,8) NOT NULL DEFAULT 13"),
+            ("false_breakout_point_1_offset_bps", "NUMERIC(18,8)"),
+            ("false_breakout_point_2_distance_bps", "NUMERIC(18,8)"),
+            ("false_breakout_observation_timeout_seconds", "NUMERIC(18,8)"),
+            ("false_breakout_take_profit_bps", "NUMERIC(18,8)"),
+            ("false_breakout_stop_loss_bps", "NUMERIC(18,8)"),
+        ):
+            await connection.execute(text(
+                f"ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+            ))
+        await connection.execute(text(
+            "ALTER TABLE pair_strategy_configs ADD COLUMN IF NOT EXISTS "
+            "strategy_state JSON NOT NULL DEFAULT '{}'"
         ))
         await connection.execute(text("ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS default_leverage NUMERIC(10,4) NOT NULL DEFAULT 25.0"))
         await connection.execute(text(
@@ -236,6 +290,13 @@ async def async_main() -> None:
         await connection.execute(text(
             "ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS stop_loss_bps NUMERIC(18,8)"
         ))
+        for column in (
+            "bounce_take_profit_bps", "bounce_stop_loss_bps",
+            "breakout_take_profit_bps", "breakout_stop_loss_bps",
+        ):
+            await connection.execute(text(
+                f"ALTER TABLE trading_pairs ADD COLUMN IF NOT EXISTS {column} NUMERIC(18,8)"
+            ))
         for column, sql_type in (
             ("leverage", "NUMERIC(10,4)"),
             ("position_notional_usdt", "NUMERIC(24,8)"),
@@ -257,6 +318,18 @@ async def async_main() -> None:
         await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS wall_id VARCHAR(240)"))
         await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS entry_trigger_direction VARCHAR(12)"))
         await connection.execute(text("ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS entry_armed BOOLEAN NOT NULL DEFAULT FALSE"))
+        await connection.execute(text(
+            "ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS take_profit_bps NUMERIC(18,8)"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS stop_loss_bps NUMERIC(18,8)"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS level_policy_strategy_id VARCHAR(60)"
+        ))
+        await connection.execute(text(
+            "ALTER TABLE virtual_trades ADD COLUMN IF NOT EXISTS tick_size NUMERIC(30,12)"
+        ))
         await connection.execute(text(
             "ALTER TABLE pair_strategy_configs ADD COLUMN IF NOT EXISTS "
             "version INTEGER NOT NULL DEFAULT 1"

@@ -5,6 +5,9 @@ from threading import RLock
 
 from .settings import PairSettings, TradingSettings
 from .commission import LEGACY_SAVED_RATE, maker_maker_simulation
+from .trade_levels import (
+    FALSE_BREAKOUT_PENDING_TIMEOUT_SECONDS, calculate_levels_from_entry,
+)
 
 
 class TradeManager:
@@ -176,6 +179,10 @@ class TradeManager:
             "entry_mode": signal.entry_mode,
             "entry_trigger_direction": getattr(signal, "entry_trigger_direction", None),
             "reference_price": getattr(signal, "reference_price", None),
+            "level_policy_strategy_id": getattr(signal, "level_policy_strategy_id", None),
+            "take_profit_bps": getattr(signal, "take_profit_bps", None),
+            "stop_loss_bps": getattr(signal, "stop_loss_bps", None),
+            "tick_size": getattr(signal, "tick_size", None),
             "signal_id": f"{signal.strategy_id}:{signal.wall_id}",
         }
         signal_id = data.get("signal_id") or data["wall_id"]
@@ -282,8 +289,8 @@ class TradeManager:
             reference_price = self.last_prices.get(symbol)
         armed = (
             reference_price is not None
-            and ((wall_side == "buy" and float(reference_price) > entry_price)
-                 or (wall_side == "sell" and float(reference_price) < entry_price))
+            and ((trigger_direction == "cross_down" and float(reference_price) > entry_price)
+                 or (trigger_direction == "cross_up" and float(reference_price) < entry_price))
         )
         trade = {
             "signal_id": signal_id,
@@ -316,6 +323,11 @@ class TradeManager:
             "entry_fill_price": entry_price if immediate else None,
             "entry_trigger_direction": trigger_direction,
             "entry_armed": bool(armed) if not immediate else True,
+            "level_policy_strategy_id": data.get("level_policy_strategy_id"),
+            "take_profit_bps": data.get("take_profit_bps"),
+            "stop_loss_bps": data.get("stop_loss_bps"),
+            "tick_size": data.get("tick_size"),
+            "tick_size": data.get("tick_size"),
             "entry_previous_price": float(reference_price) if reference_price is not None else None,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
@@ -410,7 +422,11 @@ class TradeManager:
             trigger_previous = previous
             if trigger_previous is None:
                 trigger_previous = trade.get("entry_previous_price")
-            safe_side = numeric_price > float(entry) if trade["wall_side"] == "buy" else numeric_price < float(entry)
+            safe_side = (
+                numeric_price > float(entry)
+                if trade["entry_trigger_direction"] == "cross_down"
+                else numeric_price < float(entry)
+            )
             crossed = False
             if trigger_previous is not None:
                 if trade["entry_trigger_direction"] == "cross_down":
@@ -471,6 +487,26 @@ class TradeManager:
                 events.append({"event": "ENTRY_BLOCKED", "trade": trade,
                                "reason": "INSUFFICIENT_AVAILABLE_BALANCE"})
                 continue
+            if trade.get("strategy_id") == "false_breakout":
+                try:
+                    actual_levels = calculate_levels_from_entry(
+                        side=trade["side"], entry_price=numeric_price,
+                        tick_size=trade["tick_size"],
+                        take_profit_bps=trade["take_profit_bps"],
+                        stop_loss_bps=trade["stop_loss_bps"],
+                    )
+                except (TypeError, ValueError, ArithmeticError):
+                    trade.update(
+                        status="cancelled", closed_at=datetime.now(timezone.utc),
+                        close_reason="INVALID_TRADE_LEVELS", entry_armed=False,
+                    )
+                    events.append({
+                        "event": "ENTRY_CANCELLED", "trade": trade,
+                        "reason": "INVALID_TRADE_LEVELS",
+                    })
+                    continue
+                trade["stop_loss"] = float(actual_levels["stop_loss"])
+                trade["take_profit"] = float(actual_levels["take_profit"])
             trade["status"] = "open"
             trade["opened_at"] = datetime.now(timezone.utc)
             # A Last Price trigger is only a virtual fill assumption. This
@@ -703,6 +739,35 @@ class TradeManager:
         )
         return {"event": "ENTRY_CANCELLED", "trade": trade, "reason": reason}
 
+    def cancel_expired_false_breakout_pending(
+        self, now: datetime | None = None,
+    ) -> list[dict]:
+        """Cancel False Breakout PENDINGs 15 minutes after their persisted creation."""
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        events = []
+        for trade in self.trades:
+            if (trade.get("strategy_id") != "false_breakout"
+                    or trade.get("status") != "pending"):
+                continue
+            created_at = trade.get("created_at")
+            if not isinstance(created_at, datetime):
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if (now - created_at).total_seconds() < FALSE_BREAKOUT_PENDING_TIMEOUT_SECONDS:
+                continue
+            trade.update(
+                status="cancelled", closed_at=now,
+                close_reason="FALSE_BREAKOUT_ENTRY_TIMEOUT", entry_armed=False,
+            )
+            events.append({
+                "event": "ENTRY_CANCELLED", "trade": trade,
+                "reason": "FALSE_BREAKOUT_ENTRY_TIMEOUT",
+            })
+        return events
+
     def close_trade(self, signal_id: str, price: float) -> dict | None:
         trade = self.find_trade(signal_id)
         if trade is None or trade.get("status") != "open":
@@ -814,6 +879,9 @@ class TradeManager:
             "take_profit": float(levels["take_profit"]),
             "leverage": float(pair_settings.leverage or self.trading_settings.leverage),
             "stake_usdt": float(self.trading_settings.stake_usdt),
+            "level_policy_strategy_id": data.get("level_policy_strategy_id"),
+            "take_profit_bps": data.get("take_profit_bps"),
+            "stop_loss_bps": data.get("stop_loss_bps"),
         }
         return all(existing.get(key) == value for key, value in expected.items())
 
@@ -839,6 +907,10 @@ class TradeManager:
             "leverage": float(pair_settings.leverage or self.trading_settings.leverage),
             "position_notional_usdt": float(trade["stake_usdt"])
             * float(pair_settings.leverage or self.trading_settings.leverage),
+            "level_policy_strategy_id": data.get("level_policy_strategy_id"),
+            "take_profit_bps": data.get("take_profit_bps"),
+            "stop_loss_bps": data.get("stop_loss_bps"),
+            "tick_size": data.get("tick_size"),
             "entry_armed": False,
         })
         return trade

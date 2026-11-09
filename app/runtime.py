@@ -6,7 +6,9 @@ import logging
 from config import CANCELLED_TRADE_CLEANUP_INTERVAL_SECONDS
 from script.engine import EngineMode, StrategyPersistenceError, TradingEngine
 from script.settings import PairSettings, TradingSettings, normalize_pair_symbol
-from script.trade_levels import effective_trade_level_bps
+from script.trade_levels import (
+    effective_strategy_trade_level_bps, effective_trade_level_bps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,31 @@ class RuntimeController:
         self._lifecycle_lock = asyncio.Lock()
         self._workers_by_symbol: dict[str, asyncio.Task] = {}
         self._cancelled_cleanup_task: asyncio.Task | None = None
+        self._false_breakout_timeout_task: asyncio.Task | None = None
+
+    def start_false_breakout_timeout_service(self) -> None:
+        if self._false_breakout_timeout_task is not None and not self._false_breakout_timeout_task.done():
+            return
+        self._false_breakout_timeout_task = asyncio.create_task(
+            self._false_breakout_timeout_loop(), name="false-breakout-pending-timeout"
+        )
+
+    async def _false_breakout_timeout_loop(self) -> None:
+        while True:
+            try:
+                await self.engine.expire_false_breakout_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("False Breakout PENDING expiry check failed")
+            await asyncio.sleep(1.0)
+
+    async def _stop_false_breakout_timeout_service(self) -> None:
+        task = self._false_breakout_timeout_task
+        self._false_breakout_timeout_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def start_cancelled_trade_cleanup(self) -> None:
         """Start the single app-lifetime cleanup service if it is not running."""
@@ -264,9 +291,18 @@ class RuntimeController:
                 events = self.engine.trade_manager.cancel_pending_for_symbol(
                     symbol, "PAIR_DISABLED"
                 )
-            elif previous_settings is not None and effective_trade_level_bps(
-                previous_settings, self.engine.trading_settings
-            ) != effective_trade_level_bps(settings, self.engine.trading_settings):
+            elif previous_settings is not None and (
+                effective_trade_level_bps(previous_settings, self.engine.trading_settings)
+                != effective_trade_level_bps(settings, self.engine.trading_settings)
+                or any(
+                    effective_strategy_trade_level_bps(
+                        previous_settings, self.engine.trading_settings, strategy_id
+                    ) != effective_strategy_trade_level_bps(
+                        settings, self.engine.trading_settings, strategy_id
+                    )
+                    for strategy_id in ("bounce", "breakout")
+                )
+            ):
                 self.engine.pair_settings[symbol] = settings
                 self.engine.trade_manager.set_pair_settings_for_price_check(settings)
                 events = self.engine.replan_after_level_settings_change(symbol)
@@ -344,8 +380,6 @@ class RuntimeController:
             if symbol not in self.engine.pair_settings:
                 raise ValueError(f"Pair {symbol} is not configured")
             self.engine.strategy_registry.get_enabled(selected)
-            if len(selected) > 1:
-                raise ValueError("Select only one trading strategy per pair")
             previous = self.engine.get_enabled_strategy_ids(symbol)
             current_version = self.engine.strategy_versions.get(symbol, 0)
             if previous == selected:
@@ -449,6 +483,7 @@ class RuntimeController:
     async def shutdown(self) -> None:
         """Stop feeds and persist state without closing virtual trades."""
         await self._stop_cancelled_trade_cleanup()
+        await self._stop_false_breakout_timeout_service()
         async with self._lifecycle_lock, self.engine.state_lock:
             await self.engine._stop_workers_locked()
             if self.engine._pending_persistence and not await self.engine.persist_events([]):

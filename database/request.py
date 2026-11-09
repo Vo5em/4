@@ -164,12 +164,29 @@ async def initialize_database(
                     ),
                     take_profit_bps=getattr(row, "take_profit_bps", None),
                     stop_loss_bps=getattr(row, "stop_loss_bps", None),
+                    bounce_take_profit_bps=getattr(row, "bounce_take_profit_bps", None),
+                    bounce_stop_loss_bps=getattr(row, "bounce_stop_loss_bps", None),
+                    breakout_take_profit_bps=getattr(row, "breakout_take_profit_bps", None),
+                    breakout_stop_loss_bps=getattr(row, "breakout_stop_loss_bps", None),
+                    historical_level_timeframe=getattr(row, "historical_level_timeframe", "5m") or "5m",
+                    historical_level_candle_count=getattr(row, "historical_level_candle_count", 500) or 500,
+                    historical_level_refresh_seconds=getattr(row, "historical_level_refresh_seconds", 300.0) or 300.0,
+                    max_wall_level_distance_bps=getattr(row, "max_wall_level_distance_bps", 13.0) or 13.0,
+                    false_breakout_point_1_offset_bps=getattr(row, "false_breakout_point_1_offset_bps", None),
+                    false_breakout_point_2_distance_bps=getattr(row, "false_breakout_point_2_distance_bps", None),
+                    false_breakout_observation_timeout_seconds=getattr(row, "false_breakout_observation_timeout_seconds", None),
+                    false_breakout_take_profit_bps=getattr(row, "false_breakout_take_profit_bps", None),
+                    false_breakout_stop_loss_bps=getattr(row, "false_breakout_stop_loss_bps", None),
                 )
                 for row in pair_rows
             },
             "enabled_strategies": enabled_strategies,
             "strategy_versions": {
                 row.symbol: int(getattr(row, "version", 1) or 1)
+                for row in strategy_rows
+            },
+            "strategy_states": {
+                row.symbol: dict(getattr(row, "strategy_state", {}) or {})
                 for row in strategy_rows
             },
             "trades": [_trade_dict(row) for row in trade_rows],
@@ -252,6 +269,19 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
         taker_fee_rate=settings.taker_fee_rate,
         take_profit_bps=settings.take_profit_bps,
         stop_loss_bps=settings.stop_loss_bps,
+        bounce_take_profit_bps=settings.bounce_take_profit_bps,
+        bounce_stop_loss_bps=settings.bounce_stop_loss_bps,
+        breakout_take_profit_bps=settings.breakout_take_profit_bps,
+        breakout_stop_loss_bps=settings.breakout_stop_loss_bps,
+        historical_level_timeframe=settings.historical_level_timeframe,
+        historical_level_candle_count=settings.historical_level_candle_count,
+        historical_level_refresh_seconds=settings.historical_level_refresh_seconds,
+        max_wall_level_distance_bps=settings.max_wall_level_distance_bps,
+        false_breakout_point_1_offset_bps=settings.false_breakout_point_1_offset_bps,
+        false_breakout_point_2_distance_bps=settings.false_breakout_point_2_distance_bps,
+        false_breakout_observation_timeout_seconds=settings.false_breakout_observation_timeout_seconds,
+        false_breakout_take_profit_bps=settings.false_breakout_take_profit_bps,
+        false_breakout_stop_loss_bps=settings.false_breakout_stop_loss_bps,
     )
 
 
@@ -293,6 +323,10 @@ def _trade_dict(row: VirtualTrade) -> dict:
         "entry_fill_price": getattr(row, "entry_fill_price", None),
         "entry_trigger_direction": getattr(row, "entry_trigger_direction", None),
         "entry_armed": bool(getattr(row, "entry_armed", False)),
+        "take_profit_bps": getattr(row, "take_profit_bps", None),
+        "stop_loss_bps": getattr(row, "stop_loss_bps", None),
+        "level_policy_strategy_id": getattr(row, "level_policy_strategy_id", None),
+        "tick_size": getattr(row, "tick_size", None),
         "stop_loss": row.stop_loss,
         "take_profit": row.take_profit,
         "exit_price": row.exit_price,
@@ -312,7 +346,9 @@ _VIRTUAL_TRADE_FIELDS = (
     "gross_pnl_usdt", "maker_fee_rate", "taker_fee_rate", "applied_fee_rate",
     "commission_model", "fee_rate", "accounting_version", "stop_loss",
     "take_profit", "entry_fill_price", "wall_id", "entry_trigger_direction",
-    "entry_armed", "exit_price", "profit_usdt", "close_reason",
+    "entry_armed", "take_profit_bps", "stop_loss_bps", "level_policy_strategy_id",
+    "tick_size",
+    "exit_price", "profit_usdt", "close_reason",
     "profit_percent", "created_at", "opened_at", "closed_at",
 )
 
@@ -397,6 +433,49 @@ async def save_trades(
             state.balance_usdt = balance_usdt
             if engine_mode is not None:
                 state.engine_mode = engine_mode
+        await session.commit()
+
+
+async def save_trades_with_strategy_states(
+    trades: list[dict],
+    balance_usdt: float,
+    engine_mode: str,
+    strategy_states: dict[str, dict],
+) -> None:
+    """Atomically persist trade rows, balance, and strategy scenario state."""
+    async with async_session() as session:
+        for trade in trades:
+            row = await session.scalar(
+                select(VirtualTrade).where(VirtualTrade.signal_id == trade["signal_id"])
+            )
+            values = _virtual_trade_values(trade, is_insert=row is None)
+            if row is None:
+                session.add(VirtualTrade(**values))
+            else:
+                for key, value in values.items():
+                    setattr(row, key, value)
+            if trade.get("status") == "cancelled" and trade.get("close_reason") == "MANUAL_CANCELLED":
+                block = await session.get(ManualPlanBlock, trade["signal_id"])
+                if block is None:
+                    session.add(ManualPlanBlock(
+                        signal_id=trade["signal_id"], symbol=trade["symbol"],
+                        strategy_id=trade["strategy_id"], wall_id=trade.get("wall_id"),
+                        wall_side=trade["wall_side"], wall_price=trade["wall_price"],
+                    ))
+        for symbol, state_by_strategy in strategy_states.items():
+            symbol = normalize_pair_symbol(symbol)
+            row = await session.get(PairStrategyConfig, symbol)
+            if row is None:
+                row = PairStrategyConfig(
+                    symbol=symbol, enabled_strategy_ids=[], strategy_state=state_by_strategy,
+                )
+                session.add(row)
+            else:
+                row.strategy_state = state_by_strategy
+        state = await session.get(RuntimeState, 1)
+        if state is not None:
+            state.balance_usdt = balance_usdt
+            state.engine_mode = engine_mode
         await session.commit()
 
 
@@ -488,6 +567,13 @@ async def save_pair_settings(settings: PairSettings) -> None:
                 "breakout_max_update_gap_seconds",
                 "leverage", "maker_fee_rate", "taker_fee_rate",
                 "take_profit_bps", "stop_loss_bps",
+                "bounce_take_profit_bps", "bounce_stop_loss_bps",
+                "breakout_take_profit_bps", "breakout_stop_loss_bps",
+                "historical_level_timeframe", "historical_level_candle_count",
+                "historical_level_refresh_seconds", "max_wall_level_distance_bps",
+                "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
+                "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
+                "false_breakout_stop_loss_bps",
             ):
                 setattr(row, key, getattr(values, key))
         await session.commit()
@@ -616,6 +702,13 @@ async def save_pair_settings_with_trades(
                 "breakout_max_update_gap_seconds",
                 "leverage", "maker_fee_rate", "taker_fee_rate",
                 "take_profit_bps", "stop_loss_bps",
+                "bounce_take_profit_bps", "bounce_stop_loss_bps",
+                "breakout_take_profit_bps", "breakout_stop_loss_bps",
+                "historical_level_timeframe", "historical_level_candle_count",
+                "historical_level_refresh_seconds", "max_wall_level_distance_bps",
+                "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
+                "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
+                "false_breakout_stop_loss_bps",
             ):
                 setattr(pair_row, key, getattr(values, key))
 
