@@ -1,5 +1,50 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+
+PAIR_PAGE_SIZE = 10
+
+
+def paginated_pair_keyboard(
+    pairs,
+    page: int,
+    item_callback,
+    page_callback,
+    back_callback: str,
+    *,
+    page_size: int = PAIR_PAGE_SIZE,
+    columns: int = 2,
+    labels=None,
+    back_label: str = "Назад к настройкам",
+) -> InlineKeyboardMarkup:
+    """Build a bounded pair picker shared by settings and market diagnostics."""
+    symbols = list(pairs)
+    if page_size < 1 or columns < 1:
+        raise ValueError("page_size and columns must be positive")
+    page_count = max(1, (len(symbols) + page_size - 1) // page_size)
+    page = max(0, min(int(page), page_count - 1))
+    page_symbols = symbols[page * page_size:(page + 1) * page_size]
+    labels = labels or {}
+    rows = []
+    for offset in range(0, len(page_symbols), columns):
+        rows.append([
+            InlineKeyboardButton(
+                text=str(labels.get(symbol, symbol)),
+                callback_data=item_callback(symbol),
+            )
+            for symbol in page_symbols[offset:offset + columns]
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text="Назад", callback_data=page_callback(max(0, page - 1)),
+        ),
+        InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data=page_callback(page)),
+        InlineKeyboardButton(
+            text="Вперёд", callback_data=page_callback(min(page_count - 1, page + 1)),
+        ),
+    ])
+    rows.append([InlineKeyboardButton(text=back_label, callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 main = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="Запустить / возобновить", callback_data="engine_start")],

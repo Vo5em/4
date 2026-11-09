@@ -24,6 +24,7 @@ from script.engine import EngineMode
 from script.settings import PairSettings
 from script.trade_levels import (
     ENTRY_DISTANCE_BPS,
+    effective_strategy_trade_level_bps,
     effective_trade_level_bps,
     estimate_trade_outcomes,
 )
@@ -181,6 +182,22 @@ def _database_label(status: str) -> str:
     }.get(status, "нет данных")
 
 
+def _compact_items(items, max_chars: int) -> str:
+    values = [str(item) for item in items]
+    if not values:
+        return "нет данных"
+    if len(", ".join(values)) <= max_chars:
+        return ", ".join(values)
+    count = 0
+    for candidate_count in range(1, len(values) + 1):
+        suffix = f" … и ещё {len(values) - candidate_count}"
+        candidate = ", ".join(values[:candidate_count])
+        if len(candidate) + len(suffix) > max_chars:
+            break
+        count = candidate_count
+    return ", ".join(values[:count]) + f" … и ещё {len(values) - count}"
+
+
 def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
     symbol = symbol.strip().upper()
     settings = runtime.engine.pair_settings.get(symbol)
@@ -276,37 +293,42 @@ def pair_statistics_text(runtime: RuntimeController, symbol: str) -> str:
 
 def dashboard_text(runtime: RuntimeController) -> str:
     status = runtime.engine.get_status()
-    pairs = ", ".join(status["enabled_pairs"]) or "нет активных пар"
-    feeds = ", ".join(
+    enabled_pairs = status["enabled_pairs"]
+    pairs = _compact_items(enabled_pairs, 850) if enabled_pairs else "нет активных пар"
+    feed_items = [
         f"{symbol}: {_feed_label(feed)}"
         for symbol, feed in status["feed_status"].items()
-    ) or "нет потоков"
+    ]
+    feeds = _compact_items(feed_items, 480) if feed_items else "нет потоков"
     market_health = status.get("market_data_health", {})
-    freshness = ", ".join(
+    freshness_items = [
         _market_health_label(symbol, health)
-        for symbol, health in market_health.items()
-    ) or "нет данных"
+        for symbol, health in list(market_health.items())[:4]
+    ]
+    freshness = _compact_items(freshness_items, 550)
     strategy_errors = status.get("strategy_errors", {})
-    error_text = " | ".join(
+    strategy_error_items = [
         f"{symbol} {strategy_id}: {error_type}"
         for symbol, errors in strategy_errors.items()
         for strategy_id, error_type in errors.items()
-    )
+    ]
+    error_text = _compact_items(strategy_error_items, 350) if strategy_error_items else ""
     strategy_error_line = (
         f"\nОшибки стратегий: {escape(error_text)}" if error_text else ""
     )
     feed_errors = status.get("feed_errors", {})
-    feed_error_text = " | ".join(
-        f"{symbol}: {escape(str(error['type']))}: {escape(str(error['message']))} "
+    feed_error_items = [
+        f"{symbol}: {escape(str(error['type']))}: {escape(str(error['message']))[:160]} "
         f"({_date_label(error.get('at'))})"
         for symbol, error in feed_errors.items() if error
-    ) or "нет"
+    ]
+    feed_error_text = _compact_items(feed_error_items, 550) if feed_error_items else "нет"
     analysis_active = [
         symbol for symbol, metric in status.get("market_analysis", {}).items()
         if metric.get("updated_at") is not None
     ]
     analysis_status = (
-        "анализирует " + ", ".join(analysis_active)
+        "анализирует " + _compact_items(analysis_active, 380)
         if analysis_active and status["algorithm_status"] == "working"
         else "ожидает обработку рынка" if status["algorithm_status"] == "waiting"
         else "остановлен" if status["algorithm_status"] == "stopped"
@@ -335,7 +357,7 @@ def dashboard_text(runtime: RuntimeController) -> str:
         "<b>Админ-панель · виртуальная торговля</b>\n\n"
         f"Состояние: {_mode_label(status['mode'])}\n"
         f"Алгоритм: {_algorithm_label(status['algorithm_status'])}\n"
-        f"Пары: {pairs}\n"
+        f"Пары ({len(enabled_pairs)} включено): {pairs}\n"
         f"Рыночные данные: {feeds}\n"
         f"Возраст данных: {freshness}\n"
         f"Поиск и анализ стен: {analysis_status}\n"
@@ -393,6 +415,199 @@ def pair_settings_text(runtime: RuntimeController) -> str:
             f"стратегии {escape(strategies)}"
         )
     return "\n".join(pairs) or "Торговые пары не настроены."
+
+
+_PAIR_SETTINGS_PAGE_SIZE = 10
+_PAIR_SETTINGS_SECTIONS = ("main", "levels", "strategies", "false_breakout")
+_PAIR_SECTION_LABELS = {
+    "main": "Основные", "levels": "Исторические уровни",
+    "strategies": "Стратегии · TP/SL", "false_breakout": "False Breakout",
+}
+_PAIR_SECTION_KEYS = {"main": "m", "levels": "l", "strategies": "s", "false_breakout": "f"}
+_PAIR_SECTION_BY_KEY = {value: key for key, value in _PAIR_SECTION_KEYS.items()}
+
+
+def _pair_settings_overview_text(runtime: RuntimeController) -> str:
+    pairs = sorted(runtime.engine.pair_settings)
+    enabled = sum(runtime.engine.pair_settings[symbol].enabled for symbol in pairs)
+    disabled = len(pairs) - enabled
+    names = ", ".join(pairs) or "нет"
+    max_names_length = 2500
+    if len(names) > max_names_length:
+        included = []
+        current_length = 0
+        for symbol in pairs:
+            extra = len(symbol) + (2 if included else 0)
+            if current_length + extra > max_names_length:
+                break
+            included.append(symbol)
+            current_length += extra
+        names = ", ".join(included) + f" … и ещё {len(pairs) - len(included)}"
+    trading = runtime.engine.trading_settings
+    return (
+        "<b>Настройки виртуальной торговли</b>\n\n"
+        f"Ставка на сделку: {trading.stake_usdt:.2f} USDT\n"
+        f"Начальный баланс: {trading.initial_balance_usdt:.2f} USDT\n"
+        f"Глобальные TP / SL: {trading.default_take_profit_bps:g} / "
+        f"{trading.default_stop_loss_bps:g} б.п. от Entry\n"
+        f"Торговые пары: {len(pairs)} · включено {enabled} · выключено {disabled}\n"
+        f"Список: {escape(names)}\n\n"
+        "Индивидуальные значения смотрите в карточке выбранной пары."
+    )
+
+
+def pair_settings_list_text(runtime: RuntimeController, page: int) -> str:
+    symbols = sorted(runtime.engine.pair_settings)
+    pages = max(1, (len(symbols) + _PAIR_SETTINGS_PAGE_SIZE - 1) // _PAIR_SETTINGS_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    return (
+        f"<b>Настройки пары</b> · {len(symbols)} пар · стр. {page + 1}/{pages}\n\n"
+        "Выберите пару кнопкой или отправьте её символ сообщением."
+    )
+
+
+def pair_settings_list_keyboard(runtime: RuntimeController, page: int = 0) -> InlineKeyboardMarkup:
+    symbols = sorted(runtime.engine.pair_settings)
+    page_count = max(1, (len(symbols) + _PAIR_SETTINGS_PAGE_SIZE - 1) // _PAIR_SETTINGS_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    return kb.paginated_pair_keyboard(
+        symbols, page,
+        lambda symbol: f"settings_pair_select:{symbol}:{page}",
+        lambda target: f"settings_pair_page:{target}",
+        "settings",
+        page_size=_PAIR_SETTINGS_PAGE_SIZE,
+        columns=2,
+        labels={
+            symbol: f"{symbol} · {'вкл' if runtime.engine.pair_settings[symbol].enabled else 'выкл'}"
+            for symbol in symbols
+        },
+    )
+
+
+def _display_setting(value) -> str:
+    if value is None:
+        return "Не задано (none)"
+    if isinstance(value, bool):
+        return "включена" if value else "выключена"
+    return str(value)
+
+
+def _setting_command_value(value) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def pair_settings_card_text(runtime: RuntimeController, symbol: str, section: str = "main") -> str:
+    symbol = symbol.strip().upper()
+    settings = runtime.engine.pair_settings.get(symbol)
+    if settings is None:
+        return "Пара больше не настроена. Откройте список пар заново."
+    if section not in _PAIR_SETTINGS_SECTIONS:
+        section = "main"
+    strategy_names = _strategy_label(runtime.engine.get_enabled_strategy_ids(symbol))
+    fields_by_section = {
+        "main": (
+            ("enabled", settings.enabled),
+            ("min_wall_ratio", settings.min_wall_ratio),
+            ("min_wall_notional_usdt", settings.min_wall_notional_usdt),
+            ("max_wall_distance_bps", settings.max_wall_distance_bps),
+            ("min_wall_age_seconds", settings.min_wall_age_seconds),
+            ("consumed_ratio", settings.consumed_ratio),
+            ("entry_distance_bps", settings.entry_distance_bps),
+            ("stop_distance_bps", settings.stop_distance_bps),
+            ("bounce_reversal_bps", settings.bounce_reversal_bps),
+            ("breakout_confirm_seconds", settings.breakout_confirm_seconds),
+            ("breakout_buffer_bps", settings.breakout_buffer_bps),
+            ("breakout_max_update_gap_seconds", settings.breakout_max_update_gap_seconds),
+        ),
+        "levels": (
+            ("historical_level_timeframe", settings.historical_level_timeframe),
+            ("historical_level_candle_count", settings.historical_level_candle_count),
+            ("historical_level_refresh_seconds", settings.historical_level_refresh_seconds),
+            ("max_wall_level_distance_bps", settings.max_wall_level_distance_bps),
+        ),
+        "strategies": (
+            ("bounce_take_profit_bps", settings.bounce_take_profit_bps),
+            ("bounce_stop_loss_bps", settings.bounce_stop_loss_bps),
+            ("breakout_take_profit_bps", settings.breakout_take_profit_bps),
+            ("breakout_stop_loss_bps", settings.breakout_stop_loss_bps),
+            ("take_profit_bps", settings.take_profit_bps),
+            ("stop_loss_bps", settings.stop_loss_bps),
+            ("false_breakout_take_profit_bps", settings.false_breakout_take_profit_bps),
+            ("false_breakout_stop_loss_bps", settings.false_breakout_stop_loss_bps),
+        ),
+        "false_breakout": (
+            ("false_breakout_point_1_offset_bps", settings.false_breakout_point_1_offset_bps),
+            ("false_breakout_point_2_distance_bps", settings.false_breakout_point_2_distance_bps),
+            ("false_breakout_observation_timeout_seconds", settings.false_breakout_observation_timeout_seconds),
+        ),
+    }
+    lines = [
+        f"<b>{escape(symbol)} · {_PAIR_SECTION_LABELS[section]}</b>",
+        f"Стратегии: {escape(strategy_names)}",
+    ]
+    if section == "main":
+        effective_leverage = settings.leverage or runtime.engine.trading_settings.leverage
+        lines.append(f"leverage: {effective_leverage:g}x (изменить: «Плечо по парам»)")
+        lines.append(
+            f"Комиссии Maker/Taker: {settings.maker_fee_rate * 100:.4f}% / "
+            f"{settings.taker_fee_rate * 100:.4f}%"
+        )
+    if section == "levels":
+        levels = runtime.engine.historical_levels.get(symbol, ())
+        if not levels:
+            lines.append("Текущие уровни: нет данных")
+        else:
+            level_lines = "; ".join(
+                f"{item.get('type', 'нет данных')} {float(item.get('price', 0)):g}, "
+                f"{item.get('touch_count', 'нет данных')} кас."
+                for item in levels[:10]
+            )
+            lines.append(f"Текущие уровни: {escape(level_lines)}")
+    if section == "strategies":
+        lines.append("Combined использует параметры выбранной политики Bounce или Breakout.")
+        for strategy_id in ("bounce", "breakout"):
+            tp, sl = effective_strategy_trade_level_bps(
+                settings, runtime.engine.trading_settings, strategy_id
+            )
+            lines.append(f"Эффективно {strategy_id}: TP {tp:g} / SL {sl:g} б.п.")
+    if section == "false_breakout":
+        lines.append("Фиксированный срок PENDING: 900 секунд (15 минут).")
+        lines.append("Это не срок наблюдения до создания PENDING.")
+        false_tp = settings.false_breakout_take_profit_bps or settings.take_profit_bps or runtime.engine.trading_settings.default_take_profit_bps
+        false_sl = settings.false_breakout_stop_loss_bps or settings.stop_loss_bps or runtime.engine.trading_settings.default_stop_loss_bps
+        lines.append(f"Эффективно False Breakout: TP {false_tp:g} / SL {false_sl:g} б.п.")
+    for parameter, value in fields_by_section[section]:
+        lines.append(f"<code>{parameter}</code>: {_display_setting(value)}")
+    lines.extend(("", "Команда изменения: <code>ПАРА параметр значение</code>"))
+    for parameter, value in fields_by_section[section]:
+        lines.append(
+            f"<code>{escape(symbol)} {parameter} {_setting_command_value(value)}</code>"
+        )
+    if section in {"strategies", "false_breakout"}:
+        lines.append("Для сброса необязательного значения используйте <code>none</code>.")
+    text = "\n".join(lines)
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        raise AssertionError(f"Pair settings card exceeds Telegram limit: {len(text)}")
+    return text
+
+
+def pair_settings_card_keyboard(runtime: RuntimeController, symbol: str, section: str) -> InlineKeyboardMarkup:
+    symbol = symbol.strip().upper()
+    section = section if section in _PAIR_SETTINGS_SECTIONS else "main"
+    sections = [InlineKeyboardButton(
+        text=("✓ " if section == target else "") + _PAIR_SECTION_LABELS[target],
+        callback_data=f"settings_pair_section:{symbol}:{_PAIR_SECTION_KEYS[target]}",
+    ) for target in _PAIR_SETTINGS_SECTIONS]
+    rows = [sections[index:index + 2] for index in range(0, len(sections), 2)]
+    rows.extend((
+        [InlineKeyboardButton(text="К списку пар", callback_data="settings_pair")],
+        [InlineKeyboardButton(text="Настройки", callback_data="settings")],
+    ))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _level_value_label(override: float | None, default: float) -> str:
@@ -534,17 +749,10 @@ async def show_settings(
     callback: CallbackQuery, runtime: RuntimeController, state: FSMContext
 ) -> None:
     await state.clear()
-    pair_text = pair_settings_text(runtime)
     if callback.message is not None:
         await edit_message_if_changed(
             callback.message,
-            "<b>Настройки виртуальной торговли</b>\n\n"
-            f"Ставка на сделку: {runtime.engine.trading_settings.stake_usdt:.2f} USDT\n"
-            f"Начальный баланс: {runtime.engine.trading_settings.initial_balance_usdt:.2f} USDT\n\n"
-            f"Глобальный TP / SL: "
-            f"{runtime.engine.trading_settings.default_take_profit_bps:g} / "
-            f"{runtime.engine.trading_settings.default_stop_loss_bps:g} б.п. от Entry\n\n"
-            f"<b>Пары</b>\n{pair_text}\n\n"
+            _pair_settings_overview_text(runtime) + "\n\n"
             "Настройки сохраняются в PostgreSQL. Пороги, дистанции и плечо "
             "настраиваются отдельно для каждой пары; плечо новых сделок "
             "не меняет уже созданные. Стратегии пары можно "
@@ -736,27 +944,90 @@ async def update_trade_level_value(
 
 
 @admin.callback_query(Admin(), F.data == "settings_pair")
-async def request_pair_settings(callback: CallbackQuery, state: FSMContext) -> None:
+async def request_pair_settings(
+    callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
+) -> None:
+    previous = await state.get_data()
+    page = int(previous.get("pair_list_page", 0) or 0)
     await state.set_state(SettingsInput.waiting_for_pair)
+    await state.update_data(pair_section="main", pair_list_page=page)
     if callback.message is not None:
-        await callback.message.answer(
-            "Отправьте: <code>ПАРА параметр значение</code>.\n"
-            "Параметры: <code>enabled, min_wall_ratio, min_wall_notional_usdt, max_wall_distance_bps, "
-            "min_wall_age_seconds, consumed_ratio, entry_distance_bps, "
-            "stop_distance_bps, bounce_reversal_bps, "
-            "breakout_confirm_seconds, breakout_buffer_bps, "
-            "breakout_max_update_gap_seconds, historical_level_timeframe, "
-            "historical_level_candle_count, historical_level_refresh_seconds, "
-            "max_wall_level_distance_bps, bounce_take_profit_bps, bounce_stop_loss_bps, "
-            "breakout_take_profit_bps, breakout_stop_loss_bps, "
-            "false_breakout_point_1_offset_bps, false_breakout_point_2_distance_bps, "
-            "false_breakout_observation_timeout_seconds, false_breakout_take_profit_bps, "
-            "false_breakout_stop_loss_bps</code>. Для nullable False Breakout параметров "
-            "значение <code>none</code> отключает сценарии, пока обязательные точки не заданы.\n"
-            "Примеры: <code>BTCUSDT historical_level_timeframe 15m</code>; "
-            "<code>ETHUSDT false_breakout_point_1_offset_bps 8</code>.\n"
-            "Также: <code>BTCUSDT entry_distance_bps 1.5</code>.",
-            reply_markup=kb.cancel_input,
+        await edit_message_if_changed(
+            callback.message,
+            pair_settings_list_text(runtime, page),
+            reply_markup=pair_settings_list_keyboard(runtime, page),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("settings_pair_page:"))
+async def navigate_pair_settings_list(
+    callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
+) -> None:
+    try:
+        page = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница", show_alert=True)
+        return
+    await state.set_state(SettingsInput.waiting_for_pair)
+    await state.update_data(pair_list_page=page, pair_section="main")
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message, pair_settings_list_text(runtime, page),
+            pair_settings_list_keyboard(runtime, page),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("settings_pair_select:"))
+async def select_settings_pair(
+    callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
+) -> None:
+    try:
+        _, symbol, raw_page = (callback.data or "").split(":", 2)
+        page = int(raw_page)
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректный выбор пары", show_alert=True)
+        return
+    symbol = symbol.strip().upper()
+    if symbol not in runtime.engine.pair_settings:
+        await callback.answer("Пара больше не настроена. Список обновлён.", show_alert=True)
+        if callback.message is not None:
+            await edit_message_if_changed(
+                callback.message, pair_settings_list_text(runtime, page),
+                pair_settings_list_keyboard(runtime, page),
+            )
+        return
+    await state.set_state(SettingsInput.waiting_for_pair)
+    await state.update_data(pair_symbol=symbol, pair_section="main", pair_list_page=page)
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message, pair_settings_card_text(runtime, symbol, "main"),
+            pair_settings_card_keyboard(runtime, symbol, "main"),
+        )
+    await callback.answer()
+
+
+@admin.callback_query(Admin(), F.data.startswith("settings_pair_section:"))
+async def navigate_pair_settings_section(
+    callback: CallbackQuery, state: FSMContext, runtime: RuntimeController
+) -> None:
+    try:
+        _, symbol, raw_section = (callback.data or "").split(":", 2)
+    except ValueError:
+        await callback.answer("Некорректный раздел", show_alert=True)
+        return
+    symbol = symbol.upper()
+    section = _PAIR_SECTION_BY_KEY.get(raw_section, raw_section)
+    if symbol not in runtime.engine.pair_settings or section not in _PAIR_SETTINGS_SECTIONS:
+        await callback.answer("Пара или раздел больше недоступны", show_alert=True)
+        return
+    await state.set_state(SettingsInput.waiting_for_pair)
+    await state.update_data(pair_symbol=symbol, pair_section=section)
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message, pair_settings_card_text(runtime, symbol, section),
+            pair_settings_card_keyboard(runtime, symbol, section),
         )
     await callback.answer()
 
@@ -1002,6 +1273,22 @@ async def update_pair_settings(
     runtime: RuntimeController,
 ) -> None:
     parts = (message.text or "").split()
+    if len(parts) == 1:
+        symbol = parts[0].strip().upper()
+        if symbol not in runtime.engine.pair_settings:
+            await message.answer(
+                "Пара не найдена. Выберите её кнопкой или проверьте символ.\n"
+                + pair_settings_list_text(runtime, 0),
+                reply_markup=pair_settings_list_keyboard(runtime, 0),
+            )
+            return
+        data = await state.get_data()
+        await state.update_data(pair_symbol=symbol, pair_section="main")
+        await message.answer(
+            pair_settings_card_text(runtime, symbol, "main"),
+            reply_markup=pair_settings_card_keyboard(runtime, symbol, "main"),
+        )
+        return
     if len(parts) != 3:
         await message.answer("Неверный формат. Пример: <code>BTCUSDT entry_distance_bps 1.5</code>.")
         return
@@ -1066,8 +1353,29 @@ async def update_pair_settings(
     except Exception:
         await message.answer("Не удалось сохранить настройки пары в базе данных.")
         return
-    await state.clear()
-    await message.answer("Настройки пары сохранены.\n\n" + dashboard_text(runtime), reply_markup=kb.main)
+    data = await state.get_data()
+    parameter_sections = {
+        "historical_level_timeframe": "levels",
+        "historical_level_candle_count": "levels",
+        "historical_level_refresh_seconds": "levels",
+        "max_wall_level_distance_bps": "levels",
+        "bounce_take_profit_bps": "strategies", "bounce_stop_loss_bps": "strategies",
+        "breakout_take_profit_bps": "strategies", "breakout_stop_loss_bps": "strategies",
+        "false_breakout_take_profit_bps": "strategies", "false_breakout_stop_loss_bps": "strategies",
+        "false_breakout_point_1_offset_bps": "false_breakout",
+        "false_breakout_point_2_distance_bps": "false_breakout",
+        "false_breakout_observation_timeout_seconds": "false_breakout",
+    }
+    section = parameter_sections.get(parameter, data.get("pair_section", "main"))
+    if section not in _PAIR_SETTINGS_SECTIONS:
+        section = "main"
+    await state.set_state(SettingsInput.waiting_for_pair)
+    await state.update_data(pair_symbol=symbol, pair_section=section)
+    await message.answer(
+        f"Настройка {escape(parameter)} сохранена для {escape(symbol)}.\n\n"
+        + pair_settings_card_text(runtime, symbol, section),
+        reply_markup=pair_settings_card_keyboard(runtime, symbol, section),
+    )
 
 
 @admin.callback_query(Admin(), F.data == "moreinfo")
@@ -1113,7 +1421,10 @@ def _trade_for_token(runtime: RuntimeController, token: str) -> dict | None:
 
 
 def _strategy_name(strategy_id: str) -> str:
-    return {"bounce": "Bounce", "breakout": "Breakout"}.get(
+    return {
+        "bounce": "Bounce", "breakout": "Breakout",
+        "false_breakout": "False Breakout", "combined": "Combined",
+    }.get(
         strategy_id, strategy_id or "нет данных"
     )
 
@@ -1213,6 +1524,25 @@ def _deal_card(runtime: RuntimeController, trade: dict) -> tuple[str, InlineKeyb
             f"Триггер: {'ARMED' if trade.get('entry_armed') else 'WAITING'} · направление: {escape(str(trade.get('entry_trigger_direction') or 'нет данных'))}",
             f"Маржа при активации: {float(trade.get('stake_usdt') or 0):.2f} USDT · "
             f"сейчас не резервируется · плечо {float(trade.get('leverage') or 1):g}x",
+            "Исторический уровень: "
+            + (
+                f"{float(trade['historical_level_price']):g} · "
+                f"{escape(str(trade.get('historical_level_type') or 'Нет данных'))} · "
+                f"{escape(str(trade.get('historical_level_timeframe') or 'Нет данных'))} · "
+                f"{trade.get('historical_level_touch_count', 'Нет данных')} кас. · "
+                f"дистанция {float(trade['historical_level_distance_bps']):.2f} б.п."
+                if all(trade.get(key) is not None for key in (
+                    "historical_level_price", "historical_level_timeframe",
+                    "historical_level_type", "historical_level_touch_count",
+                    "historical_level_distance_bps",
+                )) else "Нет данных (эти поля не сохраняются в VirtualTrade)"
+            ),
+            (
+                f"Combined выбрал: {_strategy_name(str(trade.get('level_policy_strategy_id')))}"
+                if trade.get("strategy_id") == "combined" else
+                f"Политика уровней: {_strategy_name(str(trade.get('level_policy_strategy_id')))}"
+                if trade.get("level_policy_strategy_id") else "Политика уровней: нет данных"
+            ),
             f"Диагностика: reference={trade.get('entry_previous_price') if trade.get('entry_previous_price') is not None else 'нет данных'}; wall_id={escape(str(trade.get('wall_id') or 'нет данных'))}",
         ])
         rows = [[InlineKeyboardButton(text="Отменить план", callback_data=f"deal:confirm_cancel:{_deal_token(trade)}")], [InlineKeyboardButton(text="К PENDING", callback_data="deals:pending:0")]]
@@ -1949,6 +2279,7 @@ def stable_walls_text(
 
 def stable_walls_keyboard(
     runtime: RuntimeController, symbol: str, section: str, page: int,
+    pair_page: int = 0,
 ) -> InlineKeyboardMarkup:
     data, _health = _wall_snapshot(runtime, symbol)
     stable, candidates = _wall_counts(data)
@@ -1959,30 +2290,56 @@ def stable_walls_keyboard(
     )
     page_count = max(1, (total + WALLS_PAGE_SIZE - 1) // WALLS_PAGE_SIZE)
     page = min(max(0, page), page_count - 1)
-    pair_row = [InlineKeyboardButton(
-        text=("✓ " if pair == symbol else "") + pair,
-        callback_data=f"walls:{pair}:{section}:0",
-    ) for pair in runtime.engine.pair_settings]
-    rows = [pair_row] if pair_row else []
+    symbols = sorted(runtime.engine.pair_settings)
+    pair_page_count = max(1, (len(symbols) + _PAIR_SETTINGS_PAGE_SIZE - 1) // _PAIR_SETTINGS_PAGE_SIZE)
+    pair_page = max(0, min(int(pair_page), pair_page_count - 1))
+    legacy_pair_callbacks = pair_page_count == 1
+    pair_markup = kb.paginated_pair_keyboard(
+        symbols, pair_page,
+        lambda pair: (
+            f"walls:{pair}:{section}:0" if legacy_pair_callbacks
+            else f"walls:{pair}:{section}:0:{pair_page}"
+        ),
+        lambda target: (
+            f"walls:{symbol}:{section}:{target}" if legacy_pair_callbacks
+            else f"wallspairs:{symbol}:{section}:{page}:{target}"
+        ),
+        "dashboard",
+        page_size=_PAIR_SETTINGS_PAGE_SIZE, columns=2,
+        labels={pair: ("✓ " if pair == symbol else "") + pair for pair in symbols},
+        back_label="На главную",
+    )
+    pair_rows = [list(row) for row in pair_markup.inline_keyboard[:-2]]
+    pair_nav_rows = [list(row) for row in pair_markup.inline_keyboard[-2:]]
+    rows = pair_rows
+    def wall_callback(target_section: str, target_page: int) -> str:
+        suffix = "" if legacy_pair_callbacks else f":{pair_page}"
+        return f"walls:{symbol}:{target_section}:{target_page}{suffix}"
+
     rows.append([
-        InlineKeyboardButton(text=f"STABLE · {len(stable)}", callback_data=f"walls:{symbol}:stable:0"),
-        InlineKeyboardButton(text=f"CANDIDATE · {len(candidates)}", callback_data=f"walls:{symbol}:candidate:0"),
+        InlineKeyboardButton(text=f"STABLE · {len(stable)}", callback_data=wall_callback("stable", 0)),
+        InlineKeyboardButton(text=f"CANDIDATE · {len(candidates)}", callback_data=wall_callback("candidate", 0)),
     ])
-    rows.append([InlineKeyboardButton(text="Диагностика", callback_data=f"walls:{symbol}:diagnostics:0")])
+    rows.append([InlineKeyboardButton(text="Диагностика", callback_data=wall_callback("diagnostics", 0))])
     rows.append([
-        InlineKeyboardButton(text="Назад", callback_data=f"walls:{symbol}:{section}:{max(0, page - 1)}"),
-        InlineKeyboardButton(text="Вперёд", callback_data=f"walls:{symbol}:{section}:{min(page_count - 1, page + 1)}"),
+        InlineKeyboardButton(text="Назад", callback_data=wall_callback(section, max(0, page - 1))),
+        InlineKeyboardButton(text="Вперёд", callback_data=wall_callback(section, min(page_count - 1, page + 1))),
     ])
-    rows.append([
-        InlineKeyboardButton(text="Обновить", callback_data=f"walls:{symbol}:{section}:{page}"),
-        InlineKeyboardButton(text="На главную", callback_data="dashboard"),
-    ])
+    rows.append([InlineKeyboardButton(
+        text="Обновить",
+        callback_data=(
+            f"walls:{symbol}:{section}:{page}" if legacy_pair_callbacks
+            else f"walls:{symbol}:{section}:{page}:{pair_page}"
+        ),
+    )])
+    rows.extend(pair_nav_rows)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_stable_walls(callback: CallbackQuery, runtime: RuntimeController,
                                symbol: str, section: str, page: int,
-                               answer: str | None = None) -> None:
+                               answer: str | None = None,
+                               pair_page: int = 0) -> None:
     if not runtime.engine.pair_settings:
         if callback.message is not None:
             await edit_message_if_changed(callback.message, "<b>Стабильные стены</b>\nТорговые пары не настроены.", kb.main)
@@ -1993,7 +2350,7 @@ async def _render_stable_walls(callback: CallbackQuery, runtime: RuntimeControll
         symbol = "BTCUSDT" if "BTCUSDT" in runtime.engine.pair_settings else next(iter(runtime.engine.pair_settings))
     page = max(0, int(page))
     text = stable_walls_text(runtime, symbol, section, page)
-    markup = stable_walls_keyboard(runtime, symbol, section, page)
+    markup = stable_walls_keyboard(runtime, symbol, section, page, pair_page)
     if callback.message is not None:
         await edit_message_if_changed(callback.message, text, markup)
     await callback.answer(answer or "")
@@ -2012,8 +2369,12 @@ async def show_stable_walls(callback: CallbackQuery, runtime: RuntimeController)
 @admin.callback_query(Admin(), F.data.startswith("walls:"))
 async def navigate_stable_walls(callback: CallbackQuery, runtime: RuntimeController) -> None:
     try:
-        _prefix, symbol, section, raw_page = callback.data.split(":", 3)
+        parts = callback.data.split(":")
+        if len(parts) not in {4, 5}:
+            raise ValueError("wrong callback arity")
+        _prefix, symbol, section, raw_page = parts[:4]
         page = int(raw_page)
+        pair_page = int(parts[4]) if len(parts) == 5 else 0
     except (AttributeError, ValueError):
         await callback.answer("Некорректная навигация", show_alert=True)
         return
@@ -2024,4 +2385,20 @@ async def navigate_stable_walls(callback: CallbackQuery, runtime: RuntimeControl
     if page < 0:
         page = 0
         answer = "Это первая страница"
-    await _render_stable_walls(callback, runtime, symbol, section, page, answer)
+    await _render_stable_walls(callback, runtime, symbol, section, page, answer, pair_page)
+
+
+@admin.callback_query(Admin(), F.data.startswith("wallspairs:"))
+async def navigate_stable_wall_pairs(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    try:
+        _, symbol, section, raw_page, raw_pair_page = (callback.data or "").split(":", 4)
+        page, pair_page = int(raw_page), int(raw_pair_page)
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная страница списка пар", show_alert=True)
+        return
+    if section not in {"stable", "candidate", "diagnostics"}:
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    await _render_stable_walls(
+        callback, runtime, symbol, section, page, pair_page=pair_page,
+    )
