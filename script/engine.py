@@ -99,6 +99,8 @@ class TradingEngine:
         self.historical_levels: dict[str, tuple[dict, ...]] = {}
         self.historical_levels_updated_at: dict[str, datetime | None] = {}
         self.historical_level_errors: dict[str, str | None] = {}
+        self.historical_level_candles_analyzed: dict[str, int | None] = {}
+        self.historical_level_applied_settings: dict[str, dict | None] = {}
         self.diagnostic_only = diagnostic_only
         self.diagnostic_symbols = {
             symbol.upper() for symbol in (diagnostic_symbols or set())
@@ -230,15 +232,25 @@ class TradingEngine:
 
     def set_historical_levels(
         self, symbol: str, levels: tuple[dict, ...], error: str | None = None,
+        *, candles_analyzed: int | None = None,
+        applied_settings: dict | None = None,
     ) -> None:
         symbol = symbol.upper()
         self.historical_levels[symbol] = tuple(dict(level) for level in levels)
         self.historical_levels_updated_at[symbol] = self._utc_now() if error is None else None
         self.historical_level_errors[symbol] = error
+        self.historical_level_candles_analyzed[symbol] = (
+            int(candles_analyzed) if error is None and candles_analyzed is not None else None
+        )
+        self.historical_level_applied_settings[symbol] = (
+            dict(applied_settings) if error is None and applied_settings is not None else None
+        )
         diagnostics = self.wall_diagnostics.setdefault(symbol, {})
         diagnostics["historical_levels"] = [dict(level) for level in levels]
         diagnostics["historical_level_updated_at"] = self.historical_levels_updated_at[symbol]
         diagnostics["historical_level_error"] = error
+        diagnostics["historical_level_candles_analyzed"] = self.historical_level_candles_analyzed[symbol]
+        diagnostics["historical_level_applied_settings"] = self.historical_level_applied_settings[symbol]
 
     @staticmethod
     def _utc_now() -> datetime:

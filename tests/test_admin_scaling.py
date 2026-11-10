@@ -5,6 +5,10 @@ from unittest.mock import AsyncMock
 from app import keyboard as kb
 from app.admin import (
     SettingsInput,
+    _trendln_level_rows,
+    _trendln_role,
+    _trendln_snapshot_state,
+    _trendln_wall_matches,
     _pair_settings_overview_text,
     dashboard_text,
     navigate_pair_settings_section,
@@ -14,6 +18,8 @@ from app.admin import (
     pair_settings_list_text,
     select_settings_pair,
     stable_walls_keyboard,
+    trendln_levels_keyboard,
+    trendln_levels_text,
     update_pair_settings,
 )
 from app.runtime import RuntimeController
@@ -151,6 +157,10 @@ class SettingsPairScalingTests(unittest.TestCase):
         false = pair_settings_card_text(runtime, "ETHUSDT", "false_breakout")
         self.assertIn("historical_level_timeframe</code>: 15m", levels)
         self.assertIn("historical_level_candle_count</code>: 333", levels)
+        self.assertIn("historical_level_pctbound</code>: 0.05", levels)
+        self.assertIn("historical_level_min_touches</code>: 1", levels)
+        self.assertIn("historical_level_extmethod</code>: METHOD_NUMDIFF", levels)
+        self.assertIn("historical_level_accuracy</code>: 2", levels)
         self.assertIn("max_wall_level_distance_bps</code>: 13", levels)
         self.assertIn("bounce_take_profit_bps</code>: 7", strategies)
         self.assertIn("breakout_stop_loss_bps</code>: 10", strategies)
@@ -178,6 +188,176 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertEqual(state.data["pair_section"], "levels")
         self.assertIn("Настройка historical_level_timeframe сохранена", message.answer.await_args.args[0])
         self.assertIn("PAIR037USDT", message.answer.await_args.args[0])
+
+    def test_trendln_parameters_can_be_changed_through_existing_pair_command(self):
+        runtime = RuntimeController(TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")}))
+        for parameter, value in (
+            ("historical_level_pctbound", "0.005"),
+            ("historical_level_min_touches", "3"),
+            ("historical_level_extmethod", "method_naive"),
+            ("historical_level_accuracy", "4"),
+        ):
+            state = FakeState()
+            state.data = {"pair_symbol": "ETHUSDT", "pair_section": "levels"}
+            state.state = SettingsInput.waiting_for_pair
+            message = SimpleNamespace(
+                text=f"ETHUSDT {parameter} {value}", answer=AsyncMock(),
+            )
+            run(update_pair_settings(message, state, runtime))
+            self.assertEqual(state.data["pair_symbol"], "ETHUSDT")
+            self.assertEqual(state.data["pair_section"], "levels")
+            self.assertIn("сохранена", message.answer.await_args.args[0])
+        settings = runtime.engine.pair_settings["ETHUSDT"]
+        self.assertEqual(settings.historical_level_pctbound, 0.005)
+        self.assertEqual(settings.historical_level_min_touches, 3)
+        self.assertEqual(settings.historical_level_extmethod, "METHOD_NAIVE")
+        self.assertEqual(settings.historical_level_accuracy, 4)
+
+    def test_trendln_current_role_does_not_replace_historical_type(self):
+        self.assertEqual(_trendln_role(101.0, 100.0, 0.01), ("RESISTANCE", "выше цены", 100.0))
+        self.assertEqual(_trendln_role(99.0, 100.0, 0.01), ("SUPPORT", "ниже цены", -100.0))
+        self.assertEqual(_trendln_role(100.005, 100.0, 0.01), ("AT_LEVEL", "AT_LEVEL", 0.0))
+
+    def test_trendln_view_reports_applied_snapshot_and_nearest_sides(self):
+        settings = PairSettings("ETHUSDT", historical_level_pctbound=0.01)
+        engine = TradingEngine({"ETHUSDT": settings})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        engine.set_historical_levels(
+            "ETHUSDT",
+            (
+                {"price": 101.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 3},
+                {"price": 99.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 2},
+                {"price": 100.005, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1},
+            ),
+            candles_analyzed=480,
+            applied_settings={
+                "historical_level_timeframe": "5m",
+                "historical_level_candle_count": 500,
+                "historical_level_refresh_seconds": 300,
+                "historical_level_pctbound": 0.05,
+                "historical_level_min_touches": 1,
+                "historical_level_extmethod": "METHOD_NUMDIFF",
+                "historical_level_accuracy": 2,
+            },
+        )
+        engine.get_market_data_health = lambda _symbol: {
+            "price_fresh": True, "price_age_seconds": 0.1,
+        }
+        runtime = RuntimeController(engine)
+        rows = _trendln_level_rows(_trendln_snapshot_state(runtime, "ETHUSDT"))
+        self.assertEqual(rows[0][0]["type"], "SUPPORT")
+        self.assertEqual(rows[0][0]["current_role"], "RESISTANCE")
+        self.assertEqual(rows[1][0]["type"], "RESISTANCE")
+        self.assertEqual(rows[1][0]["current_role"], "SUPPORT")
+        self.assertEqual(rows[2][0]["current_role"], "AT_LEVEL")
+        text = trendln_levels_text(runtime, "ETHUSDT")
+        self.assertIn("В расчёте: pctbound 0.05 (500 bps)", text)
+        self.assertIn("сейчас настроено: 0.01", text)
+        self.assertIn("проанализировано 480 / запрошено 500", text)
+        self.assertIn("исторически SUPPORT · сейчас RESISTANCE", text)
+        self.assertIn("исторически RESISTANCE · сейчас SUPPORT", text)
+        self.assertIn("Pivots 3", text)
+        self.assertLessEqual(len(text), 4096)
+
+    def test_trendln_view_does_not_claim_current_position_without_fresh_price(self):
+        settings = PairSettings("ETHUSDT")
+        engine = TradingEngine({"ETHUSDT": settings})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.set_historical_levels("ETHUSDT", ({
+            "price": 101.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2,
+        },), candles_analyzed=20, applied_settings={})
+        engine.get_market_data_health = lambda _symbol: {
+            "price_fresh": False, "price_age_seconds": 25.0,
+        }
+        runtime = RuntimeController(engine)
+        text = trendln_levels_text(runtime, "ETHUSDT")
+        self.assertIn("нет актуальной цены", text)
+        self.assertIn("Положение уровней относительно Last Price не вычисляется", text)
+        self.assertNotIn("текущая роль RESISTANCE", text)
+        self.assertLessEqual(len(text), 4096)
+
+    def test_trendln_level_and_wall_pages_are_bounded_and_navigable(self):
+        settings = PairSettings("ETHUSDT", max_wall_level_distance_bps=20)
+        engine = TradingEngine({"ETHUSDT": settings})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        levels = tuple({
+            "price": 100.0 + index / 100,
+            "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1,
+        } for index in range(1, 31))
+        engine.set_historical_levels("ETHUSDT", levels, candles_analyzed=500, applied_settings={
+            "historical_level_timeframe": "5m", "historical_level_candle_count": 500,
+            "historical_level_refresh_seconds": 300, "historical_level_pctbound": .05,
+            "historical_level_min_touches": 1, "historical_level_extmethod": "METHOD_NUMDIFF",
+            "historical_level_accuracy": 2,
+        })
+        engine.historical_levels["ETHUSDT"] += ({
+            "price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2,
+        },)
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        runtime = RuntimeController(engine)
+        page0 = trendln_levels_text(runtime, "ETHUSDT", page=0)
+        page1 = trendln_levels_text(runtime, "ETHUSDT", page=1)
+        self.assertLessEqual(len(page0), 4096)
+        self.assertLessEqual(len(page1), 4096)
+        self.assertIn("стр. 1/6", page0)
+        self.assertIn("стр. 2/6", page1)
+        keyboard = trendln_levels_keyboard(runtime, "ETHUSDT", "levels", 0)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("trendln_view:ETHUSDT:levels:1", callbacks)
+        self.assertIn("settings_pair_section:ETHUSDT:l", callbacks)
+
+        from unittest.mock import patch
+        stable_walls = [{
+            "side": "buy", "price": 100.0 + index / 100,
+            "wall_ratio": 900, "status": "STABLE",
+        } for index in range(20)]
+        with patch("app.admin._wall_snapshot", return_value=({"bid": stable_walls, "ask": []}, {})):
+            wall_page0 = trendln_levels_text(runtime, "ETHUSDT", section="walls", page=0)
+            wall_page3 = trendln_levels_text(runtime, "ETHUSDT", section="walls", page=3)
+            wall_keyboard = trendln_levels_keyboard(runtime, "ETHUSDT", "walls", 0)
+        self.assertLessEqual(len(wall_page0), 4096)
+        self.assertLessEqual(len(wall_page3), 4096)
+        self.assertIn("стр. 1/4", wall_page0)
+        self.assertIn("стр. 4/4", wall_page3)
+        wall_callbacks = [button.callback_data for row in wall_keyboard.inline_keyboard for button in row]
+        self.assertIn("trendln_view:ETHUSDT:walls:1", wall_callbacks)
+
+    def test_trendln_wall_pairing_uses_historical_type_and_existing_distance_threshold(self):
+        from unittest.mock import patch
+
+        settings = PairSettings("ETHUSDT", max_wall_level_distance_bps=13)
+        engine = TradingEngine({"ETHUSDT": settings})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        engine.set_historical_levels("ETHUSDT", (
+            {"price": 100.1, "type": "SUPPORT", "timeframe": "5m", "touch_count": 3},
+            {"price": 100.1, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 4},
+        ), candles_analyzed=500, applied_settings={})
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        runtime = RuntimeController(engine)
+        snapshot = _trendln_snapshot_state(runtime, "ETHUSDT")
+        wall = {"side": "buy", "price": 100.0, "wall_ratio": 900, "status": "STABLE"}
+        with patch("app.admin._wall_snapshot", return_value=({"bid": [wall], "ask": []}, {})):
+            matches = _trendln_wall_matches(runtime, "ETHUSDT", snapshot)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["historical_type"], "SUPPORT")
+        self.assertEqual(matches[0]["current_role"], "RESISTANCE")
+        self.assertEqual(matches[0]["touch_count"], 3)
+        self.assertAlmostEqual(matches[0]["distance_bps"], 9.99000999)
+        self.assertTrue(matches[0]["passes"])
+
+    def test_trendln_view_explicitly_reports_missing_side(self):
+        engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        engine.set_historical_levels("ETHUSDT", ({
+            "price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 2,
+        },), candles_analyzed=100, applied_settings={})
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        text = trendln_levels_text(RuntimeController(engine), "ETHUSDT")
+        self.assertIn("Нет уровней снизу.", text)
 
 
 class PairKeyboardScalingTests(unittest.TestCase):

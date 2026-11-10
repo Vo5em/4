@@ -12,7 +12,7 @@ import aiohttp
 import websockets
 
 from .engine import EngineMode, MARKET_PRICE_SOURCE, TradingEngine
-from .historical_levels import fetch_historical_levels
+from .historical_levels import fetch_historical_level_snapshot
 from .orderbook import LocalOrderBook
 from .scanner import diagnose_wall_levels, find_nearby_levels, find_walls
 from .settings import PairSettings
@@ -1017,7 +1017,7 @@ async def _historical_level_worker(symbol: str, engine: TradingEngine) -> None:
         if settings is None:
             return
         try:
-            levels = await fetch_historical_levels(symbol, settings)
+            snapshot = await fetch_historical_level_snapshot(symbol, settings)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -1026,11 +1026,17 @@ async def _historical_level_worker(symbol: str, engine: TradingEngine) -> None:
                 "%s historical level refresh failed (%s)", symbol, type(error).__name__
             )
         else:
-            engine.set_historical_levels(symbol, levels)
+            levels = snapshot["levels"]
+            engine.set_historical_levels(
+                symbol,
+                levels,
+                candles_analyzed=snapshot["candles_analyzed"],
+                applied_settings=snapshot["settings"],
+            )
             logger.info(
                 "%s historical levels refreshed timeframe=%s candles=%d levels=%d",
-                symbol, settings.historical_level_timeframe,
-                settings.historical_level_candle_count, len(levels),
+                symbol, snapshot["settings"]["historical_level_timeframe"],
+                snapshot["candles_analyzed"], len(levels),
             )
         await asyncio.sleep(max(1.0, float(settings.historical_level_refresh_seconds)))
 

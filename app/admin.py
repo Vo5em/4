@@ -1,7 +1,7 @@
 import os
 import hashlib
 from math import isfinite
-from datetime import timezone
+from datetime import datetime, timezone
 from html import escape
 from dataclasses import replace
 import logging
@@ -418,13 +418,268 @@ def pair_settings_text(runtime: RuntimeController) -> str:
 
 
 _PAIR_SETTINGS_PAGE_SIZE = 10
+_TRENDLN_DISPLAY_PAGE_SIZE = 5
 _PAIR_SETTINGS_SECTIONS = ("main", "levels", "strategies", "false_breakout")
 _PAIR_SECTION_LABELS = {
-    "main": "Основные", "levels": "Исторические уровни",
+    "main": "Основные", "levels": "Тех. анализ · Trendln",
     "strategies": "Стратегии · TP/SL", "false_breakout": "False Breakout",
 }
 _PAIR_SECTION_KEYS = {"main": "m", "levels": "l", "strategies": "s", "false_breakout": "f"}
 _PAIR_SECTION_BY_KEY = {value: key for key, value in _PAIR_SECTION_KEYS.items()}
+
+
+def _trendln_role(level_price: float, last_price: float, tick_size: float | None) -> tuple[str, str, float]:
+    delta = level_price - last_price
+    distance_bps = abs(delta) / last_price * 10000
+    tolerance = tick_size if tick_size is not None and tick_size > 0 else 0.0
+    if abs(delta) <= tolerance:
+        return "AT_LEVEL", "AT_LEVEL", 0.0
+    if delta > 0:
+        return "RESISTANCE", "выше цены", distance_bps
+    return "SUPPORT", "ниже цены", -distance_bps
+
+
+def _trendln_snapshot_state(runtime: RuntimeController, symbol: str) -> dict:
+    engine = runtime.engine
+    settings = engine.pair_settings[symbol]
+    updated_at = engine.historical_levels_updated_at.get(symbol)
+    error = engine.historical_level_errors.get(symbol)
+    applied_settings = engine.historical_level_applied_settings.get(symbol)
+    age_seconds = None
+    if updated_at is not None:
+        normalized = updated_at if updated_at.tzinfo else updated_at.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - normalized).total_seconds())
+    snapshot_refresh_seconds = (
+        applied_settings.get("historical_level_refresh_seconds")
+        if applied_settings else settings.historical_level_refresh_seconds
+    )
+    stale = age_seconds is not None and age_seconds > snapshot_refresh_seconds
+    market_health = engine.get_market_data_health(symbol)
+    price = engine.trade_manager.last_prices.get(symbol)
+    price_fresh = bool(market_health.get("price_fresh")) and price is not None and price > 0
+    return {
+        "updated_at": updated_at,
+        "age_seconds": age_seconds,
+        "error": error,
+        "stale": stale,
+        "levels": engine.historical_levels.get(symbol, ()),
+        "candles_analyzed": engine.historical_level_candles_analyzed.get(symbol),
+        "applied_settings": applied_settings,
+        "current_settings": settings,
+        "last_price": price,
+        "price_fresh": price_fresh,
+        "price_age_seconds": market_health.get("price_age_seconds"),
+        "tick_size": engine.instrument_tick_sizes.get(symbol),
+    }
+
+
+def _trendln_actual_settings_text(snapshot: dict) -> str:
+    actual = snapshot.get("applied_settings")
+    if not actual:
+        return "В расчёте: нет успешного снимка"
+    labels = (
+        ("historical_level_pctbound", "pctbound"),
+        ("historical_level_min_touches", "min_touches"),
+        ("historical_level_extmethod", "extmethod"),
+        ("historical_level_accuracy", "accuracy"),
+    )
+    configured = snapshot["current_settings"]
+    fields = []
+    for key, label in labels:
+        value = actual.get(key, "нет данных")
+        if key == "historical_level_pctbound" and isinstance(value, (int, float)):
+            rendered = f"{value:g} ({value * 10000:g} bps)"
+        else:
+            rendered = str(value)
+        current = getattr(configured, key)
+        suffix = " · сейчас настроено: " + str(current) if current != value else ""
+        fields.append(f"{label} {rendered}{suffix}")
+    return "В расчёте: " + "; ".join(fields)
+
+
+def _trendln_level_rows(snapshot: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    if not snapshot["price_fresh"]:
+        return [], [], []
+    price = float(snapshot["last_price"])
+    tick_size = snapshot["tick_size"]
+    above, below, at_level = [], [], []
+    for level in snapshot["levels"]:
+        level_price = float(level["price"])
+        role, position, signed_bps = _trendln_role(level_price, price, tick_size)
+        row = {
+            **level,
+            "current_role": role,
+            "position": position,
+            "signed_distance_bps": signed_bps,
+        }
+        target = {
+            "выше цены": above,
+            "ниже цены": below,
+            "AT_LEVEL": at_level,
+        }[position]
+        target.append(row)
+    above.sort(key=lambda level: abs(level["signed_distance_bps"]))
+    below.sort(key=lambda level: abs(level["signed_distance_bps"]))
+    return above, below, at_level
+
+
+def _trendln_wall_matches(runtime: RuntimeController, symbol: str, snapshot: dict) -> list[dict]:
+    data, _health = _wall_snapshot(runtime, symbol)
+    stable, _candidates = _wall_counts(data)
+    levels = snapshot["levels"]
+    maximum_bps = runtime.engine.pair_settings[symbol].max_wall_level_distance_bps
+    last_price = float(snapshot["last_price"]) if snapshot["price_fresh"] else None
+    matches = []
+    for wall in stable:
+        side = wall.get("side")
+        expected_type = "SUPPORT" if side == "buy" else "RESISTANCE"
+        wall_price = float(wall.get("price") or 0)
+        if wall_price <= 0:
+            continue
+        for level in levels:
+            if str(level.get("type", "")).upper() != expected_type:
+                continue
+            level_price = float(level.get("price") or 0)
+            if level_price <= 0:
+                continue
+            distance_bps = abs(wall_price - level_price) / level_price * 10000
+            current_role = "нет данных"
+            if last_price is not None:
+                current_role, _position, _signed = _trendln_role(
+                    level_price, last_price, snapshot["tick_size"]
+                )
+            matches.append({
+                "side": "BID" if side == "buy" else "ASK",
+                "wall_price": wall_price,
+                "wall_ratio": wall.get("wall_ratio"),
+                "level_price": level_price,
+                "historical_type": str(level.get("type", "нет данных")).upper(),
+                "current_role": current_role,
+                "touch_count": level.get("touch_count", "нет данных"),
+                "distance_bps": distance_bps,
+                "maximum_bps": maximum_bps,
+                "passes": distance_bps <= maximum_bps,
+            })
+    matches.sort(key=lambda item: (item["side"], item["wall_price"], item["distance_bps"]))
+    return matches
+
+
+def trendln_levels_text(
+    runtime: RuntimeController, symbol: str, section: str = "levels", page: int = 0,
+) -> str:
+    symbol = symbol.strip().upper()
+    if symbol not in runtime.engine.pair_settings:
+        return "Пара больше не настроена. Откройте список пар заново."
+    if section not in {"levels", "walls"}:
+        section = "levels"
+    snapshot = _trendln_snapshot_state(runtime, symbol)
+    levels = snapshot["levels"]
+    status = "ошибка: " + str(snapshot["error"]) if snapshot["error"] else (
+        "нет успешного расчёта" if snapshot["updated_at"] is None else
+        "УСТАРЕЛ" if snapshot["stale"] else "актуален"
+    )
+    if snapshot["updated_at"] is not None:
+        status += f" · { _date_label(snapshot['updated_at']) }"
+        if snapshot["age_seconds"] is not None:
+            status += f" · {snapshot['age_seconds']:.0f} с назад"
+    price_text = (
+        f"{float(snapshot['last_price']):g}"
+        if snapshot["price_fresh"] else
+        f"нет актуальной цены (последняя известная {snapshot['last_price']:g}, "
+        f"возраст {snapshot['price_age_seconds']:.2f} с)"
+        if snapshot["last_price"] is not None and snapshot["price_age_seconds"] is not None else
+        "нет актуальной цены"
+    )
+    current = snapshot["current_settings"]
+    actual = snapshot.get("applied_settings") or {}
+    applied_timeframe = actual.get("historical_level_timeframe", "нет данных")
+    applied_requested = actual.get("historical_level_candle_count", "нет данных")
+    actual_candles = snapshot.get("candles_analyzed")
+    header = (
+        f"<b>{escape(symbol)} · Trendln</b> · {escape(section)} · стр. {page + 1}\n"
+        f"Last Price: {price_text}\n"
+        f"Данные уровней: {escape(status)}\n"
+        f"Таймфрейм расчёта: {escape(str(applied_timeframe))} · сейчас {escape(current.historical_level_timeframe)}\n"
+        f"Свечи: проанализировано {actual_candles if actual_candles is not None else 'нет данных'} / "
+        f"запрошено {applied_requested}; период обновления по снимку "
+        f"{actual.get('historical_level_refresh_seconds', 'нет данных')} с; сейчас "
+        f"{current.historical_level_refresh_seconds:g} с\n"
+        f"{escape(_trendln_actual_settings_text(snapshot))}\n"
+        f"Настройки отдельно для новой конфигурации указаны в карточке пары.\n"
+    )
+    if snapshot["stale"]:
+        header += "Сохранённые уровни ниже устарели; показаны как снимок, не как актуальная структура.\n"
+    if not snapshot["price_fresh"]:
+        header += "Положение уровней относительно Last Price не вычисляется без свежей цены.\n"
+    if not levels:
+        body = "Нет сохранённых исторических уровней."
+    elif section == "levels":
+        above, below, at_level = _trendln_level_rows(snapshot)
+        if not snapshot["price_fresh"]:
+            body = "Нет уровней, классифицированных по текущей цене. Обновите рыночные данные."
+            page_count = 1
+            page = 0
+        else:
+            page_count = max(
+                1,
+                (max(len(above), len(below), len(at_level)) + _TRENDLN_DISPLAY_PAGE_SIZE - 1)
+                // _TRENDLN_DISPLAY_PAGE_SIZE,
+            )
+            page = min(max(0, int(page)), page_count - 1)
+            first = page * _TRENDLN_DISPLAY_PAGE_SIZE
+            upper = above[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
+            lower = below[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
+            at_price = at_level[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
+            tick_label = (
+                f"tickSize {snapshot['tick_size']:g}"
+                if snapshot["tick_size"] else "tickSize нет данных; AT_LEVEL только при точном совпадении"
+            )
+            upper_text = "\n".join(
+                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+                f"сейчас {row['current_role']} · Pivots {row['touch_count']} · "
+                f"+{row['signed_distance_bps']:.2f} bps"
+                for row in upper
+            ) or "Нет уровней сверху."
+            lower_text = "\n".join(
+                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+                f"сейчас {row['current_role']} · Pivots {row['touch_count']} · "
+                f"{row['signed_distance_bps']:.2f} bps"
+                for row in lower
+            ) or "Нет уровней снизу."
+            at_text = "\n".join(
+                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+                f"сейчас AT_LEVEL · Pivots {row['touch_count']}"
+                for row in at_price
+            ) or "Нет уровней в пределах tickSize."
+            body = (
+                f"БЛИЖАЙШИЕ СВЕРХУ · стр. {page + 1}/{page_count}:\n{upper_text}\n\n"
+                f"НА УРОВНЕ ЦЕНЫ:\n{at_text}\n\n"
+                f"БЛИЖАЙШИЕ СНИЗУ · стр. {page + 1}/{page_count}:\n{lower_text}\n\n"
+                f"Допуск AT_LEVEL: {tick_label}"
+            )
+    else:
+        matches = _trendln_wall_matches(runtime, symbol, snapshot)
+        page_count = max(1, (len(matches) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
+        page = min(max(0, int(page)), page_count - 1)
+        selected = matches[page * _TRENDLN_DISPLAY_PAGE_SIZE:(page + 1) * _TRENDLN_DISPLAY_PAGE_SIZE]
+        if not selected:
+            body = "Нет STABLE-стен с уровнем исторического типа, совместимого со стороной стены."
+        else:
+            rows = []
+            for item in selected:
+                ratio = f"{float(item['wall_ratio']):.2f}x" if item["wall_ratio"] is not None else "нет данных"
+                passed = "ПРОХОДИТ" if item["passes"] else "НЕ ПРОХОДИТ"
+                rows.append(
+                    f"{item['side']} стена {item['wall_price']:g} · ratio {ratio}\n"
+                    f"уровень {item['level_price']:g} · исторически {item['historical_type']} · "
+                    f"текущая роль {item['current_role']} · Pivots {item['touch_count']}\n"
+                    f"дистанция стена↔уровень {item['distance_bps']:.2f}/{item['maximum_bps']:g} bps · {passed}"
+                )
+            body = f"STABLE-сопоставления · стр. {page + 1}/{page_count}\n\n" + "\n\n".join(rows)
+    text = header + "\n" + body
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        raise AssertionError(f"Trendln page exceeds Telegram limit: {len(text)}")
+    return text
 
 
 def _pair_settings_overview_text(runtime: RuntimeController) -> str:
@@ -527,6 +782,10 @@ def pair_settings_card_text(runtime: RuntimeController, symbol: str, section: st
             ("historical_level_timeframe", settings.historical_level_timeframe),
             ("historical_level_candle_count", settings.historical_level_candle_count),
             ("historical_level_refresh_seconds", settings.historical_level_refresh_seconds),
+            ("historical_level_pctbound", settings.historical_level_pctbound),
+            ("historical_level_min_touches", settings.historical_level_min_touches),
+            ("historical_level_extmethod", settings.historical_level_extmethod),
+            ("historical_level_accuracy", settings.historical_level_accuracy),
             ("max_wall_level_distance_bps", settings.max_wall_level_distance_bps),
         ),
         "strategies": (
@@ -557,16 +816,14 @@ def pair_settings_card_text(runtime: RuntimeController, symbol: str, section: st
             f"{settings.taker_fee_rate * 100:.4f}%"
         )
     if section == "levels":
-        levels = runtime.engine.historical_levels.get(symbol, ())
-        if not levels:
-            lines.append("Текущие уровни: нет данных")
-        else:
-            level_lines = "; ".join(
-                f"{item.get('type', 'нет данных')} {float(item.get('price', 0)):g}, "
-                f"{item.get('touch_count', 'нет данных')} кас."
-                for item in levels[:10]
-            )
-            lines.append(f"Текущие уровни: {escape(level_lines)}")
+        snapshot = _trendln_snapshot_state(runtime, symbol)
+        lines.append(
+            "Уровни по этому снимку: "
+            + ("УСТАРЕЛ" if snapshot["stale"] else
+               "нет успешного расчёта" if snapshot["updated_at"] is None else "снимок доступен")
+        )
+        lines.append(_trendln_actual_settings_text(snapshot))
+        lines.append("Полный список уровней и STABLE-сопоставления: кнопка «Уровни Trendln».")
     if section == "strategies":
         lines.append("Combined использует параметры выбранной политики Bounce или Breakout.")
         for strategy_id in ("bounce", "breakout"):
@@ -607,7 +864,70 @@ def pair_settings_card_keyboard(runtime: RuntimeController, symbol: str, section
         [InlineKeyboardButton(text="К списку пар", callback_data="settings_pair")],
         [InlineKeyboardButton(text="Настройки", callback_data="settings")],
     ))
+    if section == "levels":
+        rows.append([InlineKeyboardButton(
+            text="Уровни Trendln",
+            callback_data=f"trendln_view:{symbol}:levels:0",
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def trendln_levels_keyboard(
+    runtime: RuntimeController, symbol: str, section: str, page: int,
+) -> InlineKeyboardMarkup:
+    symbol = symbol.strip().upper()
+    snapshot = _trendln_snapshot_state(runtime, symbol)
+    if section == "walls":
+        total = len(_trendln_wall_matches(runtime, symbol, snapshot))
+    else:
+        above, below, at_level = _trendln_level_rows(snapshot)
+        total = max(len(above), len(below), len(at_level))
+    pages = max(1, (total + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=("✓ " if section == "levels" else "") + "Уровни",
+                callback_data=f"trendln_view:{symbol}:levels:0",
+            ),
+            InlineKeyboardButton(
+                text=("✓ " if section == "walls" else "") + "STABLE-сопоставления",
+                callback_data=f"trendln_view:{symbol}:walls:0",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="Назад", callback_data=f"trendln_view:{symbol}:{section}:{max(0, page - 1)}",
+            ),
+            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data=f"trendln_view:{symbol}:{section}:{page}"),
+            InlineKeyboardButton(
+                text="Вперёд", callback_data=f"trendln_view:{symbol}:{section}:{min(pages - 1, page + 1)}",
+            ),
+        ],
+        [InlineKeyboardButton(text="Карточка пары", callback_data=f"settings_pair_section:{symbol}:l")],
+        [InlineKeyboardButton(text="Обновить", callback_data=f"trendln_view:{symbol}:{section}:{page}")],
+    ])
+
+
+@admin.callback_query(Admin(), F.data.startswith("trendln_view:"))
+async def show_trendln_levels(callback: CallbackQuery, runtime: RuntimeController) -> None:
+    try:
+        _, symbol, section, raw_page = (callback.data or "").split(":", 3)
+        page = int(raw_page)
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная страница Trendln", show_alert=True)
+        return
+    symbol = symbol.strip().upper()
+    if symbol not in runtime.engine.pair_settings or section not in {"levels", "walls"} or page < 0:
+        await callback.answer("Пара или страница больше недоступны", show_alert=True)
+        return
+    if callback.message is not None:
+        await edit_message_if_changed(
+            callback.message,
+            trendln_levels_text(runtime, symbol, section, page),
+            trendln_levels_keyboard(runtime, symbol, section, page),
+        )
+    await callback.answer()
 
 
 def _level_value_label(override: float | None, default: float) -> str:
@@ -1306,6 +1626,8 @@ async def update_pair_settings(
         "consumed_ratio", "entry_distance_bps", "stop_distance_bps", "bounce_reversal_bps",
         "breakout_confirm_seconds", "breakout_buffer_bps", "breakout_max_update_gap_seconds",
         "historical_level_candle_count", "historical_level_refresh_seconds",
+        "historical_level_pctbound", "historical_level_min_touches",
+        "historical_level_accuracy",
         "max_wall_level_distance_bps", "bounce_take_profit_bps", "bounce_stop_loss_bps",
         "breakout_take_profit_bps", "breakout_stop_loss_bps",
         "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
@@ -1326,12 +1648,17 @@ async def update_pair_settings(
         value = raw_value.lower() in {"true", "1", "on"}
     elif parameter == "historical_level_timeframe":
         value = raw_value
+    elif parameter == "historical_level_extmethod":
+        value = raw_value.upper()
     elif parameter in numeric_fields and parameter in nullable_fields and raw_value.lower() == "none":
         value = None
     elif parameter in numeric_fields:
         try:
             value = (
-                int(raw_value) if parameter == "historical_level_candle_count"
+                int(raw_value) if parameter in {
+                    "historical_level_candle_count", "historical_level_min_touches",
+                    "historical_level_accuracy",
+                }
                 else float(raw_value)
             )
         except ValueError:
@@ -1358,6 +1685,10 @@ async def update_pair_settings(
         "historical_level_timeframe": "levels",
         "historical_level_candle_count": "levels",
         "historical_level_refresh_seconds": "levels",
+        "historical_level_pctbound": "levels",
+        "historical_level_min_touches": "levels",
+        "historical_level_extmethod": "levels",
+        "historical_level_accuracy": "levels",
         "max_wall_level_distance_bps": "levels",
         "bounce_take_profit_bps": "strategies", "bounce_stop_loss_bps": "strategies",
         "breakout_take_profit_bps": "strategies", "breakout_stop_loss_bps": "strategies",

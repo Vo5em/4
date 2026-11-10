@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from script.engine import TradingEngine
 from script.historical_levels import calculate_horizontal_levels
@@ -62,7 +62,64 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
             {"price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 3},
         ))
         fake.get_horizontal_levels.assert_called_once()
-        self.assertEqual(fake.get_horizontal_levels.call_args.kwargs["min_touches"], 1)
+        self.assertEqual(fake.get_horizontal_levels.call_args.kwargs, {
+            "pctbound": 0.05,
+            "min_touches": 1,
+            "extmethod": "METHOD_NUMDIFF",
+            "accuracy": 2,
+        })
+
+    def test_pair_trendln_parameters_are_validated_and_independent(self):
+        btc = PairSettings("BTCUSDT")
+        eth = PairSettings(
+            "ETHUSDT", historical_level_pctbound=0.005,
+            historical_level_min_touches=3,
+            historical_level_extmethod="METHOD_NAIVE",
+            historical_level_accuracy=4,
+        )
+        self.assertEqual(
+            (btc.historical_level_pctbound, btc.historical_level_min_touches,
+             btc.historical_level_extmethod, btc.historical_level_accuracy),
+            (0.05, 1, "METHOD_NUMDIFF", 2),
+        )
+        self.assertEqual(
+            (eth.historical_level_pctbound, eth.historical_level_min_touches,
+             eth.historical_level_extmethod, eth.historical_level_accuracy),
+            (0.005, 3, "METHOD_NAIVE", 4),
+        )
+        invalid = (
+            {"historical_level_pctbound": 0},
+            {"historical_level_min_touches": True},
+            {"historical_level_extmethod": "METHOD_NCUBED"},
+            {"historical_level_accuracy": 3},
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                PairSettings("BTCUSDT", **values)
+
+    def test_trendln_snapshot_records_exact_applied_settings_and_candle_count(self):
+        from script import historical_levels
+
+        settings = PairSettings(
+            "ETHUSDT", historical_level_pctbound=0.01,
+            historical_level_min_touches=2,
+            historical_level_extmethod="METHOD_NAIVECONSEC",
+            historical_level_accuracy=4,
+        )
+        candles = [{"low": 99.0, "high": 101.0}] * 17
+        levels = ({"price": 100.0, "type": "SUPPORT", "touch_count": 2},)
+        with (
+            patch.object(historical_levels, "fetch_closed_bybit_candles", new=AsyncMock(return_value=candles)),
+            patch.object(historical_levels.asyncio, "to_thread", new=AsyncMock(return_value=levels)) as to_thread,
+        ):
+            snapshot = run(historical_levels.fetch_historical_level_snapshot("ETHUSDT", settings))
+        self.assertEqual(snapshot["levels"], levels)
+        self.assertEqual(snapshot["candles_analyzed"], 17)
+        self.assertEqual(snapshot["settings"]["historical_level_pctbound"], 0.01)
+        self.assertEqual(snapshot["settings"]["historical_level_min_touches"], 2)
+        self.assertEqual(snapshot["settings"]["historical_level_extmethod"], "METHOD_NAIVECONSEC")
+        self.assertEqual(snapshot["settings"]["historical_level_accuracy"], 4)
+        self.assertEqual(to_thread.call_args.kwargs["accuracy"], 4)
 
     def test_wall_requires_matching_level_type_and_distance(self):
         strategy = BreakoutStrategy()

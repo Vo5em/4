@@ -93,6 +93,80 @@ class FakeSession:
 
 
 class DatabaseRepositoryTests(unittest.TestCase):
+    def test_trendln_columns_have_additive_defaults_and_idempotent_migration(self):
+        expected = {
+            "historical_level_pctbound": "NUMERIC",
+            "historical_level_min_touches": "INTEGER",
+            "historical_level_extmethod": "VARCHAR",
+            "historical_level_accuracy": "INTEGER",
+        }
+        for column_name, type_name in expected.items():
+            column = TradingPairSetting.__table__.c[column_name]
+            self.assertIn(type_name, str(column.type).upper())
+            self.assertTrue(column.nullable is False)
+            self.assertIsNotNone(column.server_default)
+
+        migration = (
+            Path(__file__).parents[1]
+            / "database" / "migrations"
+            / "20261110_add_trendln_pair_settings.sql"
+        ).read_text(encoding="utf-8").upper()
+        self.assertEqual(migration.count("ADD COLUMN IF NOT EXISTS"), 4)
+        self.assertIn("HISTORICAL_LEVEL_PCTBOUND NUMERIC(18, 10) NOT NULL DEFAULT 0.05", migration)
+        self.assertIn("HISTORICAL_LEVEL_MIN_TOUCHES INTEGER NOT NULL DEFAULT 1", migration)
+        self.assertIn("HISTORICAL_LEVEL_EXTMETHOD VARCHAR(32) NOT NULL DEFAULT 'METHOD_NUMDIFF'", migration)
+        self.assertIn("HISTORICAL_LEVEL_ACCURACY INTEGER NOT NULL DEFAULT 2", migration)
+        self.assertNotIn("DROP TABLE", migration)
+        self.assertNotIn("DELETE FROM", migration)
+
+    def test_pair_settings_repository_saves_trendln_parameters_without_touching_other_values(self):
+        row = repository._pair_row(PairSettings("BTCUSDT", min_wall_ratio=777))
+        session = FakeSession({TradingPairSetting: [row]})
+        settings = PairSettings(
+            "BTCUSDT", min_wall_ratio=777,
+            historical_level_pctbound=0.005,
+            historical_level_min_touches=3,
+            historical_level_extmethod="METHOD_NAIVE",
+            historical_level_accuracy=4,
+        )
+        with patch.object(repository, "async_session", return_value=session):
+            run_immediate(repository.save_pair_settings(settings))
+        self.assertEqual(row.historical_level_pctbound, 0.005)
+        self.assertEqual(row.historical_level_min_touches, 3)
+        self.assertEqual(row.historical_level_extmethod, "METHOD_NAIVE")
+        self.assertEqual(row.historical_level_accuracy, 4)
+        self.assertEqual(row.min_wall_ratio, 777)
+        self.assertEqual(session.commits, 1)
+
+    def test_pre_migration_pair_row_loads_trendln_defaults(self):
+        state_row = RuntimeState(
+            id=1, balance_usdt=1000, initial_balance_usdt=1000,
+            stake_usdt=10, max_open_trades=3, engine_mode="stopped", initialized=False,
+        )
+        pair_row = repository._pair_row(PairSettings("BTCUSDT"))
+        pair_row.historical_level_pctbound = None
+        pair_row.historical_level_min_touches = None
+        pair_row.historical_level_extmethod = None
+        pair_row.historical_level_accuracy = None
+        session = FakeSession({RuntimeState: [state_row], TradingPairSetting: [pair_row]})
+
+        async def create_tables():
+            return None
+
+        with (
+            patch.object(repository, "async_main", create_tables),
+            patch.object(repository, "read_legacy_symbol_rows", return_value=[]),
+            patch.object(repository, "async_session", return_value=session),
+        ):
+            restored = run_immediate(repository.initialize_database(
+                TradingSettings(), {"BTCUSDT": PairSettings("BTCUSDT")},
+            ))
+        settings = restored["pair_settings"]["BTCUSDT"]
+        self.assertEqual(settings.historical_level_pctbound, 0.05)
+        self.assertEqual(settings.historical_level_min_touches, 1)
+        self.assertEqual(settings.historical_level_extmethod, "METHOD_NUMDIFF")
+        self.assertEqual(settings.historical_level_accuracy, 2)
+
     def test_cancelled_cleanup_uses_one_hour_retention_and_minute_interval(self):
         if "CANCELLED_TRADE_RETENTION_MINUTES" not in os.environ:
             self.assertEqual(CANCELLED_TRADE_RETENTION_MINUTES, 60)

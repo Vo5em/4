@@ -60,6 +60,39 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                 ))
             self.assertEqual(column_type, "bigint")
 
+            async with repository.engine.begin() as connection:
+                await connection.execute(text(
+                    "ALTER TABLE trading_pairs "
+                    "DROP COLUMN historical_level_pctbound, "
+                    "DROP COLUMN historical_level_min_touches, "
+                    "DROP COLUMN historical_level_extmethod, "
+                    "DROP COLUMN historical_level_accuracy"
+                ))
+            await async_main()
+            async with repository.engine.connect() as connection:
+                trendln_columns = (await connection.execute(text(
+                    "SELECT column_name, data_type, column_default, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'trading_pairs' AND column_name IN "
+                    "('historical_level_pctbound', 'historical_level_min_touches', "
+                    "'historical_level_extmethod', 'historical_level_accuracy')"
+                ))).all()
+            trendln_schema = {name: (data_type, default, nullable)
+                              for name, data_type, default, nullable in trendln_columns}
+            self.assertEqual(set(trendln_schema), {
+                "historical_level_pctbound", "historical_level_min_touches",
+                "historical_level_extmethod", "historical_level_accuracy",
+            })
+            self.assertEqual(trendln_schema["historical_level_pctbound"][0], "numeric")
+            self.assertEqual(trendln_schema["historical_level_min_touches"][0], "integer")
+            self.assertEqual(trendln_schema["historical_level_extmethod"][0], "character varying")
+            self.assertEqual(trendln_schema["historical_level_accuracy"][0], "integer")
+            self.assertTrue(all(column[2] == "NO" for column in trendln_schema.values()))
+            self.assertIn("0.05", trendln_schema["historical_level_pctbound"][1])
+            self.assertIn("1", trendln_schema["historical_level_min_touches"][1])
+            self.assertIn("METHOD_NUMDIFF", trendln_schema["historical_level_extmethod"][1])
+            self.assertIn("2", trendln_schema["historical_level_accuracy"][1])
+
             defaults = TradingSettings(
                 stake_usdt=10, initial_balance_usdt=100, max_open_trades=3
             )

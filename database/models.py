@@ -81,6 +81,20 @@ class TradingPairSetting(Base):
     historical_level_refresh_seconds: Mapped[float] = mapped_column(
         Numeric(18, 8, asdecimal=False), nullable=False, default=300.0, server_default=text("300")
     )
+    historical_level_pctbound: Mapped[float] = mapped_column(
+        Numeric(18, 10, asdecimal=False), nullable=False,
+        default=0.05, server_default=text("0.05")
+    )
+    historical_level_min_touches: Mapped[int] = mapped_column(
+        nullable=False, default=1, server_default=text("1")
+    )
+    historical_level_extmethod: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="METHOD_NUMDIFF",
+        server_default=text("'METHOD_NUMDIFF'")
+    )
+    historical_level_accuracy: Mapped[int] = mapped_column(
+        nullable=False, default=2, server_default=text("2")
+    )
     max_wall_level_distance_bps: Mapped[float] = mapped_column(
         Numeric(18, 8, asdecimal=False), nullable=False, default=13.0, server_default=text("13")
     )
@@ -228,6 +242,10 @@ async def async_main() -> None:
             ("historical_level_timeframe", "VARCHAR(8) NOT NULL DEFAULT '5m'"),
             ("historical_level_candle_count", "INTEGER NOT NULL DEFAULT 500"),
             ("historical_level_refresh_seconds", "NUMERIC(18,8) NOT NULL DEFAULT 300"),
+            ("historical_level_pctbound", "NUMERIC(18,10) NOT NULL DEFAULT 0.05"),
+            ("historical_level_min_touches", "INTEGER NOT NULL DEFAULT 1"),
+            ("historical_level_extmethod", "VARCHAR(32) NOT NULL DEFAULT 'METHOD_NUMDIFF'"),
+            ("historical_level_accuracy", "INTEGER NOT NULL DEFAULT 2"),
             ("max_wall_level_distance_bps", "NUMERIC(18,8) NOT NULL DEFAULT 13"),
             ("false_breakout_point_1_offset_bps", "NUMERIC(18,8)"),
             ("false_breakout_point_2_distance_bps", "NUMERIC(18,8)"),

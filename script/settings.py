@@ -44,6 +44,10 @@ class PairSettings:
     historical_level_timeframe: str = "5m"
     historical_level_candle_count: int = 500
     historical_level_refresh_seconds: float = 300.0
+    historical_level_pctbound: float = 0.05
+    historical_level_min_touches: int = 1
+    historical_level_extmethod: str = "METHOD_NUMDIFF"
+    historical_level_accuracy: int = 2
     max_wall_level_distance_bps: float = 13.0
     false_breakout_point_1_offset_bps: float | None = None
     false_breakout_point_2_distance_bps: float | None = None
@@ -128,6 +132,34 @@ class PairSettings:
             raise ValueError("historical_level_candle_count must be between 5 and 1000")
         if not isfinite(self.historical_level_refresh_seconds) or self.historical_level_refresh_seconds <= 0:
             raise ValueError("historical_level_refresh_seconds must be positive")
+        if (
+            isinstance(self.historical_level_pctbound, bool)
+            or not isinstance(self.historical_level_pctbound, (int, float))
+            or not isfinite(self.historical_level_pctbound)
+            or self.historical_level_pctbound <= 0
+        ):
+            raise ValueError("historical_level_pctbound must be a positive finite number")
+        object.__setattr__(self, "historical_level_pctbound", float(self.historical_level_pctbound))
+        if (
+            isinstance(self.historical_level_min_touches, bool)
+            or not isinstance(self.historical_level_min_touches, int)
+            or self.historical_level_min_touches < 1
+        ):
+            raise ValueError("historical_level_min_touches must be a positive integer")
+        if (
+            not isinstance(self.historical_level_extmethod, str)
+            or self.historical_level_extmethod not in {
+                "METHOD_NUMDIFF", "METHOD_NAIVE", "METHOD_NAIVECONSEC"
+            }
+        ):
+            raise ValueError("Unsupported historical_level_extmethod")
+        if (
+            isinstance(self.historical_level_accuracy, bool)
+            or not isinstance(self.historical_level_accuracy, int)
+            or self.historical_level_accuracy <= 0
+            or self.historical_level_accuracy % 2 != 0
+        ):
+            raise ValueError("historical_level_accuracy must be a positive even integer")
         if not isfinite(self.max_wall_level_distance_bps) or self.max_wall_level_distance_bps <= 0:
             raise ValueError("max_wall_level_distance_bps must be positive")
 

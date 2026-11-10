@@ -91,7 +91,10 @@ async def fetch_closed_bybit_candles(
     return candles
 
 
-def calculate_horizontal_levels(candles: list[dict], timeframe: str) -> tuple[dict, ...]:
+def calculate_horizontal_levels(
+    candles: list[dict], timeframe: str, *, pctbound: float = 0.05,
+    min_touches: int = 1, extmethod: str = "METHOD_NUMDIFF", accuracy: int = 2,
+) -> tuple[dict, ...]:
     """Return trendln-provided price, support/resistance type, and touch count."""
     try:
         trendln = importlib.import_module("trendln")
@@ -101,7 +104,10 @@ def calculate_horizontal_levels(candles: list[dict], timeframe: str) -> tuple[di
         supports, resistances = trendln.get_horizontal_levels(
             ([candle["low"] for candle in candles],
              [candle["high"] for candle in candles]),
-            min_touches=1,
+            pctbound=float(pctbound),
+            min_touches=min_touches,
+            extmethod=extmethod,
+            accuracy=accuracy,
         )
     except Exception as error:
         raise HistoricalLevelError(
@@ -126,11 +132,38 @@ def calculate_horizontal_levels(candles: list[dict], timeframe: str) -> tuple[di
     return tuple(levels)
 
 
-async def fetch_historical_levels(symbol: str, settings) -> tuple[dict, ...]:
+async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
+    """Fetch and calculate levels with the exact settings used for this snapshot."""
+    applied_settings = {
+        "historical_level_timeframe": settings.historical_level_timeframe,
+        "historical_level_candle_count": settings.historical_level_candle_count,
+        "historical_level_refresh_seconds": settings.historical_level_refresh_seconds,
+        "historical_level_pctbound": settings.historical_level_pctbound,
+        "historical_level_min_touches": settings.historical_level_min_touches,
+        "historical_level_extmethod": settings.historical_level_extmethod,
+        "historical_level_accuracy": settings.historical_level_accuracy,
+    }
     candles = await fetch_closed_bybit_candles(
         symbol, settings.historical_level_timeframe,
         settings.historical_level_candle_count,
     )
-    return await asyncio.to_thread(
-        calculate_horizontal_levels, candles, settings.historical_level_timeframe
+    levels = await asyncio.to_thread(
+        calculate_horizontal_levels,
+        candles,
+        settings.historical_level_timeframe,
+        pctbound=settings.historical_level_pctbound,
+        min_touches=settings.historical_level_min_touches,
+        extmethod=settings.historical_level_extmethod,
+        accuracy=settings.historical_level_accuracy,
     )
+    return {
+        "levels": levels,
+        "candles_analyzed": len(candles),
+        "settings": applied_settings,
+    }
+
+
+async def fetch_historical_levels(symbol: str, settings) -> tuple[dict, ...]:
+    """Backward-compatible levels-only adapter."""
+    snapshot = await fetch_historical_level_snapshot(symbol, settings)
+    return snapshot["levels"]
