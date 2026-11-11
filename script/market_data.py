@@ -1026,17 +1026,17 @@ async def _historical_level_worker(symbol: str, engine: TradingEngine) -> None:
                 "%s historical level refresh failed (%s)", symbol, type(error).__name__
             )
         else:
-            levels = snapshot["levels"]
             engine.set_historical_levels(
                 symbol,
-                levels,
+                snapshot["strategy_levels"],
                 candles_analyzed=snapshot["candles_analyzed"],
                 applied_settings=snapshot["settings"],
+                diagnostic_levels=snapshot["levels"],
             )
             logger.info(
                 "%s historical levels refreshed timeframe=%s candles=%d levels=%d",
                 symbol, snapshot["settings"]["historical_level_timeframe"],
-                snapshot["candles_analyzed"], len(levels),
+                snapshot["candles_analyzed"], len(snapshot["levels"]),
             )
         await asyncio.sleep(max(1.0, float(settings.historical_level_refresh_seconds)))
 

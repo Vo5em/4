@@ -48,6 +48,9 @@ class PairSettings:
     historical_level_min_touches: int = 1
     historical_level_extmethod: str = "METHOD_NUMDIFF"
     historical_level_accuracy: int = 2
+    historical_level_touch_zone_bps: float = 10.0
+    historical_level_touch_reset_bps: float = 30.0
+    historical_level_touch_min_separation_candles: int = 3
     max_wall_level_distance_bps: float = 13.0
     false_breakout_point_1_offset_bps: float | None = None
     false_breakout_point_2_distance_bps: float | None = None
@@ -160,6 +163,27 @@ class PairSettings:
             or self.historical_level_accuracy % 2 != 0
         ):
             raise ValueError("historical_level_accuracy must be a positive even integer")
+        for name in (
+            "historical_level_touch_zone_bps",
+            "historical_level_touch_reset_bps",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative finite number")
+            object.__setattr__(self, name, float(value))
+        if self.historical_level_touch_reset_bps <= self.historical_level_touch_zone_bps:
+            raise ValueError("historical_level_touch_reset_bps must be greater than touch_zone_bps")
+        if (
+            isinstance(self.historical_level_touch_min_separation_candles, bool)
+            or not isinstance(self.historical_level_touch_min_separation_candles, int)
+            or self.historical_level_touch_min_separation_candles < 1
+        ):
+            raise ValueError("historical_level_touch_min_separation_candles must be a positive integer")
         if not isfinite(self.max_wall_level_distance_bps) or self.max_wall_level_distance_bps <= 0:
             raise ValueError("max_wall_level_distance_bps must be positive")
 

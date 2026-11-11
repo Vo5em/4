@@ -161,6 +161,9 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertIn("historical_level_min_touches</code>: 1", levels)
         self.assertIn("historical_level_extmethod</code>: METHOD_NUMDIFF", levels)
         self.assertIn("historical_level_accuracy</code>: 2", levels)
+        self.assertIn("historical_level_touch_zone_bps</code>: 10.0", levels)
+        self.assertIn("historical_level_touch_reset_bps</code>: 30.0", levels)
+        self.assertIn("historical_level_touch_min_separation_candles</code>: 3", levels)
         self.assertIn("max_wall_level_distance_bps</code>: 13", levels)
         self.assertIn("bounce_take_profit_bps</code>: 7", strategies)
         self.assertIn("breakout_stop_loss_bps</code>: 10", strategies)
@@ -196,6 +199,9 @@ class SettingsPairScalingTests(unittest.TestCase):
             ("historical_level_min_touches", "3"),
             ("historical_level_extmethod", "method_naive"),
             ("historical_level_accuracy", "4"),
+            ("historical_level_touch_zone_bps", "8"),
+            ("historical_level_touch_reset_bps", "35"),
+            ("historical_level_touch_min_separation_candles", "5"),
         ):
             state = FakeState()
             state.data = {"pair_symbol": "ETHUSDT", "pair_section": "levels"}
@@ -212,6 +218,9 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertEqual(settings.historical_level_min_touches, 3)
         self.assertEqual(settings.historical_level_extmethod, "METHOD_NAIVE")
         self.assertEqual(settings.historical_level_accuracy, 4)
+        self.assertEqual(settings.historical_level_touch_zone_bps, 8.0)
+        self.assertEqual(settings.historical_level_touch_reset_bps, 35.0)
+        self.assertEqual(settings.historical_level_touch_min_separation_candles, 5)
 
     def test_trendln_current_role_does_not_replace_historical_type(self):
         self.assertEqual(_trendln_role(101.0, 100.0, 0.01), ("RESISTANCE", "выше цены", 100.0))
@@ -226,7 +235,8 @@ class SettingsPairScalingTests(unittest.TestCase):
         engine.set_historical_levels(
             "ETHUSDT",
             (
-                {"price": 101.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 3},
+                {"price": 101.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 3,
+                 "pivot_count": 3, "independent_touch_count": 0},
                 {"price": 99.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 2},
                 {"price": 100.005, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1},
             ),
@@ -257,7 +267,9 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertIn("проанализировано 480 / запрошено 500", text)
         self.assertIn("исторически SUPPORT · сейчас RESISTANCE", text)
         self.assertIn("исторически RESISTANCE · сейчас SUPPORT", text)
-        self.assertIn("Pivots 3", text)
+        self.assertIn("Pivots Trendln 3", text)
+        self.assertIn("самостоятельные касания 0", text)
+        self.assertIn("только диагностическая метрика", text)
         self.assertLessEqual(len(text), 4096)
 
     def test_trendln_view_does_not_claim_current_position_without_fresh_price(self):
@@ -292,9 +304,11 @@ class SettingsPairScalingTests(unittest.TestCase):
             "historical_level_min_touches": 1, "historical_level_extmethod": "METHOD_NUMDIFF",
             "historical_level_accuracy": 2,
         })
-        engine.historical_levels["ETHUSDT"] += ({
+        support_level = {
             "price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2,
-        },)
+        }
+        engine.historical_levels["ETHUSDT"] += (support_level,)
+        engine.historical_level_diagnostic_levels["ETHUSDT"] += (support_level,)
         engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
         runtime = RuntimeController(engine)
         page0 = trendln_levels_text(runtime, "ETHUSDT", page=0)

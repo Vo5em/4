@@ -175,6 +175,15 @@ async def initialize_database(
                     historical_level_min_touches=getattr(row, "historical_level_min_touches", 1) or 1,
                     historical_level_extmethod=getattr(row, "historical_level_extmethod", "METHOD_NUMDIFF") or "METHOD_NUMDIFF",
                     historical_level_accuracy=getattr(row, "historical_level_accuracy", 2) or 2,
+                    historical_level_touch_zone_bps=getattr(
+                        row, "historical_level_touch_zone_bps", 10.0
+                    ) if getattr(row, "historical_level_touch_zone_bps", None) is not None else 10.0,
+                    historical_level_touch_reset_bps=getattr(
+                        row, "historical_level_touch_reset_bps", 30.0
+                    ) if getattr(row, "historical_level_touch_reset_bps", None) is not None else 30.0,
+                    historical_level_touch_min_separation_candles=getattr(
+                        row, "historical_level_touch_min_separation_candles", 3
+                    ) or 3,
                     max_wall_level_distance_bps=getattr(row, "max_wall_level_distance_bps", 13.0) or 13.0,
                     false_breakout_point_1_offset_bps=getattr(row, "false_breakout_point_1_offset_bps", None),
                     false_breakout_point_2_distance_bps=getattr(row, "false_breakout_point_2_distance_bps", None),
@@ -284,6 +293,9 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
         historical_level_min_touches=settings.historical_level_min_touches,
         historical_level_extmethod=settings.historical_level_extmethod,
         historical_level_accuracy=settings.historical_level_accuracy,
+        historical_level_touch_zone_bps=settings.historical_level_touch_zone_bps,
+        historical_level_touch_reset_bps=settings.historical_level_touch_reset_bps,
+        historical_level_touch_min_separation_candles=settings.historical_level_touch_min_separation_candles,
         max_wall_level_distance_bps=settings.max_wall_level_distance_bps,
         false_breakout_point_1_offset_bps=settings.false_breakout_point_1_offset_bps,
         false_breakout_point_2_distance_bps=settings.false_breakout_point_2_distance_bps,
@@ -581,6 +593,8 @@ async def save_pair_settings(settings: PairSettings) -> None:
                 "historical_level_refresh_seconds", "historical_level_pctbound",
                 "historical_level_min_touches", "historical_level_extmethod",
                 "historical_level_accuracy", "max_wall_level_distance_bps",
+                "historical_level_touch_zone_bps", "historical_level_touch_reset_bps",
+                "historical_level_touch_min_separation_candles",
                 "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
                 "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
                 "false_breakout_stop_loss_bps",
@@ -718,6 +732,8 @@ async def save_pair_settings_with_trades(
                 "historical_level_refresh_seconds", "historical_level_pctbound",
                 "historical_level_min_touches", "historical_level_extmethod",
                 "historical_level_accuracy", "max_wall_level_distance_bps",
+                "historical_level_touch_zone_bps", "historical_level_touch_reset_bps",
+                "historical_level_touch_min_separation_candles",
                 "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
                 "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
                 "false_breakout_stop_loss_bps",

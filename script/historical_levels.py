@@ -10,6 +10,8 @@ import time
 
 import aiohttp
 
+from .independent_touches import count_independent_touches
+
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 _BYBIT_INTERVALS = {
@@ -142,6 +144,9 @@ async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
         "historical_level_min_touches": settings.historical_level_min_touches,
         "historical_level_extmethod": settings.historical_level_extmethod,
         "historical_level_accuracy": settings.historical_level_accuracy,
+        "historical_level_touch_zone_bps": settings.historical_level_touch_zone_bps,
+        "historical_level_touch_reset_bps": settings.historical_level_touch_reset_bps,
+        "historical_level_touch_min_separation_candles": settings.historical_level_touch_min_separation_candles,
     }
     candles = await fetch_closed_bybit_candles(
         symbol, settings.historical_level_timeframe,
@@ -156,14 +161,35 @@ async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
         extmethod=settings.historical_level_extmethod,
         accuracy=settings.historical_level_accuracy,
     )
+    calculated_at = datetime.now(timezone.utc).isoformat()
+    touch_parameters = {
+        "touch_zone_bps": settings.historical_level_touch_zone_bps,
+        "reset_bps": settings.historical_level_touch_reset_bps,
+        "min_separation_candles": settings.historical_level_touch_min_separation_candles,
+    }
+    enriched_levels = tuple({
+        **level,
+        # Keep the original Trendln field for strategy compatibility.
+        "pivot_count": level["touch_count"],
+        "independent_touch_count": count_independent_touches(
+            level["price"], candles,
+            touch_zone_bps=settings.historical_level_touch_zone_bps,
+            reset_bps=settings.historical_level_touch_reset_bps,
+            min_separation_candles=settings.historical_level_touch_min_separation_candles,
+        ),
+        "independent_touch_parameters": dict(touch_parameters),
+        "independent_touch_calculated_at": calculated_at,
+    } for level in levels)
     return {
-        "levels": levels,
+        "levels": enriched_levels,
+        "strategy_levels": tuple(dict(level) for level in levels),
         "candles_analyzed": len(candles),
         "settings": applied_settings,
+        "calculated_at": calculated_at,
     }
 
 
 async def fetch_historical_levels(symbol: str, settings) -> tuple[dict, ...]:
     """Backward-compatible levels-only adapter."""
     snapshot = await fetch_historical_level_snapshot(symbol, settings)
-    return snapshot["levels"]
+    return snapshot["strategy_levels"]

@@ -106,19 +106,40 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
             historical_level_extmethod="METHOD_NAIVECONSEC",
             historical_level_accuracy=4,
         )
-        candles = [{"low": 99.0, "high": 101.0}] * 17
-        levels = ({"price": 100.0, "type": "SUPPORT", "touch_count": 2},)
+        candles = [{"low": 99.0, "high": 101.0, "close": 100.0}] * 17
+        levels = ({"price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 12},)
         with (
             patch.object(historical_levels, "fetch_closed_bybit_candles", new=AsyncMock(return_value=candles)),
             patch.object(historical_levels.asyncio, "to_thread", new=AsyncMock(return_value=levels)) as to_thread,
         ):
             snapshot = run(historical_levels.fetch_historical_level_snapshot("ETHUSDT", settings))
-        self.assertEqual(snapshot["levels"], levels)
+        level, = snapshot["levels"]
+        self.assertEqual(level["touch_count"], 12)
+        self.assertEqual(level["pivot_count"], 12)
+        self.assertEqual(level["independent_touch_count"], 1)
+        self.assertEqual(level["independent_touch_parameters"], {
+            "touch_zone_bps": 10.0, "reset_bps": 30.0,
+            "min_separation_candles": 3,
+        })
+        self.assertEqual(level["independent_touch_calculated_at"], snapshot["calculated_at"])
+        self.assertNotIn("independent_touch_count", snapshot["strategy_levels"][0])
+        engine = TradingEngine({"ETHUSDT": settings})
+        engine.set_historical_levels(
+            "ETHUSDT", snapshot["strategy_levels"],
+            diagnostic_levels=snapshot["levels"],
+        )
+        self.assertNotIn("independent_touch_count", engine.historical_levels["ETHUSDT"][0])
+        self.assertEqual(
+            engine.historical_level_diagnostic_levels["ETHUSDT"][0]["independent_touch_count"], 1
+        )
         self.assertEqual(snapshot["candles_analyzed"], 17)
         self.assertEqual(snapshot["settings"]["historical_level_pctbound"], 0.01)
         self.assertEqual(snapshot["settings"]["historical_level_min_touches"], 2)
         self.assertEqual(snapshot["settings"]["historical_level_extmethod"], "METHOD_NAIVECONSEC")
         self.assertEqual(snapshot["settings"]["historical_level_accuracy"], 4)
+        self.assertEqual(snapshot["settings"]["historical_level_touch_zone_bps"], 10.0)
+        self.assertEqual(snapshot["settings"]["historical_level_touch_reset_bps"], 30.0)
+        self.assertEqual(snapshot["settings"]["historical_level_touch_min_separation_candles"], 3)
         self.assertEqual(to_thread.call_args.kwargs["accuracy"], 4)
 
     def test_wall_requires_matching_level_type_and_distance(self):
@@ -138,10 +159,12 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
 class StrategyLevelFilterTests(unittest.TestCase):
     def test_bounce_accepts_one_touch_and_breakout_requires_two(self):
         one_touch = make_context(price=99.5, levels=(
-            {"price": 100.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1},
+            {"price": 100.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1,
+             "pivot_count": 1, "independent_touch_count": 7},
         ))
         two_touches = make_context(price=99.5, levels=(
-            {"price": 100.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 2},
+            {"price": 100.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 2,
+             "pivot_count": 2, "independent_touch_count": 1},
         ))
         self.assertEqual(len(BounceStrategy().evaluate(one_touch)), 1)
         self.assertEqual(BounceStrategy().evaluate(two_touches), [])

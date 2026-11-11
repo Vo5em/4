@@ -97,6 +97,7 @@ class TradingEngine:
         self.instrument_tick_sizes: dict[str, float] = {}
         self.repository = repository
         self.historical_levels: dict[str, tuple[dict, ...]] = {}
+        self.historical_level_diagnostic_levels: dict[str, tuple[dict, ...]] = {}
         self.historical_levels_updated_at: dict[str, datetime | None] = {}
         self.historical_level_errors: dict[str, str | None] = {}
         self.historical_level_candles_analyzed: dict[str, int | None] = {}
@@ -234,9 +235,13 @@ class TradingEngine:
         self, symbol: str, levels: tuple[dict, ...], error: str | None = None,
         *, candles_analyzed: int | None = None,
         applied_settings: dict | None = None,
+        diagnostic_levels: tuple[dict, ...] | None = None,
     ) -> None:
         symbol = symbol.upper()
         self.historical_levels[symbol] = tuple(dict(level) for level in levels)
+        self.historical_level_diagnostic_levels[symbol] = tuple(
+            dict(level) for level in (diagnostic_levels if diagnostic_levels is not None else levels)
+        )
         self.historical_levels_updated_at[symbol] = self._utc_now() if error is None else None
         self.historical_level_errors[symbol] = error
         self.historical_level_candles_analyzed[symbol] = (
@@ -246,7 +251,9 @@ class TradingEngine:
             dict(applied_settings) if error is None and applied_settings is not None else None
         )
         diagnostics = self.wall_diagnostics.setdefault(symbol, {})
-        diagnostics["historical_levels"] = [dict(level) for level in levels]
+        diagnostics["historical_levels"] = [
+            dict(level) for level in self.historical_level_diagnostic_levels[symbol]
+        ]
         diagnostics["historical_level_updated_at"] = self.historical_levels_updated_at[symbol]
         diagnostics["historical_level_error"] = error
         diagnostics["historical_level_candles_analyzed"] = self.historical_level_candles_analyzed[symbol]
