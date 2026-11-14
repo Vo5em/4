@@ -92,6 +92,8 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
             {"historical_level_min_touches": True},
             {"historical_level_extmethod": "METHOD_NCUBED"},
             {"historical_level_accuracy": 3},
+            {"historical_level_break_confirm_candles": 0},
+            {"historical_level_break_confirm_bps": 0},
         )
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
@@ -122,7 +124,12 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
             "min_separation_candles": 3,
         })
         self.assertEqual(level["independent_touch_calculated_at"], snapshot["calculated_at"])
+        self.assertIn(level["freshness_state"], {"UNCONFIRMED", "CONFIRMED", "CONFIRMED_AFTER_BREAK"})
+        self.assertIsNone(level["current_phase_touch_count"])
+        self.assertEqual(snapshot["settings"]["historical_level_break_confirm_bps"], 20.0)
+        self.assertEqual(snapshot["settings"]["historical_level_break_confirm_candles"], 2)
         self.assertNotIn("independent_touch_count", snapshot["strategy_levels"][0])
+        self.assertNotIn("current_phase_touch_count", snapshot["strategy_levels"][0])
         engine = TradingEngine({"ETHUSDT": settings})
         engine.set_historical_levels(
             "ETHUSDT", snapshot["strategy_levels"],

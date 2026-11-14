@@ -436,7 +436,13 @@ class TradeManager:
             if not trade.get("entry_armed"):
                 if safe_side:
                     trade["entry_armed"] = True
-                    events.append({"event": "ENTRY_ARMED", "trade": trade})
+                    events.append({
+                        "event": "ENTRY_ARMED", "trade": trade,
+                        "previous_price": trigger_previous,
+                        "current_price": numeric_price,
+                        "cross_direction": trade["entry_trigger_direction"],
+                        "entry_armed": True,
+                    })
                 elif crossed and any(
                     item.get("status") == "open" and item.get("symbol") == symbol
                     for item in self.trades
@@ -466,14 +472,30 @@ class TradeManager:
                     entry_armed=False,
                 )
                 events.append({
+                    "event": "ENTRY_BLOCKED", "trade": trade,
+                    "reason": "ENTRY_BLOCKED_BY_OPEN_TRADE",
+                    "previous_price": trigger_previous,
+                    "current_price": numeric_price,
+                    "cross_direction": trade["entry_trigger_direction"],
+                })
+                events.append({
                     "event": "ENTRY_CANCELLED", "trade": trade,
                     "reason": "ENTRY_BLOCKED_BY_OPEN_TRADE",
+                    "previous_price": trigger_previous,
+                    "current_price": numeric_price,
+                    "cross_direction": trade["entry_trigger_direction"],
                 })
                 continue
             if open_count >= self.trading_settings.max_open_trades:
                 trade["entry_armed"] = False
-                events.append({"event": "ENTRY_BLOCKED", "trade": trade,
-                               "reason": "GLOBAL_OPEN_LIMIT"})
+                events.append({
+                    "event": "ENTRY_BLOCKED", "trade": trade,
+                    "reason": "GLOBAL_OPEN_LIMIT",
+                    "previous_price": trigger_previous,
+                    "current_price": numeric_price,
+                    "cross_direction": trade["entry_trigger_direction"],
+                    "entry_armed": False,
+                })
                 continue
             reserved = sum(
                 float(item["stake_usdt"]) for item in self.trades
@@ -484,8 +506,14 @@ class TradeManager:
             available = self.balance_usdt - reserved
             if available < float(trade["stake_usdt"]) + entry_fee:
                 trade["entry_armed"] = False
-                events.append({"event": "ENTRY_BLOCKED", "trade": trade,
-                               "reason": "INSUFFICIENT_AVAILABLE_BALANCE"})
+                events.append({
+                    "event": "ENTRY_BLOCKED", "trade": trade,
+                    "reason": "INSUFFICIENT_AVAILABLE_BALANCE",
+                    "previous_price": trigger_previous,
+                    "current_price": numeric_price,
+                    "cross_direction": trade["entry_trigger_direction"],
+                    "entry_armed": False,
+                })
                 continue
             if trade.get("strategy_id") == "false_breakout":
                 try:
@@ -503,6 +531,9 @@ class TradeManager:
                     events.append({
                         "event": "ENTRY_CANCELLED", "trade": trade,
                         "reason": "INVALID_TRADE_LEVELS",
+                        "previous_price": trigger_previous,
+                        "current_price": numeric_price,
+                        "cross_direction": trade["entry_trigger_direction"],
                     })
                     continue
                 trade["stop_loss"] = float(actual_levels["stop_loss"])
@@ -541,6 +572,11 @@ class TradeManager:
 
     def discard_deferred_entry_tick(self, symbol: str) -> None:
         self._deferred_entry_ticks.pop(symbol.upper(), None)
+
+    def get_entry_reference_price(self, symbol: str) -> float | None:
+        """Read the prior price that the next eligible ticker will compare against."""
+        symbol = symbol.upper()
+        return self._deferred_entry_ticks.get(symbol, self.last_prices.get(symbol))
 
     def cancel_pending_for_wall(
         self,
@@ -853,10 +889,20 @@ class TradeManager:
         trade.update(status="cancelled", closed_at=datetime.now(timezone.utc), close_reason=reason)
         return [{"event": "ENTRY_CANCELLED", "trade": trade}]
 
-    def disarm_pending_for_symbol(self, symbol: str) -> None:
+    def disarm_pending_for_symbol(self, symbol: str, reason: str = "MARKET_DATA_UNSAFE") -> list[dict]:
+        events = []
+        current_price = self.last_prices.get(symbol.upper())
         for trade in self.trades:
-            if trade["symbol"] == symbol.upper() and trade["status"] == "pending":
+            if (trade["symbol"] == symbol.upper() and trade["status"] == "pending"
+                    and trade.get("entry_armed")):
                 trade["entry_armed"] = False
+                events.append({
+                    "event": "PENDING_DISARMED", "trade": trade, "reason": reason,
+                    "previous_price": trade.get("entry_previous_price"),
+                    "current_price": current_price,
+                    "entry_armed": False,
+                })
+        return events
 
     def set_pair_settings_for_price_check(self, settings: PairSettings) -> None:
         if not hasattr(self, "_current_pair_settings"):

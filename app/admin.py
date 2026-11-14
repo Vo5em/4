@@ -443,6 +443,15 @@ def _trendln_role(level_price: float, last_price: float, tick_size: float | None
     return "SUPPORT", "ниже цены", -distance_bps
 
 
+def _trendln_phase_status(level: dict) -> str:
+    state = level.get("freshness_state") or "нет данных"
+    structure = level.get("structure_state") or "нет данных"
+    reason = level.get("freshness_reason") or "причина не указана"
+    transition = level.get("last_confirmed_transition_at") or "нет"
+    phase_start = level.get("current_phase_started_at") or "не определено"
+    return f"{structure}/{state}; фаза с {phase_start}; переход {transition}; {reason}"
+
+
 def _trendln_snapshot_state(runtime: RuntimeController, symbol: str) -> dict:
     engine = runtime.engine
     settings = engine.pair_settings[symbol]
@@ -491,6 +500,8 @@ def _trendln_actual_settings_text(snapshot: dict) -> str:
         ("historical_level_touch_zone_bps", "touch_zone_bps"),
         ("historical_level_touch_reset_bps", "touch_reset_bps"),
         ("historical_level_touch_min_separation_candles", "touch_min_separation_candles"),
+        ("historical_level_break_confirm_bps", "break_confirm_bps"),
+        ("historical_level_break_confirm_candles", "break_confirm_candles"),
     )
     configured = snapshot["current_settings"]
     fields = []
@@ -566,6 +577,12 @@ def _trendln_wall_matches(runtime: RuntimeController, symbol: str, snapshot: dic
                 "current_role": current_role,
                 "touch_count": level.get("touch_count", "нет данных"),
                 "independent_touch_count": level.get("independent_touch_count"),
+                "current_phase_touch_count": level.get("current_phase_touch_count"),
+                "freshness_state": level.get("freshness_state"),
+                "structure_state": level.get("structure_state"),
+                "freshness_reason": level.get("freshness_reason"),
+                "current_phase_started_at": level.get("current_phase_started_at"),
+                "last_confirmed_transition_at": level.get("last_confirmed_transition_at"),
                 "distance_bps": distance_bps,
                 "maximum_bps": maximum_bps,
                 "passes": distance_bps <= maximum_bps,
@@ -649,6 +666,8 @@ def trendln_levels_text(
                 f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
                 f"сейчас {row['current_role']} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
                 f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+                f"фаза {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
+                f"{_trendln_phase_status(row)} · "
                 f"+{row['signed_distance_bps']:.2f} bps"
                 for row in upper
             ) or "Нет уровней сверху."
@@ -656,13 +675,17 @@ def trendln_levels_text(
                 f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
                 f"сейчас {row['current_role']} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
                 f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+                f"фаза {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
+                f"{_trendln_phase_status(row)} · "
                 f"{row['signed_distance_bps']:.2f} bps"
                 for row in lower
             ) or "Нет уровней снизу."
             at_text = "\n".join(
                 f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
                 f"сейчас AT_LEVEL · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'}"
+                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+                f"фаза {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
+                f"{_trendln_phase_status(row)}"
                 for row in at_price
             ) or "Нет уровней в пределах tickSize."
             body = (
@@ -687,7 +710,9 @@ def trendln_levels_text(
                     f"{item['side']} стена {item['wall_price']:g} · ratio {ratio}\n"
                     f"уровень {item['level_price']:g} · исторически {item['historical_type']} · "
                     f"текущая роль {item['current_role']} · Pivots Trendln {item['touch_count']} · "
-                    f"самостоятельные касания {item.get('independent_touch_count') if item.get('independent_touch_count') is not None else 'нет данных'}\n"
+                    f"самостоятельные касания {item.get('independent_touch_count') if item.get('independent_touch_count') is not None else 'нет данных'} · "
+                    f"фаза {item.get('current_phase_touch_count') if item.get('current_phase_touch_count') is not None else 'нет данных'} · "
+                    f"{_trendln_phase_status(item)}\n"
                     f"дистанция стена↔уровень {item['distance_bps']:.2f}/{item['maximum_bps']:g} bps · {passed}"
                 )
             body = f"STABLE-сопоставления · стр. {page + 1}/{page_count}\n\n" + "\n\n".join(rows)
@@ -804,6 +829,8 @@ def pair_settings_card_text(runtime: RuntimeController, symbol: str, section: st
             ("historical_level_touch_zone_bps", settings.historical_level_touch_zone_bps),
             ("historical_level_touch_reset_bps", settings.historical_level_touch_reset_bps),
             ("historical_level_touch_min_separation_candles", settings.historical_level_touch_min_separation_candles),
+            ("historical_level_break_confirm_bps", settings.historical_level_break_confirm_bps),
+            ("historical_level_break_confirm_candles", settings.historical_level_break_confirm_candles),
             ("max_wall_level_distance_bps", settings.max_wall_level_distance_bps),
         ),
         "strategies": (
@@ -1652,6 +1679,7 @@ async def update_pair_settings(
         "historical_level_accuracy",
         "historical_level_touch_zone_bps", "historical_level_touch_reset_bps",
         "historical_level_touch_min_separation_candles",
+        "historical_level_break_confirm_bps", "historical_level_break_confirm_candles",
         "max_wall_level_distance_bps", "bounce_take_profit_bps", "bounce_stop_loss_bps",
         "breakout_take_profit_bps", "breakout_stop_loss_bps",
         "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
@@ -1682,6 +1710,7 @@ async def update_pair_settings(
                 int(raw_value) if parameter in {
                     "historical_level_candle_count", "historical_level_min_touches",
                     "historical_level_accuracy", "historical_level_touch_min_separation_candles",
+                    "historical_level_break_confirm_candles",
                 }
                 else float(raw_value)
             )
@@ -1716,6 +1745,8 @@ async def update_pair_settings(
         "historical_level_touch_zone_bps": "levels",
         "historical_level_touch_reset_bps": "levels",
         "historical_level_touch_min_separation_candles": "levels",
+        "historical_level_break_confirm_bps": "levels",
+        "historical_level_break_confirm_candles": "levels",
         "max_wall_level_distance_bps": "levels",
         "bounce_take_profit_bps": "strategies", "bounce_stop_loss_bps": "strategies",
         "breakout_take_profit_bps": "strategies", "breakout_stop_loss_bps": "strategies",

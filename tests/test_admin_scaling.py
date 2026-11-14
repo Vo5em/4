@@ -164,6 +164,8 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertIn("historical_level_touch_zone_bps</code>: 10.0", levels)
         self.assertIn("historical_level_touch_reset_bps</code>: 30.0", levels)
         self.assertIn("historical_level_touch_min_separation_candles</code>: 3", levels)
+        self.assertIn("historical_level_break_confirm_bps</code>: 20.0", levels)
+        self.assertIn("historical_level_break_confirm_candles</code>: 2", levels)
         self.assertIn("max_wall_level_distance_bps</code>: 13", levels)
         self.assertIn("bounce_take_profit_bps</code>: 7", strategies)
         self.assertIn("breakout_stop_loss_bps</code>: 10", strategies)
@@ -202,6 +204,8 @@ class SettingsPairScalingTests(unittest.TestCase):
             ("historical_level_touch_zone_bps", "8"),
             ("historical_level_touch_reset_bps", "35"),
             ("historical_level_touch_min_separation_candles", "5"),
+            ("historical_level_break_confirm_bps", "25"),
+            ("historical_level_break_confirm_candles", "3"),
         ):
             state = FakeState()
             state.data = {"pair_symbol": "ETHUSDT", "pair_section": "levels"}
@@ -221,6 +225,8 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertEqual(settings.historical_level_touch_zone_bps, 8.0)
         self.assertEqual(settings.historical_level_touch_reset_bps, 35.0)
         self.assertEqual(settings.historical_level_touch_min_separation_candles, 5)
+        self.assertEqual(settings.historical_level_break_confirm_bps, 25.0)
+        self.assertEqual(settings.historical_level_break_confirm_candles, 3)
 
     def test_trendln_current_role_does_not_replace_historical_type(self):
         self.assertEqual(_trendln_role(101.0, 100.0, 0.01), ("RESISTANCE", "выше цены", 100.0))
@@ -361,6 +367,28 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertEqual(matches[0]["touch_count"], 3)
         self.assertAlmostEqual(matches[0]["distance_bps"], 9.99000999)
         self.assertTrue(matches[0]["passes"])
+
+    def test_trendln_level_card_renders_phase_diagnostics_and_reason(self):
+        engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        engine.set_historical_levels("ETHUSDT", ({
+            "price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 14,
+        },), diagnostic_levels=({
+            "price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 14,
+            "pivot_count": 14, "independent_touch_count": 3,
+            "current_phase_touch_count": 1, "freshness_state": "CONFIRMED_AFTER_BREAK",
+            "freshness_reason": "2 закрытия подряд за уровнем на 20 bps.",
+            "last_confirmed_transition_at": "2026-01-01T00:10:00+00:00",
+        },), candles_analyzed=500, applied_settings={})
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        text = trendln_levels_text(RuntimeController(engine), "ETHUSDT")
+        self.assertIn("Pivots Trendln 14", text)
+        self.assertIn("самостоятельные касания 3", text)
+        self.assertIn("фаза 1", text)
+        self.assertIn("CONFIRMED_AFTER_BREAK", text)
+        self.assertIn("2026-01-01T00:10:00+00:00", text)
+        self.assertIn("2 закрытия подряд", text)
 
     def test_trendln_view_explicitly_reports_missing_side(self):
         engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})

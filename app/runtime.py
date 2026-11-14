@@ -120,7 +120,9 @@ class RuntimeController:
                 # planner will reconcile each plan against the first
                 # synchronized wall snapshot for its symbol.
                 for symbol in self.engine.pair_settings:
-                    self.engine.trade_manager.disarm_pending_for_symbol(symbol)
+                    self.engine.disarm_pending_with_diagnostics(
+                        symbol, "PROCESS_RESTART", "runtime"
+                    )
             for symbol, settings in self.engine.pair_settings.items():
                 if not settings.enabled:
                     disabled_pair_events.extend(

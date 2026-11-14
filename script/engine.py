@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -163,6 +164,7 @@ class TradingEngine:
         self._reconnect_reconciliation_required: set[str] = set()
         self._stale_data_warning_at: dict[str, float] = {}
         self._planner_reconcile_log_at: dict[str, float] = {}
+        self._trade_lifecycle_order = 0
         self.market_analysis = {
             symbol: {
                 "potential_wall_count": None,
@@ -273,7 +275,7 @@ class TradingEngine:
             if status in {"connecting", "reconnecting"}:
                 self._reconnect_reconciliation_required.add(symbol)
             self._market_health(symbol)["book_synchronized"] = False
-            self.trade_manager.disarm_pending_for_symbol(symbol)
+            self.disarm_pending_with_diagnostics(symbol, "WEBSOCKET_DISCONNECTED", "websocket")
             self.wall_diagnostics[symbol]["book_synchronized"] = False
             self.wall_diagnostics[symbol]["reason"] = (
                 "WebSocket не подключён; прежний стакан помечен недействительным."
@@ -445,14 +447,16 @@ class TradingEngine:
         self._entry_eligible_pending_ids.pop(symbol, None)
         health = self._market_health(symbol)
         health["book_synchronized"] = False
-        self.trade_manager.disarm_pending_for_symbol(symbol)
+        if generation is not None:
+            health["active_connection_generation"] = generation
+        self.disarm_pending_with_diagnostics(symbol, "ORDERBOOK_UNSYNCHRONIZED", "orderbook")
         diagnostics = self.wall_diagnostics.setdefault(symbol.upper(), {})
         diagnostics["book_synchronized"] = False
         diagnostics["reason"] = "Стакан не синхронизирован; анализ стен заблокирован."
-        if generation is not None:
-            health["active_connection_generation"] = generation
 
-    async def process_confirmed_entry_tick(self, symbol: str, price: float) -> list[dict]:
+    async def process_confirmed_entry_tick(
+        self, symbol: str, price: float, *, event_source: str = "ticker"
+    ) -> list[dict]:
         """Process crossings for plans validated before this fresh ticker arrived.
 
         Market data calls this before running Scanner/WallTracker for the tick,
@@ -474,7 +478,9 @@ class TradingEngine:
                 or not self._entry_event_is_after_resume(symbol)
             ):
                 self._entry_eligible_pending_ids.pop(symbol, None)
-                self.trade_manager.disarm_pending_for_symbol(symbol)
+                self.disarm_pending_with_diagnostics(
+                    symbol, "ENTRY_SAFETY_CHECK_FAILED", event_source
+                )
                 self.trade_manager.discard_deferred_entry_tick(symbol)
                 return []
 
@@ -486,7 +492,9 @@ class TradingEngine:
                 key: dict(value) for key, value in self._pending_persistence.items()
             }
             timeout_events = self.trade_manager.cancel_expired_false_breakout_pending()
-            if timeout_events and not await self.persist_events(timeout_events):
+            if timeout_events and not await self.persist_events(
+                timeout_events, event_source=event_source
+            ):
                 self.restore_trade_state(
                     previous_trades, previous_balance, previous_pending_persistence
                 )
@@ -497,7 +505,7 @@ class TradingEngine:
                 symbol, price, process_open=False,
                 eligible_signal_ids=eligible_ids,
             )
-            if events and not await self.persist_events(events):
+            if events and not await self.persist_events(events, event_source=event_source):
                 self.restore_trade_state(
                     previous_trades, previous_balance, previous_pending_persistence
                 )
@@ -1234,6 +1242,7 @@ class TradingEngine:
 
     async def persist_events(
         self, events: list[dict], *, strategy_states: dict[str, dict] | None = None,
+        event_source: str = "unknown",
     ) -> bool:
         async with self._persistence_lock:
             for event in events:
@@ -1242,7 +1251,7 @@ class TradingEngine:
                     self._pending_persistence[trade["signal_id"]] = trade
             if self.repository is None:
                 self._pending_persistence.clear()
-                self._log_trade_lifecycle_events(events)
+                self._log_trade_lifecycle_events(events, event_source=event_source)
                 return True
             if not self._pending_persistence and not strategy_states:
                 return True
@@ -1270,7 +1279,7 @@ class TradingEngine:
                 print(f"Database trade save failed: {type(error).__name__}")
                 return False
             self.record_database_success()
-            self._log_trade_lifecycle_events(events)
+            self._log_trade_lifecycle_events(events, event_source=event_source)
             for signal_id, trade_ref in snapshot_refs.items():
                 if self._pending_persistence.get(signal_id) is trade_ref:
                     self._pending_persistence.pop(signal_id, None)
@@ -1314,40 +1323,124 @@ class TradingEngine:
                 return 0
             return len(events)
 
-    def _log_trade_lifecycle_events(self, events: list[dict]) -> None:
+    def _log_trade_lifecycle_events(
+        self, events: list[dict], *, event_source: str = "unknown"
+    ) -> None:
+        event_names = {
+            "TRADE_CREATED": "PENDING_CREATED",
+            "ENTRY_ARMED": "PENDING_ARMED",
+            "PENDING_DISARMED": "PENDING_DISARMED",
+            "ENTRY_CROSS_DETECTED": "ENTRY_CROSS_DETECTED",
+            "ENTRY_CANCELLED": "PENDING_CANCELLED",
+            "ENTRY_ACTIVATED": "OPEN_CREATED",
+            "ENTRY_BLOCKED": "ENTRY_BLOCKED",
+        }
         for event in events:
             trade = event.get("trade")
-            if not trade or event.get("event") == "TRADE_CREATED":
+            event_type = event.get("event")
+            # Entry crosses are logged at ticker receipt, before execution and
+            # before any later orderbook reconciliation can invalidate a plan.
+            if event_type == "ENTRY_CROSS_DETECTED" and not event.get("ticker_received"):
+                continue
+            if not trade or event_type not in event_names:
                 continue
             symbol = str(trade.get("symbol", "")).upper()
             health = self.get_market_data_health(symbol)
-            event_type = event.get("event")
-            fill_price = event.get("fill_price")
-            if fill_price is None and event_type == "TRADE_CLOSED":
-                fill_price = trade.get("exit_price")
-            price_source = event.get("price_source")
-            if price_source is None and event_type in {"ENTRY_ACTIVATED", "TRADE_CLOSED"}:
-                price_source = MARKET_PRICE_SOURCE
-            logger.info(
-                "%s %s trade_id=%s signal_id=%s strategy=%s side=%s wall=%s@%s "
-                "entry=%s trigger=%s fill=%s close_price=%s sl=%s tp=%s source=%s "
-                "event_time_ms=%s received_at=%s closed_at=%s processed_at=%s price_age=%s "
-                "book_age=%s synced=%s generation=%s mode=%s reason=%s",
-                symbol, event_type, trade.get("id"),
-                trade.get("signal_id"), trade.get("strategy_id"),
-                trade.get("side"), trade.get("wall_side"), trade.get("wall_price"),
-                trade.get("entry_price"), event.get("trigger_price"),
-                fill_price,
-                trade.get("exit_price") if event_type == "TRADE_CLOSED" else None,
-                trade.get("stop_loss"), trade.get("take_profit"),
-                price_source or "n/a",
-                health.get("price_event_time_ms"), health.get("price_received_at"),
-                trade.get("closed_at") if event_type == "TRADE_CLOSED" else None,
-                self._utc_now().isoformat(timespec="milliseconds"),
-                health.get("price_age_seconds"), health.get("book_age_seconds"),
-                health.get("book_synchronized"), health.get("connection_generation"),
-                self.mode.value, trade.get("close_reason"),
+            source = str(event.get("event_source") or event_source)
+            exchange_timestamp = (
+                health.get("price_message_time_ms") or health.get("price_event_time_ms")
+                if source == "ticker" else health.get("book_message_time_ms")
             )
+            wall_id = trade.get("wall_id")
+            wall_state = "UNKNOWN"
+            for wall in self.latest_stable_walls.get(symbol, ()):
+                if wall.get("wall_id") == wall_id:
+                    wall_state = "STABLE"
+                    break
+            cancel_reason = event.get("reason") or trade.get("close_reason")
+            if cancel_reason in {
+                "WALL_NO_LONGER_QUALIFIES", "NO_STABLE_WALL", "WALL_REMOVED",
+            }:
+                wall_state = "NOT_STABLE"
+            current_price = event.get("current_price")
+            if current_price is None:
+                current_price = self.latest_market_prices.get(symbol)
+            previous_price = event.get("previous_price", trade.get("entry_previous_price"))
+            entry_price = event.get("entry_price", trade.get("entry_price"))
+            distance_bps = None
+            try:
+                if current_price and entry_price:
+                    distance_bps = abs(float(current_price) - float(entry_price)) / float(entry_price) * 10000
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            self._trade_lifecycle_order += 1
+            record = {
+                "event": event_names[event_type],
+                "time_utc": self._utc_now().isoformat(timespec="milliseconds"),
+                "symbol": symbol,
+                "strategy": trade.get("strategy_id"),
+                "combined_submode": trade.get("level_policy_strategy_id"),
+                "wall_id": wall_id,
+                "plan_id": trade.get("signal_id"),
+                "trade_id": trade.get("id") or trade.get("signal_id"),
+                "source": source,
+                "local_order": self._trade_lifecycle_order,
+                "exchange_timestamp_ms": exchange_timestamp,
+                "book_generation": health.get("connection_generation"),
+                "last_price_before": previous_price,
+                "last_price_after": current_price,
+                "entry_price": entry_price,
+                "cross_direction": event.get("cross_direction", trade.get("entry_trigger_direction")),
+                "armed": event.get("entry_armed", trade.get("entry_armed")),
+                "pending_active_when_ticker_received": event.get(
+                    "pending_active_when_ticker_received",
+                    event.get("pending_active_when_processed"),
+                ),
+                "wall_state": wall_state,
+                "reason": cancel_reason,
+                "distance_to_entry_bps": distance_bps,
+            }
+            # Lifecycle transitions are sparse and must remain visible with
+            # Python's default WARNING threshold when no logging config exists.
+            logger.warning("trade_lifecycle %s", json.dumps(record, ensure_ascii=False, default=str))
+
+    def record_ticker_entry_candidates(self, symbol: str, price: float) -> None:
+        """Record active-plan crossings immediately when an accepted ticker arrives."""
+        symbol = symbol.upper()
+        eligible_signal_ids = set(self._entry_eligible_pending_ids.get(symbol, set()))
+        previous = self.trade_manager.get_entry_reference_price(symbol)
+        if previous is None:
+            return
+        for trade in self.trade_manager.get_pending_trades():
+            if str(trade.get("symbol", "")).upper() != symbol:
+                continue
+            entry = float(trade["entry_price"])
+            direction = trade.get("entry_trigger_direction")
+            crossed = (
+                direction == "cross_down" and float(previous) > entry >= float(price)
+            ) or (
+                direction == "cross_up" and float(previous) < entry <= float(price)
+            )
+            if not crossed:
+                continue
+            self._log_trade_lifecycle_events([{
+                "event": "ENTRY_CROSS_DETECTED", "trade": trade,
+                "previous_price": previous, "current_price": float(price),
+                "entry_price": entry, "cross_direction": direction,
+                "entry_armed": bool(trade.get("entry_armed")),
+                "pending_active_when_ticker_received": trade.get("status") == "pending",
+                "reason": None if trade["signal_id"] in eligible_signal_ids else "NOT_ADMITTED_BY_PRIOR_SCANNER_SNAPSHOT",
+                "event_source": "ticker",
+                "ticker_received": True,
+            }], event_source="ticker")
+
+    def disarm_pending_with_diagnostics(
+        self, symbol: str, reason: str, event_source: str = "internal"
+    ) -> list[dict]:
+        events = self.trade_manager.disarm_pending_for_symbol(symbol, reason)
+        if events:
+            self._log_trade_lifecycle_events(events, event_source=event_source)
+        return events
 
     async def persist_control_state(self) -> None:
         if self.repository is None:
@@ -1503,6 +1596,7 @@ class TradingEngine:
         *,
         price_updated: bool = True,
         entry_preprocessed: bool = False,
+        event_source: str = "unknown",
     ) -> list[dict]:
         """Serialize a market-state transition and its persistence as one unit."""
         async with self.state_lock:
@@ -1554,6 +1648,7 @@ class TradingEngine:
                 symbol, last_price, stable_walls, wall_events, wall_candidates,
                 price_updated=price_updated,
                 entry_preprocessed=entry_preprocessed,
+                event_source=event_source,
             )
             if timeout_events:
                 events = timeout_events + events
@@ -1576,7 +1671,8 @@ class TradingEngine:
                 if current_strategy_state != previous_strategy_state else None
             )
             if not await self.persist_events(
-                events, strategy_states=changed_strategy_states
+                events, strategy_states=changed_strategy_states,
+                event_source=event_source,
             ):
                 # Do not leave a replacement/open/close visible in memory when
                 # its corresponding PostgreSQL transaction failed. The next
@@ -1614,6 +1710,7 @@ class TradingEngine:
         *,
         price_updated: bool = True,
         entry_preprocessed: bool = False,
+        event_source: str = "unknown",
     ) -> list[dict]:
         symbol = symbol.upper()
         if self.mode in {EngineMode.STOPPING, EngineMode.STOPPED}:
@@ -1727,7 +1824,9 @@ class TradingEngine:
             # A gap in either the price or synchronized book stream breaks the
             # continuous crossing observation. Require a fresh safe-side tick
             # before a later Entry crossing can activate a pending plan.
-            self.trade_manager.disarm_pending_for_symbol(symbol)
+            self.disarm_pending_with_diagnostics(
+                symbol, "STALE_OR_UNSYNCHRONIZED_MARKET_DATA", event_source
+            )
             self.trade_manager.discard_deferred_entry_tick(symbol)
             self._entry_eligible_pending_ids.pop(symbol, None)
         # Direct strategy unit callers may supply a synthetic price without

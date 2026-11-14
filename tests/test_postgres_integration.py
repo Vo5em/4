@@ -69,7 +69,9 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                     "DROP COLUMN historical_level_accuracy, "
                     "DROP COLUMN historical_level_touch_zone_bps, "
                     "DROP COLUMN historical_level_touch_reset_bps, "
-                    "DROP COLUMN historical_level_touch_min_separation_candles"
+                    "DROP COLUMN historical_level_touch_min_separation_candles, "
+                    "DROP COLUMN historical_level_break_confirm_bps, "
+                    "DROP COLUMN historical_level_break_confirm_candles"
                 ))
             await async_main()
             async with repository.engine.connect() as connection:
@@ -80,7 +82,8 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                     "('historical_level_pctbound', 'historical_level_min_touches', "
                     "'historical_level_extmethod', 'historical_level_accuracy', "
                     "'historical_level_touch_zone_bps', 'historical_level_touch_reset_bps', "
-                    "'historical_level_touch_min_separation_candles')"
+                    "'historical_level_touch_min_separation_candles', "
+                    "'historical_level_break_confirm_bps', 'historical_level_break_confirm_candles')"
                 ))).all()
             trendln_schema = {name: (data_type, default, nullable)
                               for name, data_type, default, nullable in trendln_columns}
@@ -89,6 +92,7 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
                 "historical_level_extmethod", "historical_level_accuracy",
                 "historical_level_touch_zone_bps", "historical_level_touch_reset_bps",
                 "historical_level_touch_min_separation_candles",
+                "historical_level_break_confirm_bps", "historical_level_break_confirm_candles",
             })
             self.assertEqual(trendln_schema["historical_level_pctbound"][0], "numeric")
             self.assertEqual(trendln_schema["historical_level_min_touches"][0], "integer")
@@ -97,6 +101,8 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             self.assertEqual(trendln_schema["historical_level_touch_zone_bps"][0], "numeric")
             self.assertEqual(trendln_schema["historical_level_touch_reset_bps"][0], "numeric")
             self.assertEqual(trendln_schema["historical_level_touch_min_separation_candles"][0], "integer")
+            self.assertEqual(trendln_schema["historical_level_break_confirm_bps"][0], "numeric")
+            self.assertEqual(trendln_schema["historical_level_break_confirm_candles"][0], "integer")
             self.assertTrue(all(column[2] == "NO" for column in trendln_schema.values()))
             self.assertIn("0.05", trendln_schema["historical_level_pctbound"][1])
             self.assertIn("1", trendln_schema["historical_level_min_touches"][1])
@@ -105,6 +111,8 @@ class PostgreSQLRepositoryIntegrationTests(unittest.TestCase):
             self.assertIn("10", trendln_schema["historical_level_touch_zone_bps"][1])
             self.assertIn("30", trendln_schema["historical_level_touch_reset_bps"][1])
             self.assertIn("3", trendln_schema["historical_level_touch_min_separation_candles"][1])
+            self.assertIn("20", trendln_schema["historical_level_break_confirm_bps"][1])
+            self.assertIn("2", trendln_schema["historical_level_break_confirm_candles"][1])
 
             defaults = TradingSettings(
                 stake_usdt=10, initial_balance_usdt=100, max_open_trades=3

@@ -102,6 +102,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
             "historical_level_touch_zone_bps": "NUMERIC",
             "historical_level_touch_reset_bps": "NUMERIC",
             "historical_level_touch_min_separation_candles": "INTEGER",
+            "historical_level_break_confirm_bps": "NUMERIC",
+            "historical_level_break_confirm_candles": "INTEGER",
         }
         for column_name, type_name in expected.items():
             column = TradingPairSetting.__table__.c[column_name]
@@ -120,6 +122,15 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertIn("HISTORICAL_LEVEL_EXTMETHOD VARCHAR(32) NOT NULL DEFAULT 'METHOD_NUMDIFF'", migration)
         self.assertIn("HISTORICAL_LEVEL_ACCURACY INTEGER NOT NULL DEFAULT 2", migration)
         self.assertNotIn("DROP TABLE", migration)
+
+        phase_migration = (
+            Path(__file__).parents[1] / "database" / "migrations"
+            / "20261112_add_trendln_phase_diagnostic_settings.sql"
+        ).read_text(encoding="utf-8").upper()
+        self.assertEqual(phase_migration.count("ADD COLUMN IF NOT EXISTS"), 2)
+        self.assertIn("HISTORICAL_LEVEL_BREAK_CONFIRM_BPS NUMERIC(18, 8) NOT NULL DEFAULT 20.0", phase_migration)
+        self.assertIn("HISTORICAL_LEVEL_BREAK_CONFIRM_CANDLES INTEGER NOT NULL DEFAULT 2", phase_migration)
+        self.assertNotIn("DROP TABLE", phase_migration)
         self.assertNotIn("DELETE FROM", migration)
         touch_migration = (
             Path(__file__).parents[1]
@@ -144,6 +155,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
             historical_level_touch_zone_bps=8,
             historical_level_touch_reset_bps=35,
             historical_level_touch_min_separation_candles=5,
+            historical_level_break_confirm_bps=25,
+            historical_level_break_confirm_candles=3,
         )
         with patch.object(repository, "async_session", return_value=session):
             run_immediate(repository.save_pair_settings(settings))
@@ -154,6 +167,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(row.historical_level_touch_zone_bps, 8)
         self.assertEqual(row.historical_level_touch_reset_bps, 35)
         self.assertEqual(row.historical_level_touch_min_separation_candles, 5)
+        self.assertEqual(row.historical_level_break_confirm_bps, 25)
+        self.assertEqual(row.historical_level_break_confirm_candles, 3)
         self.assertEqual(row.min_wall_ratio, 777)
         self.assertEqual(session.commits, 1)
 
@@ -170,6 +185,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
         pair_row.historical_level_touch_zone_bps = None
         pair_row.historical_level_touch_reset_bps = None
         pair_row.historical_level_touch_min_separation_candles = None
+        pair_row.historical_level_break_confirm_bps = None
+        pair_row.historical_level_break_confirm_candles = None
         session = FakeSession({RuntimeState: [state_row], TradingPairSetting: [pair_row]})
 
         async def create_tables():
@@ -191,6 +208,8 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(settings.historical_level_touch_zone_bps, 10.0)
         self.assertEqual(settings.historical_level_touch_reset_bps, 30.0)
         self.assertEqual(settings.historical_level_touch_min_separation_candles, 3)
+        self.assertEqual(settings.historical_level_break_confirm_bps, 20.0)
+        self.assertEqual(settings.historical_level_break_confirm_candles, 2)
 
     def test_cancelled_cleanup_uses_one_hour_retention_and_minute_interval(self):
         if "CANCELLED_TRADE_RETENTION_MINUTES" not in os.environ:

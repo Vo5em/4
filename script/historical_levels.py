@@ -11,6 +11,7 @@ import time
 import aiohttp
 
 from .independent_touches import count_independent_touches
+from .level_phase import analyze_level_phase
 
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
@@ -147,6 +148,8 @@ async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
         "historical_level_touch_zone_bps": settings.historical_level_touch_zone_bps,
         "historical_level_touch_reset_bps": settings.historical_level_touch_reset_bps,
         "historical_level_touch_min_separation_candles": settings.historical_level_touch_min_separation_candles,
+        "historical_level_break_confirm_bps": settings.historical_level_break_confirm_bps,
+        "historical_level_break_confirm_candles": settings.historical_level_break_confirm_candles,
     }
     candles = await fetch_closed_bybit_candles(
         symbol, settings.historical_level_timeframe,
@@ -179,6 +182,15 @@ async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
         ),
         "independent_touch_parameters": dict(touch_parameters),
         "independent_touch_calculated_at": calculated_at,
+        **analyze_level_phase(
+            level["price"], candles,
+            break_confirm_bps=settings.historical_level_break_confirm_bps,
+            break_confirm_candles=settings.historical_level_break_confirm_candles,
+            touch_zone_bps=settings.historical_level_touch_zone_bps,
+            touch_reset_bps=settings.historical_level_touch_reset_bps,
+            touch_min_separation_candles=settings.historical_level_touch_min_separation_candles,
+        ),
+        "current_phase_calculated_at": calculated_at,
     } for level in levels)
     return {
         "levels": enriched_levels,

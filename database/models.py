@@ -106,6 +106,13 @@ class TradingPairSetting(Base):
     historical_level_touch_min_separation_candles: Mapped[int] = mapped_column(
         nullable=False, default=3, server_default=text("3")
     )
+    historical_level_break_confirm_bps: Mapped[float] = mapped_column(
+        Numeric(18, 8, asdecimal=False), nullable=False, default=20.0,
+        server_default=text("20.0")
+    )
+    historical_level_break_confirm_candles: Mapped[int] = mapped_column(
+        nullable=False, default=2, server_default=text("2")
+    )
     max_wall_level_distance_bps: Mapped[float] = mapped_column(
         Numeric(18, 8, asdecimal=False), nullable=False, default=13.0, server_default=text("13")
     )
@@ -260,6 +267,8 @@ async def async_main() -> None:
             ("historical_level_touch_zone_bps", "NUMERIC(18,8) NOT NULL DEFAULT 10.0"),
             ("historical_level_touch_reset_bps", "NUMERIC(18,8) NOT NULL DEFAULT 30.0"),
             ("historical_level_touch_min_separation_candles", "INTEGER NOT NULL DEFAULT 3"),
+            ("historical_level_break_confirm_bps", "NUMERIC(18,8) NOT NULL DEFAULT 20.0"),
+            ("historical_level_break_confirm_candles", "INTEGER NOT NULL DEFAULT 2"),
             ("max_wall_level_distance_bps", "NUMERIC(18,8) NOT NULL DEFAULT 13"),
             ("false_breakout_point_1_offset_bps", "NUMERIC(18,8)"),
             ("false_breakout_point_2_distance_bps", "NUMERIC(18,8)"),

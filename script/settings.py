@@ -51,6 +51,8 @@ class PairSettings:
     historical_level_touch_zone_bps: float = 10.0
     historical_level_touch_reset_bps: float = 30.0
     historical_level_touch_min_separation_candles: int = 3
+    historical_level_break_confirm_bps: float = 20.0
+    historical_level_break_confirm_candles: int = 2
     max_wall_level_distance_bps: float = 13.0
     false_breakout_point_1_offset_bps: float | None = None
     false_breakout_point_2_distance_bps: float | None = None
@@ -184,6 +186,20 @@ class PairSettings:
             or self.historical_level_touch_min_separation_candles < 1
         ):
             raise ValueError("historical_level_touch_min_separation_candles must be a positive integer")
+        if (
+            isinstance(self.historical_level_break_confirm_bps, bool)
+            or not isinstance(self.historical_level_break_confirm_bps, (int, float))
+            or not isfinite(self.historical_level_break_confirm_bps)
+            or self.historical_level_break_confirm_bps <= 0
+        ):
+            raise ValueError("historical_level_break_confirm_bps must be positive and finite")
+        object.__setattr__(self, "historical_level_break_confirm_bps", float(self.historical_level_break_confirm_bps))
+        if (
+            isinstance(self.historical_level_break_confirm_candles, bool)
+            or not isinstance(self.historical_level_break_confirm_candles, int)
+            or self.historical_level_break_confirm_candles < 1
+        ):
+            raise ValueError("historical_level_break_confirm_candles must be a positive integer")
         if not isfinite(self.max_wall_level_distance_bps) or self.max_wall_level_distance_bps <= 0:
             raise ValueError("max_wall_level_distance_bps must be positive")
 
