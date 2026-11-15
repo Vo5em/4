@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from script.level_phase import analyze_level_phase
+from script.level_phase import analyze_level_phase, classify_level_trading_status
 from script.settings import PairSettings
 from script.strategies import StrategyContext, CombinedStrategy
 
@@ -20,6 +20,127 @@ def c(close, low=None, high=None, closed=True):
 
 
 class LevelPhaseTests(unittest.TestCase):
+    def test_confirmed_support_with_post_phase_touch_is_active(self):
+        result = analyze_level_phase(100, [
+            c(99.5), c(99.5), c(100.3), c(100.3),
+            c(100.0, 99.95, 100.05), c(100.5), c(100.5), c(100.5),
+            c(100.0, 99.95, 100.05),
+        ])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "SUPPORT", **result}, 100.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(result["current_phase_touch_count"], 2)
+        self.assertEqual(status["trading_status"], "ACTIVE")
+        self.assertEqual(status["price_position"], "BELOW")
+
+    def test_confirmed_resistance_with_three_touches_is_active(self):
+        candles = [c(100.5), c(100.5), c(99.5), c(99.5)]
+        for _ in range(3):
+            candles.extend([c(99.5), c(99.5), c(99.5), c(100, 99.95, 100.05)])
+        result = analyze_level_phase(100, candles)
+        status = classify_level_trading_status(
+            {"price": 100, "type": "RESISTANCE", **result}, 99.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(result["current_phase_touch_count"], 3)
+        self.assertEqual(status["trading_status"], "ACTIVE")
+
+    def test_wick_past_support_with_close_above_is_not_broken(self):
+        result = analyze_level_phase(100, [
+            c(99.5), c(99.5), c(100.3), c(100.3),
+            c(100.3, 99.0, 100.4), c(100.3),
+            c(100.0, 99.95, 100.05),
+        ])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "SUPPORT", **result}, 100.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertNotEqual(status["trading_status"], "BROKEN")
+
+    def test_wick_past_resistance_with_close_below_is_not_broken(self):
+        result = analyze_level_phase(100, [
+            c(100.5), c(100.5), c(99.5), c(99.5),
+            c(99.5, 99.0, 101.0), c(99.5), c(100, 99.95, 100.05),
+        ])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "RESISTANCE", **result}, 99.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertNotEqual(status["trading_status"], "BROKEN")
+
+    def test_one_confirmed_close_is_not_broken_when_two_are_required(self):
+        result = analyze_level_phase(100, [
+            c(99.5), c(99.5), c(100.3), c(100.3), c(99.7),
+            c(100.3), c(100.3), c(100.0, 99.95, 100.05),
+        ])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "SUPPORT", **result}, 100.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertNotEqual(status["trading_status"], "BROKEN")
+
+    def test_two_confirmed_closes_break_support_without_role_flip(self):
+        result = analyze_level_phase(100, [
+            c(99.5), c(99.5), c(100.3), c(100.3), c(99.7), c(99.7),
+        ])
+        level = {"price": 100, "type": "SUPPORT", **result}
+        status = classify_level_trading_status(
+            level, 99.5, 0.01, price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(status["trading_status"], "BROKEN")
+        self.assertEqual(level["type"], "SUPPORT")
+        self.assertIsNotNone(status["last_confirmed_break_at"])
+
+    def test_resistance_break_does_not_become_support(self):
+        result = analyze_level_phase(100, [
+            c(100.5), c(100.5), c(99.5), c(99.5), c(100.3), c(100.3),
+        ])
+        level = {"price": 100, "type": "RESISTANCE", **result}
+        status = classify_level_trading_status(
+            level, 100.5, 0.01, price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(status["trading_status"], "BROKEN")
+        self.assertEqual(level["type"], "RESISTANCE")
+
+    def test_rolling_window_without_phase_boundary_stays_unconfirmed_after_restart(self):
+        result = analyze_level_phase(100, [c(99.5) for _ in range(12)])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "SUPPORT", **result}, 99.0, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertFalse(result["phase_origin_known"])
+        self.assertEqual(status["trading_status"], "UNCONFIRMED")
+
+    def test_new_same_price_phase_requires_new_post_boundary_touch(self):
+        result = analyze_level_phase(100, [
+            c(100.3), c(100.3), c(99.7), c(99.7),  # old support broke
+            c(100.3), c(100.3),  # confirmed reclaim/new phase
+            c(100.0, 99.95, 100.05),
+        ])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "SUPPORT", **result}, 100.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(result["current_phase_touch_count"], 1)
+        self.assertEqual(status["trading_status"], "ACTIVE")
+        self.assertIsNotNone(status["last_confirmed_break_at"])
+
+    def test_unknown_or_stale_data_never_marks_level_active(self):
+        result = analyze_level_phase(100, [
+            c(99.5), c(99.5), c(100.3), c(100.3), c(100, 99.95, 100.05),
+        ])
+        level = {"price": 100, "type": "SUPPORT", **result}
+        for kwargs in (
+            {"price_fresh": False, "snapshot_fresh": True},
+            {"price_fresh": True, "snapshot_fresh": False},
+        ):
+            status = classify_level_trading_status(level, 100.5, 0.01, **kwargs)
+            self.assertEqual(status["trading_status"], "UNCONFIRMED")
+        self.assertEqual(classify_level_trading_status(
+            level, 100.5, None, price_fresh=True, snapshot_fresh=True,
+        )["trading_status"], "UNCONFIRMED")
+
     def test_old_consolidation_excluded_after_confirmed_break_and_return_touches_count(self):
         candles = [
             c(100.3, 100.0, 100.4), c(100.35, 100.0, 100.4),

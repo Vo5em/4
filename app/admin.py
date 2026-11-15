@@ -21,6 +21,7 @@ from app.runtime import (
 )
 from script.engine import StrategyPersistenceError
 from script.engine import EngineMode
+from script.level_phase import classify_level_trading_status
 from script.settings import PairSettings
 from script.trade_levels import (
     ENTRY_DISTANCE_BPS,
@@ -444,12 +445,15 @@ def _trendln_role(level_price: float, last_price: float, tick_size: float | None
 
 
 def _trendln_phase_status(level: dict) -> str:
-    state = level.get("freshness_state") or "нет данных"
-    structure = level.get("structure_state") or "нет данных"
-    reason = level.get("freshness_reason") or "причина не указана"
-    transition = level.get("last_confirmed_transition_at") or "нет"
+    status = level.get("trading_status") or "UNCONFIRMED"
+    reason = level.get("trading_status_reason") or level.get("freshness_reason") or "причина не указана"
+    analyzer = level.get("freshness_state")
+    analyzer_reason = level.get("freshness_reason")
     phase_start = level.get("current_phase_started_at") or "не определено"
-    return f"{structure}/{state}; фаза с {phase_start}; переход {transition}; {reason}"
+    transition = level.get("last_confirmed_transition_at") or "нет"
+    analyzer_text = f"; анализ свечей {analyzer}" if analyzer else ""
+    reason_text = f"; {analyzer_reason}" if analyzer_reason and analyzer_reason != reason else ""
+    return f"{status}{analyzer_text}; граница фазы {phase_start}; переход {transition}; {reason}{reason_text}"
 
 
 def _trendln_snapshot_state(runtime: RuntimeController, symbol: str) -> dict:
@@ -518,24 +522,41 @@ def _trendln_actual_settings_text(snapshot: dict) -> str:
 
 
 def _trendln_level_rows(snapshot: dict) -> tuple[list[dict], list[dict], list[dict]]:
-    if not snapshot["price_fresh"]:
-        return [], [], []
-    price = float(snapshot["last_price"])
+    price = float(snapshot["last_price"]) if snapshot["price_fresh"] else None
     tick_size = snapshot["tick_size"]
     above, below, at_level = [], [], []
     for level in snapshot["levels"]:
         level_price = float(level["price"])
-        role, position, signed_bps = _trendln_role(level_price, price, tick_size)
+        if price is not None:
+            _role, position, signed_bps = _trendln_role(level_price, price, tick_size)
+        else:
+            position, signed_bps = "NO_DATA", 0.0
+        phase = classify_level_trading_status(
+            level, price, tick_size,
+            price_fresh=snapshot["price_fresh"],
+            snapshot_fresh=(not snapshot["stale"] and snapshot["updated_at"] is not None
+                            and snapshot["error"] is None),
+        )
+        filter_enabled = snapshot["current_settings"].historical_level_active_filter_enabled
+        expected_position = "BELOW" if str(level.get("type", "")).upper() == "SUPPORT" else "ABOVE"
+        filter_passes = phase["trading_status"] == "ACTIVE" and phase["price_position"] == expected_position
         row = {
             **level,
-            "current_role": role,
             "position": position,
             "signed_distance_bps": signed_bps,
+            **phase,
+            "historical_filter_enabled": filter_enabled,
+            "historical_filter_passes": filter_passes if filter_enabled else None,
+            "historical_filter_reason": (
+                "допущен: ACTIVE, исторический тип и положение согласованы"
+                if filter_passes else phase["trading_status_reason"]
+            ) if filter_enabled else "торговый фильтр выключен; действует прежний отбор",
         }
         target = {
             "выше цены": above,
             "ниже цены": below,
             "AT_LEVEL": at_level,
+            "NO_DATA": above,
         }[position]
         target.append(row)
     above.sort(key=lambda level: abs(level["signed_distance_bps"]))
@@ -563,29 +584,46 @@ def _trendln_wall_matches(runtime: RuntimeController, symbol: str, snapshot: dic
             if level_price <= 0:
                 continue
             distance_bps = abs(wall_price - level_price) / level_price * 10000
-            current_role = "нет данных"
+            current_position = "нет данных"
             if last_price is not None:
-                current_role, _position, _signed = _trendln_role(
+                _role, current_position, _signed = _trendln_role(
                     level_price, last_price, snapshot["tick_size"]
                 )
+            phase = classify_level_trading_status(
+                level, last_price, snapshot["tick_size"],
+                price_fresh=snapshot["price_fresh"],
+                snapshot_fresh=(not snapshot["stale"] and snapshot["updated_at"] is not None
+                                and snapshot["error"] is None),
+            )
+            filter_enabled = runtime.engine.pair_settings[symbol].historical_level_active_filter_enabled
+            filter_passes = (
+                phase["trading_status"] == "ACTIVE"
+                and phase["price_position"] == ("BELOW" if expected_type == "SUPPORT" else "ABOVE")
+            )
             matches.append({
                 "side": "BID" if side == "buy" else "ASK",
                 "wall_price": wall_price,
                 "wall_ratio": wall.get("wall_ratio"),
                 "level_price": level_price,
                 "historical_type": str(level.get("type", "нет данных")).upper(),
-                "current_role": current_role,
+                "price_position": phase["price_position"],
+                "current_position_label": current_position,
                 "touch_count": level.get("touch_count", "нет данных"),
                 "independent_touch_count": level.get("independent_touch_count"),
                 "current_phase_touch_count": level.get("current_phase_touch_count"),
                 "freshness_state": level.get("freshness_state"),
                 "structure_state": level.get("structure_state"),
                 "freshness_reason": level.get("freshness_reason"),
+                **phase,
+                "filter_enabled": filter_enabled,
+                "filter_passes": filter_passes if filter_enabled else None,
                 "current_phase_started_at": level.get("current_phase_started_at"),
                 "last_confirmed_transition_at": level.get("last_confirmed_transition_at"),
                 "distance_bps": distance_bps,
                 "maximum_bps": maximum_bps,
-                "passes": distance_bps <= maximum_bps,
+                "distance_passes": distance_bps <= maximum_bps,
+                "passes": distance_bps <= maximum_bps and (filter_passes if filter_enabled else True),
+                "filter_reason": phase["trading_status_reason"] if filter_enabled else "фильтр выключен",
             })
     matches.sort(key=lambda item: (item["side"], item["wall_price"], item["distance_bps"]))
     return matches
@@ -644,56 +682,70 @@ def trendln_levels_text(
     elif section == "levels":
         above, below, at_level = _trendln_level_rows(snapshot)
         if not snapshot["price_fresh"]:
-            body = "Нет уровней, классифицированных по текущей цене. Обновите рыночные данные."
-            page_count = 1
-            page = 0
+            page_count = max(1, (len(above) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
+            page = min(max(0, int(page)), page_count - 1)
+            selected = above[page * _TRENDLN_DISPLAY_PAGE_SIZE:(page + 1) * _TRENDLN_DISPLAY_PAGE_SIZE]
+            rows_text = "\n".join(
+                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+                f"позиция не определена · {_trendln_phase_status(row)} · "
+                f"Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
+                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+                f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'}"
+                for row in selected
+            ) or "Нет сохранённых уровней."
+            body = f"Last Price устарела или недоступна; уровни не считаются ACTIVE. · стр. {page + 1}/{page_count}\n{rows_text}"
         else:
-            page_count = max(
-                1,
-                (max(len(above), len(below), len(at_level)) + _TRENDLN_DISPLAY_PAGE_SIZE - 1)
-                // _TRENDLN_DISPLAY_PAGE_SIZE,
+            entries = (
+                [("above", row) for row in above]
+                + [("at", row) for row in at_level]
+                + [("below", row) for row in below]
             )
+            page_count = max(1, (len(entries) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
             page = min(max(0, int(page)), page_count - 1)
             first = page * _TRENDLN_DISPLAY_PAGE_SIZE
-            upper = above[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
-            lower = below[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
-            at_price = at_level[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
+            selected = entries[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
+            upper = [row for group, row in selected if group == "above"]
+            at_price = [row for group, row in selected if group == "at"]
+            lower = [row for group, row in selected if group == "below"]
             tick_label = (
-                f"tickSize {snapshot['tick_size']:g}"
-                if snapshot["tick_size"] else "tickSize нет данных; AT_LEVEL только при точном совпадении"
-            )
+            f"tickSize {snapshot['tick_size']:g}"
+            if snapshot["tick_size"] else "tickSize нет данных; AT_LEVEL только при точном совпадении"
+        )
             upper_text = "\n".join(
-                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-                f"сейчас {row['current_role']} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-                f"фаза {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
-                f"{_trendln_phase_status(row)} · "
-                f"+{row['signed_distance_bps']:.2f} bps"
-                for row in upper
-            ) or "Нет уровней сверху."
+            f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+            f"позиция {row['position']} · {_trendln_phase_status(row)} · "
+            f"фильтр {escape(row['historical_filter_reason'])} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
+            f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+            f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
+            f"последний подтверждённый пробой {row.get('last_confirmed_break_at') or 'нет'} · "
+            f"+{row['signed_distance_bps']:.2f} bps"
+            for row in upper
+        ) or "Нет уровней сверху."
             lower_text = "\n".join(
-                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-                f"сейчас {row['current_role']} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-                f"фаза {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
-                f"{_trendln_phase_status(row)} · "
-                f"{row['signed_distance_bps']:.2f} bps"
-                for row in lower
-            ) or "Нет уровней снизу."
+            f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+            f"позиция {row['position']} · {_trendln_phase_status(row)} · "
+            f"фильтр {escape(row['historical_filter_reason'])} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
+            f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+            f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
+            f"последний подтверждённый пробой {row.get('last_confirmed_break_at') or 'нет'} · "
+            f"{row['signed_distance_bps']:.2f} bps"
+            for row in lower
+        ) or "Нет уровней снизу."
             at_text = "\n".join(
-                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-                f"сейчас AT_LEVEL · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-                f"фаза {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
-                f"{_trendln_phase_status(row)}"
-                for row in at_price
-            ) or "Нет уровней в пределах tickSize."
+            f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
+            f"позиция AT_LEVEL · {_trendln_phase_status(row)} · "
+            f"фильтр {escape(row['historical_filter_reason'])} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
+            f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
+            f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
+            f"последний подтверждённый пробой {row.get('last_confirmed_break_at') or 'нет'}"
+            for row in at_price
+        ) or "Нет уровней в пределах tickSize."
             body = (
-                f"БЛИЖАЙШИЕ СВЕРХУ · стр. {page + 1}/{page_count}:\n{upper_text}\n\n"
-                f"НА УРОВНЕ ЦЕНЫ:\n{at_text}\n\n"
-                f"БЛИЖАЙШИЕ СНИЗУ · стр. {page + 1}/{page_count}:\n{lower_text}\n\n"
-                f"Допуск AT_LEVEL: {tick_label}"
-            )
+            f"БЛИЖАЙШИЕ СВЕРХУ · стр. {page + 1}/{page_count}:\n{upper_text}\n\n"
+            f"НА УРОВНЕ ЦЕНЫ:\n{at_text}\n\n"
+            f"БЛИЖАЙШИЕ СНИЗУ · стр. {page + 1}/{page_count}:\n{lower_text}\n\n"
+            f"Допуск AT_LEVEL: {tick_label}"
+        )
     else:
         matches = _trendln_wall_matches(runtime, symbol, snapshot)
         page_count = max(1, (len(matches) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
@@ -709,10 +761,11 @@ def trendln_levels_text(
                 rows.append(
                     f"{item['side']} стена {item['wall_price']:g} · ratio {ratio}\n"
                     f"уровень {item['level_price']:g} · исторически {item['historical_type']} · "
-                    f"текущая роль {item['current_role']} · Pivots Trendln {item['touch_count']} · "
+                    f"позиция {item['price_position']} · статус {item['trading_status']} · "
+                    f"фильтр {escape(item['filter_reason'])} · Pivots Trendln {item['touch_count']} · "
                     f"самостоятельные касания {item.get('independent_touch_count') if item.get('independent_touch_count') is not None else 'нет данных'} · "
-                    f"фаза {item.get('current_phase_touch_count') if item.get('current_phase_touch_count') is not None else 'нет данных'} · "
-                    f"{_trendln_phase_status(item)}\n"
+                    f"касания структуры {item.get('current_phase_touch_count') if item.get('current_phase_touch_count') is not None else 'нет данных'} · "
+                    f"последний подтверждённый пробой {item.get('last_confirmed_break_at') or 'нет данных'}\n"
                     f"дистанция стена↔уровень {item['distance_bps']:.2f}/{item['maximum_bps']:g} bps · {passed}"
                 )
             body = f"STABLE-сопоставления · стр. {page + 1}/{page_count}\n\n" + "\n\n".join(rows)
@@ -831,6 +884,7 @@ def pair_settings_card_text(runtime: RuntimeController, symbol: str, section: st
             ("historical_level_touch_min_separation_candles", settings.historical_level_touch_min_separation_candles),
             ("historical_level_break_confirm_bps", settings.historical_level_break_confirm_bps),
             ("historical_level_break_confirm_candles", settings.historical_level_break_confirm_candles),
+            ("historical_level_active_filter_enabled", settings.historical_level_active_filter_enabled),
             ("max_wall_level_distance_bps", settings.max_wall_level_distance_bps),
         ),
         "strategies": (
@@ -869,8 +923,14 @@ def pair_settings_card_text(runtime: RuntimeController, symbol: str, section: st
         )
         lines.append(_trendln_actual_settings_text(snapshot))
         lines.append(
-            "Самостоятельные касания — диагностика, торговые стратегии по-прежнему используют Pivots Trendln. "
+            "Самостоятельные касания — диагностика; Combined пока использует Pivots Trendln. "
             "reset_bps должен быть больше touch_zone_bps."
+        )
+        lines.append(
+            "Фильтр актуальных уровней: "
+            + ("включён для новых сценариев" if settings.historical_level_active_filter_enabled
+               else "выключен; используется прежний отбор")
+            + ". Введите: <code>SYMBOL historical_level_active_filter_enabled true|false</code>."
         )
         lines.append("Полный список уровней и STABLE-сопоставления: кнопка «Уровни Trendln».")
     if section == "strategies":
@@ -930,7 +990,7 @@ def trendln_levels_keyboard(
         total = len(_trendln_wall_matches(runtime, symbol, snapshot))
     else:
         above, below, at_level = _trendln_level_rows(snapshot)
-        total = max(len(above), len(below), len(at_level))
+        total = len(above) + len(below) + len(at_level)
     pages = max(1, (total + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
     page = max(0, min(int(page), pages - 1))
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1698,6 +1758,11 @@ async def update_pair_settings(
             await message.answer("Для enabled используйте true/false.")
             return
         value = raw_value.lower() in {"true", "1", "on"}
+    elif parameter == "historical_level_active_filter_enabled":
+        if raw_value.lower() not in {"true", "false", "1", "0", "on", "off"}:
+            await message.answer("Для historical_level_active_filter_enabled используйте true/false.")
+            return
+        value = raw_value.lower() in {"true", "1", "on"}
     elif parameter == "historical_level_timeframe":
         value = raw_value
     elif parameter == "historical_level_extmethod":
@@ -1747,6 +1812,7 @@ async def update_pair_settings(
         "historical_level_touch_min_separation_candles": "levels",
         "historical_level_break_confirm_bps": "levels",
         "historical_level_break_confirm_candles": "levels",
+        "historical_level_active_filter_enabled": "levels",
         "max_wall_level_distance_bps": "levels",
         "bounce_take_profit_bps": "strategies", "bounce_stop_loss_bps": "strategies",
         "breakout_take_profit_bps": "strategies", "breakout_stop_loss_bps": "strategies",

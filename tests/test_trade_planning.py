@@ -175,6 +175,67 @@ class TradingPlanLifecycleTests(unittest.TestCase):
             "ETHUSDT", price, walls, (), walls, price_updated=price_updated
         )
 
+    def test_active_level_filter_gates_new_pending_and_grandfathers_existing_pending(self):
+        settings = PairSettings(
+            "ETHUSDT", max_wall_distance_bps=1000,
+            max_wall_level_distance_bps=1000, min_wall_age_seconds=0,
+            historical_level_active_filter_enabled=True,
+        )
+        engine = TradingEngine(
+            {"ETHUSDT": settings},
+            TradingSettings(stake_usdt=10, initial_balance_usdt=1000),
+            enabled_strategies={"ETHUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        wall = self.wall("buy", 100, "filter-wall")
+        active_support = {
+            "price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1,
+            "phase_origin_known": True, "current_phase_side": "above",
+            "current_phase_touch_count": 1,
+        }
+        engine.set_historical_levels("ETHUSDT", (active_support,))
+        engine.start()
+        self.update(engine, 100.5, [wall])
+        pending, = engine.trade_manager.get_pending_trades()
+
+        broken_support = {
+            **active_support,
+            "current_phase_side": "below",
+            "current_phase_touch_count": 0,
+        }
+        engine.set_historical_levels("ETHUSDT", (broken_support,))
+        self.update(engine, 100.5, [wall])
+        still_pending, = engine.trade_manager.get_pending_trades()
+        self.assertEqual(still_pending["signal_id"], pending["signal_id"])
+        trace = engine.wall_diagnostics["ETHUSDT"]["planner_wall_decisions"][0]["strategies"][0]
+        self.assertTrue(trace["pending_preserved"])
+        self.assertIn("только к новым планам", trace["trade_planner_reason"])
+
+    def test_broken_historical_level_does_not_create_new_pending_when_filter_enabled(self):
+        settings = PairSettings(
+            "ETHUSDT", max_wall_distance_bps=1000,
+            max_wall_level_distance_bps=1000, min_wall_age_seconds=0,
+            historical_level_active_filter_enabled=True,
+        )
+        engine = TradingEngine(
+            {"ETHUSDT": settings},
+            TradingSettings(stake_usdt=10, initial_balance_usdt=1000),
+            enabled_strategies={"ETHUSDT": {BOUNCE_STRATEGY_ID}},
+        )
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        wall = self.wall("buy", 100, "broken-filter-wall")
+        engine.set_historical_levels("ETHUSDT", ({
+            "price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1,
+            "phase_origin_known": True, "current_phase_side": "below",
+            "current_phase_touch_count": 0,
+        },))
+        engine.start()
+        self.update(engine, 100.5, [wall])
+        self.assertEqual(engine.trade_manager.get_pending_trades(), [])
+        trace = engine.wall_diagnostics["ETHUSDT"]["planner_wall_decisions"][0]["strategies"][0]
+        self.assertFalse(trace["historical_level_filter"]["passed"])
+        self.assertEqual(trace["historical_level_filter"]["candidate_status"], "BROKEN")
+
     class Repository:
         def __init__(self):
             self.fail = False

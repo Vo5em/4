@@ -23,6 +23,7 @@ from .trade_levels import (
     calculate_trade_levels, effective_strategy_trade_level_bps,
     effective_trade_level_bps,
 )
+from .level_phase import classify_level_trading_status
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,37 @@ class TradingEngine:
         diagnostics["historical_level_error"] = error
         diagnostics["historical_level_candles_analyzed"] = self.historical_level_candles_analyzed[symbol]
         diagnostics["historical_level_applied_settings"] = self.historical_level_applied_settings[symbol]
+
+    def _historical_levels_for_market(self, symbol: str, last_price: float) -> tuple[dict, ...]:
+        """Attach current, freshness-aware phase status without mutating snapshots."""
+        symbol = symbol.upper()
+        settings = self.pair_settings.get(symbol)
+        updated_at = self.historical_levels_updated_at.get(symbol)
+        applied = self.historical_level_applied_settings.get(symbol) or {}
+        refresh = applied.get(
+            "historical_level_refresh_seconds",
+            settings.historical_level_refresh_seconds if settings else 0,
+        )
+        age = None
+        if updated_at is not None:
+            normalized = updated_at if updated_at.tzinfo else updated_at.replace(tzinfo=timezone.utc)
+            age = max(0.0, (self._utc_now() - normalized).total_seconds())
+        snapshot_fresh = bool(
+            self.historical_level_errors.get(symbol) is None
+            and updated_at is not None and age is not None
+            and isinstance(refresh, (int, float)) and refresh > 0 and age <= refresh
+        )
+        health = self.get_market_data_health(symbol) if self._has_market_data_metadata(symbol) else {}
+        price_fresh = bool(health.get("price_fresh", last_price > 0))
+        tick_size = self.instrument_tick_sizes.get(symbol)
+        levels = self.historical_levels.get(symbol, ())
+        return tuple({
+            **level,
+            **classify_level_trading_status(
+                level, last_price, tick_size,
+                price_fresh=price_fresh, snapshot_fresh=snapshot_fresh,
+            ),
+        } for level in levels)
 
     @staticmethod
     def _utc_now() -> datetime:
@@ -1764,7 +1796,7 @@ class TradingEngine:
                 settings=settings,
                 now=monotonic(),
                 price_updated=price_updated,
-                historical_levels=self.historical_levels.get(symbol, ()),
+                historical_levels=self._historical_levels_for_market(symbol, last_price),
                 trade_states=tuple(dict(trade) for trade in self.trade_manager.trades),
                 tick_size=self.instrument_tick_sizes.get(symbol),
                 default_take_profit_bps=self.trading_settings.default_take_profit_bps,
@@ -2016,7 +2048,7 @@ class TradingEngine:
             settings=settings,
             now=monotonic(),
             price_updated=price_updated,
-            historical_levels=self.historical_levels.get(symbol, ()),
+            historical_levels=self._historical_levels_for_market(symbol, last_price),
             trade_states=tuple(dict(trade) for trade in self.trade_manager.trades),
             tick_size=self.instrument_tick_sizes.get(symbol),
             default_take_profit_bps=self.trading_settings.default_take_profit_bps,
@@ -2355,6 +2387,33 @@ class TradingEngine:
                                 "но временно находится по другой стороне Last Price."
                             )
                         continue
+                    if pending_trade.get("wall_id") in stable_ids:
+                        planner_row = rows.get(pending_trade.get("wall_id"), {})
+                        trace = next((
+                            item for item in planner_row.get("strategies", [])
+                            if item.get("strategy_id") == strategy.strategy_id
+                        ), {})
+                        level_filter = trace.get("historical_level_filter") or {}
+                        if (settings.historical_level_active_filter_enabled
+                                and level_filter.get("enabled")
+                                and level_filter.get("passed") is False
+                                and level_filter.get("candidate_status")):
+                            # The opt-in filter gates new plans only. Existing
+                            # PENDING is grandfathered while its Scanner wall
+                            # remains STABLE; normal wall reconciliation still
+                            # cancels it when the wall loses eligibility.
+                            eligible_pending_ids.add(pending_trade["signal_id"])
+                            if trace:
+                                trace["pending_preserved"] = True
+                                trace["pending_signal_id"] = pending_trade["signal_id"]
+                                trace["trade_planner_reason"] = (
+                                    "Существующий PENDING сохранён: фильтр актуальности "
+                                    "применяется только к новым планам."
+                                )
+                            reconciliation["pending_preserved_by_historical_filter"] = (
+                                reconciliation.get("pending_preserved_by_historical_filter", 0) + 1
+                            )
+                            continue
                     cancel_events = self.trade_manager.cancel_pending_for_plan(
                         symbol, strategy.strategy_id, pending_trade["wall_id"],
                         "NO_STABLE_WALL" if not stable_walls else "WALL_NO_LONGER_QUALIFIES",

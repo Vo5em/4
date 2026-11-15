@@ -247,10 +247,20 @@ class FalseBreakoutStrategy:
         if (context.tick_size and point_1_bps is not None and point_2_bps is not None
                 and observation_timeout is not None):
             for wall_id, wall in stable_by_id.items():
-                level = nearest_matching_level(
+                raw_level = nearest_matching_level(
                     wall, context.historical_levels,
                     context.settings.max_wall_level_distance_bps,
                 )
+                filter_enabled = context.settings.historical_level_active_filter_enabled
+                level = nearest_matching_level(
+                    wall, context.historical_levels,
+                    context.settings.max_wall_level_distance_bps,
+                    active_only=filter_enabled,
+                ) if filter_enabled else raw_level
+                if filter_enabled and level is None and raw_level is not None:
+                    # Existing OBSERVING/POINT_1/PENDING scenarios are handled
+                    # below and are never invalidated by a later toggle.
+                    continue
                 if level is None or wall_id in scenarios:
                     continue
                 try:
@@ -423,7 +433,9 @@ class FalseBreakoutStrategy:
                 del scenarios[wall_id]
 
 
-def nearest_matching_level(wall: dict, levels: tuple[dict, ...], maximum_bps: float):
+def nearest_matching_level(
+    wall: dict, levels: tuple[dict, ...], maximum_bps: float, *, active_only: bool = False,
+):
     expected_type = "SUPPORT" if wall.get("side") == "buy" else "RESISTANCE"
     wall_price = float(wall.get("price") or 0)
     matches = []
@@ -437,6 +449,8 @@ def nearest_matching_level(wall: dict, levels: tuple[dict, ...], maximum_bps: fl
             continue
         if wall_price <= 0 or level_price <= 0 or touches < 1:
             continue
+        if active_only and not _level_passes_active_filter(level, wall.get("side")):
+            continue
         distance_bps = abs(wall_price - level_price) / level_price * 10000
         if distance_bps <= maximum_bps:
             matches.append((distance_bps, level_price, level, touches))
@@ -445,6 +459,17 @@ def nearest_matching_level(wall: dict, levels: tuple[dict, ...], maximum_bps: fl
     matches.sort(key=lambda item: (item[0], item[1]))
     distance, _, level, touches = matches[0]
     return {**level, "distance_bps": distance, "touch_count": touches}
+
+
+def _level_passes_active_filter(level: dict, wall_side: str | None) -> bool:
+    expected_type = "SUPPORT" if wall_side == "buy" else "RESISTANCE"
+    expected_position = "BELOW" if wall_side == "buy" else "ABOVE"
+    return (
+        str(level.get("type", "")).upper() == expected_type
+        and level.get("trading_status") == "ACTIVE"
+        and level.get("price_position") == expected_position
+        and level.get("trading_filter_eligible") is True
+    )
 
 
 def _wall_plan_signals(
@@ -468,14 +493,40 @@ def _wall_plan_signals(
             "conditions": [], "reasons": [],
         }
         traces.append(trace)
-        level = nearest_matching_level(
+        raw_level = nearest_matching_level(
             wall, context.historical_levels,
             context.settings.max_wall_level_distance_bps,
         )
+        filter_enabled = context.settings.historical_level_active_filter_enabled
+        level = nearest_matching_level(
+            wall, context.historical_levels,
+            context.settings.max_wall_level_distance_bps,
+            active_only=filter_enabled,
+        ) if filter_enabled else raw_level
         trace["historical_level"] = level
+        if filter_enabled:
+            trace["historical_level_filter"] = {
+                "enabled": True,
+                "passed": level is not None,
+                "candidate_status": raw_level.get("trading_status") if raw_level else None,
+                "candidate_price_position": raw_level.get("price_position") if raw_level else None,
+                "reason": (
+                    "ACTIVE-уровень правильного исторического типа и положения найден."
+                    if level is not None else
+                    (raw_level.get("trading_status_reason") or "Нет уровня нужного исторического типа в допустимой дистанции.")
+                    if raw_level is not None else
+                    "Нет уровня нужного исторического типа в допустимой дистанции."
+                ),
+            }
         level_ok = level is not None
         if not level_ok:
-            trace["reasons"].append("Нет подходящего исторического уровня нужного типа в допустимой дистанции.")
+            if filter_enabled and raw_level is not None:
+                trace["reasons"].append(
+                    "Исторический уровень исключён активным фильтром: "
+                    + str(raw_level.get("trading_status_reason") or raw_level.get("trading_status") or "нет подтверждения")
+                )
+            else:
+                trace["reasons"].append("Нет подходящего исторического уровня нужного типа в допустимой дистанции.")
         else:
             trace["conditions"].append({
                 "condition": "historical_level_distance_bps", "passed": True,

@@ -104,6 +104,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
             "historical_level_touch_min_separation_candles": "INTEGER",
             "historical_level_break_confirm_bps": "NUMERIC",
             "historical_level_break_confirm_candles": "INTEGER",
+            "historical_level_active_filter_enabled": "BOOLEAN",
         }
         for column_name, type_name in expected.items():
             column = TradingPairSetting.__table__.c[column_name]
@@ -131,6 +132,12 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertIn("HISTORICAL_LEVEL_BREAK_CONFIRM_BPS NUMERIC(18, 8) NOT NULL DEFAULT 20.0", phase_migration)
         self.assertIn("HISTORICAL_LEVEL_BREAK_CONFIRM_CANDLES INTEGER NOT NULL DEFAULT 2", phase_migration)
         self.assertNotIn("DROP TABLE", phase_migration)
+        active_filter_migration = (
+            Path(__file__).parents[1] / "database" / "migrations"
+            / "20261115_add_historical_level_active_filter.sql"
+        ).read_text(encoding="utf-8").upper()
+        self.assertIn("ADD COLUMN IF NOT EXISTS HISTORICAL_LEVEL_ACTIVE_FILTER_ENABLED BOOLEAN NOT NULL DEFAULT FALSE", active_filter_migration)
+        self.assertNotIn("DROP TABLE", active_filter_migration)
         self.assertNotIn("DELETE FROM", migration)
         touch_migration = (
             Path(__file__).parents[1]
@@ -157,6 +164,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
             historical_level_touch_min_separation_candles=5,
             historical_level_break_confirm_bps=25,
             historical_level_break_confirm_candles=3,
+            historical_level_active_filter_enabled=True,
         )
         with patch.object(repository, "async_session", return_value=session):
             run_immediate(repository.save_pair_settings(settings))
@@ -169,6 +177,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(row.historical_level_touch_min_separation_candles, 5)
         self.assertEqual(row.historical_level_break_confirm_bps, 25)
         self.assertEqual(row.historical_level_break_confirm_candles, 3)
+        self.assertTrue(row.historical_level_active_filter_enabled)
         self.assertEqual(row.min_wall_ratio, 777)
         self.assertEqual(session.commits, 1)
 
@@ -187,6 +196,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
         pair_row.historical_level_touch_min_separation_candles = None
         pair_row.historical_level_break_confirm_bps = None
         pair_row.historical_level_break_confirm_candles = None
+        pair_row.historical_level_active_filter_enabled = None
         session = FakeSession({RuntimeState: [state_row], TradingPairSetting: [pair_row]})
 
         async def create_tables():
@@ -210,6 +220,7 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(settings.historical_level_touch_min_separation_candles, 3)
         self.assertEqual(settings.historical_level_break_confirm_bps, 20.0)
         self.assertEqual(settings.historical_level_break_confirm_candles, 2)
+        self.assertFalse(settings.historical_level_active_filter_enabled)
 
     def test_cancelled_cleanup_uses_one_hour_retention_and_minute_interval(self):
         if "CANCELLED_TRADE_RETENTION_MINUTES" not in os.environ:

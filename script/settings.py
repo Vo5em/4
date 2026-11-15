@@ -53,6 +53,7 @@ class PairSettings:
     historical_level_touch_min_separation_candles: int = 3
     historical_level_break_confirm_bps: float = 20.0
     historical_level_break_confirm_candles: int = 2
+    historical_level_active_filter_enabled: bool = False
     max_wall_level_distance_bps: float = 13.0
     false_breakout_point_1_offset_bps: float | None = None
     false_breakout_point_2_distance_bps: float | None = None
@@ -200,6 +201,8 @@ class PairSettings:
             or self.historical_level_break_confirm_candles < 1
         ):
             raise ValueError("historical_level_break_confirm_candles must be a positive integer")
+        if not isinstance(self.historical_level_active_filter_enabled, bool):
+            raise ValueError("historical_level_active_filter_enabled must be a boolean")
         if not isfinite(self.max_wall_level_distance_bps) or self.max_wall_level_distance_bps <= 0:
             raise ValueError("max_wall_level_distance_bps must be positive")
 

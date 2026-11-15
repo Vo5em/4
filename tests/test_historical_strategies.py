@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock, patch
 
 from script.engine import TradingEngine
@@ -128,14 +129,14 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
         self.assertIsNone(level["current_phase_touch_count"])
         self.assertEqual(snapshot["settings"]["historical_level_break_confirm_bps"], 20.0)
         self.assertEqual(snapshot["settings"]["historical_level_break_confirm_candles"], 2)
-        self.assertNotIn("independent_touch_count", snapshot["strategy_levels"][0])
-        self.assertNotIn("current_phase_touch_count", snapshot["strategy_levels"][0])
+        self.assertIn("independent_touch_count", snapshot["strategy_levels"][0])
+        self.assertIn("current_phase_touch_count", snapshot["strategy_levels"][0])
         engine = TradingEngine({"ETHUSDT": settings})
         engine.set_historical_levels(
             "ETHUSDT", snapshot["strategy_levels"],
             diagnostic_levels=snapshot["levels"],
         )
-        self.assertNotIn("independent_touch_count", engine.historical_levels["ETHUSDT"][0])
+        self.assertIn("independent_touch_count", engine.historical_levels["ETHUSDT"][0])
         self.assertEqual(
             engine.historical_level_diagnostic_levels["ETHUSDT"][0]["independent_touch_count"], 1
         )
@@ -164,6 +165,95 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
 
 
 class StrategyLevelFilterTests(unittest.TestCase):
+    def test_opt_in_filter_rejects_broken_and_unconfirmed_levels(self):
+        settings = PairSettings(
+            "ETHUSDT", max_wall_distance_bps=1000,
+            max_wall_level_distance_bps=100,
+            historical_level_active_filter_enabled=True,
+        )
+        for state in ("BROKEN", "UNCONFIRMED", "INACTIVE"):
+            with self.subTest(state=state):
+                context = make_context(
+                    strategy_settings=settings, side="sell", price=99.5,
+                    levels=({
+                        "price": 100.0, "type": "RESISTANCE", "timeframe": "5m",
+                        "touch_count": 3, "trading_status": state,
+                        "price_position": "BELOW", "trading_filter_eligible": False,
+                        "trading_status_reason": f"{state} test reason",
+                    },),
+                )
+                signals, traces = BreakoutStrategy().evaluate_with_diagnostics(context)
+                self.assertEqual(signals, [])
+                self.assertFalse(traces[0]["historical_level_filter"]["passed"])
+                self.assertIn(state, traces[0]["reasons"][0])
+
+    def test_filter_disabled_keeps_previous_strategy_selection(self):
+        context = make_context(
+            strategy_settings=PairSettings(
+                "ETHUSDT", max_wall_distance_bps=1000,
+                max_wall_level_distance_bps=100,
+                historical_level_active_filter_enabled=False,
+            ),
+            price=99.5,
+            levels=({
+                "price": 100.0, "type": "RESISTANCE", "timeframe": "5m",
+                "touch_count": 2, "trading_status": "BROKEN",
+                "price_position": "BELOW", "trading_filter_eligible": False,
+            },),
+        )
+        signal, = BreakoutStrategy().evaluate(context)
+        self.assertEqual(signal.strategy_id, BREAKOUT_STRATEGY_ID)
+
+    def test_active_filter_does_not_retroactively_cancel_false_breakout_observation(self):
+        strategy = FalseBreakoutStrategy()
+        settings = PairSettings(
+            "ETHUSDT", max_wall_distance_bps=1000,
+            max_wall_level_distance_bps=100,
+            false_breakout_point_1_offset_bps=5,
+            false_breakout_point_2_distance_bps=10,
+            false_breakout_observation_timeout_seconds=300,
+        )
+        old_context = make_context(
+            strategy_settings=settings, price=100.0,
+            levels=({"price": 100.0, "type": "RESISTANCE", "touch_count": 2},),
+        )
+        strategy.evaluate(old_context)
+        wall_id = next(iter(strategy._scenarios["ETHUSDT"]))
+        active_filter = replace(settings, historical_level_active_filter_enabled=True)
+        context_after_toggle = make_context(
+            strategy_settings=active_filter, price=100.0,
+            levels=({
+                "price": 100.0, "type": "RESISTANCE", "touch_count": 2,
+                "trading_status": "BROKEN", "price_position": "ABOVE",
+                "trading_filter_eligible": False,
+            },),
+        )
+        strategy.evaluate(context_after_toggle)
+        self.assertEqual(strategy._scenarios["ETHUSDT"][wall_id]["status"], "OBSERVING")
+
+    def test_active_filter_blocks_creation_of_new_false_breakout_scenario(self):
+        strategy = FalseBreakoutStrategy()
+        settings = PairSettings(
+            "ETHUSDT", max_wall_distance_bps=1000,
+            max_wall_level_distance_bps=100,
+            false_breakout_point_1_offset_bps=5,
+            false_breakout_point_2_distance_bps=10,
+            false_breakout_observation_timeout_seconds=300,
+            historical_level_active_filter_enabled=True,
+        )
+        context = make_context(
+            strategy_settings=settings,
+            levels=({
+                "price": 100.0, "type": "RESISTANCE", "touch_count": 2,
+                "trading_status": "BROKEN", "price_position": "BELOW",
+                "trading_filter_eligible": False,
+            },),
+        )
+        signals, traces = strategy.evaluate_with_diagnostics(context)
+        self.assertEqual(signals, [])
+        self.assertEqual(traces, [])
+        self.assertEqual(strategy.diagnostics("ETHUSDT")["observing"], 0)
+
     def test_bounce_accepts_one_touch_and_breakout_requires_two(self):
         one_touch = make_context(price=99.5, levels=(
             {"price": 100.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1,

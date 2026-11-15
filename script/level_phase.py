@@ -1,8 +1,4 @@
-"""Diagnostic market phase and phase-local touch counts for Trendln levels.
-
-This module does not find levels and its output must not be fed to strategies.
-Only closed OHLC candles are inspected, in chronological order.
-"""
+"""Closed-candle phase analysis and conservative trading status for levels."""
 
 from __future__ import annotations
 
@@ -31,9 +27,9 @@ def analyze_level_phase(
     ``touch_reset_bps`` is used only by the independent touch counter to decide
     whether a later return is a separate interaction.
 
-    If the level was already on one side at the beginning of the available
-    window and neither a confirmed flip nor a stale-away boundary is observed,
-    the phase start predates the lookback and its touch count is unknown.
+    A phase start is known only after a confirmed transition within the supplied
+    closed-candle window. Otherwise its age and phase-local touch count remain
+    unknown; a rolling-window boundary is not treated as formation evidence.
     """
     _validate(level_price, break_confirm_bps, break_confirm_candles,
               touch_zone_bps, touch_reset_bps, touch_min_separation_candles)
@@ -53,6 +49,7 @@ def analyze_level_phase(
             "freshness_state": "NO_DATA", "freshness_reason": "Нет закрытых OHLC-свечей.",
             "current_phase_touch_count": None, "current_phase_started_at": None,
             "last_confirmed_transition_at": None, "current_phase_side": None,
+            "confirmed_transitions": [],
             "current_role": "NO_DATA",
             "structure_state": "UNKNOWN",
             "current_phase_touch_parameters": {
@@ -81,6 +78,8 @@ def analyze_level_phase(
     phase_started_at = None
     boundary_index = None
     last_transition_at = None
+    last_transition_side = None
+    confirmed_transitions = []
     phase_origin_known = False
     transition_seen = False
     status = "UNCONFIRMED"
@@ -106,7 +105,6 @@ def analyze_level_phase(
                 boundary_index = index
             continue
 
-        intersects_zone = row["low"] <= zone_high and row["high"] >= zone_low
         opposite = "below" if phase_side == "above" else "above"
         if side == opposite:
             if run_side != side:
@@ -118,6 +116,11 @@ def analyze_level_phase(
                 boundary_index = index
                 phase_started_at = _time_value(row)
                 last_transition_at = phase_started_at
+                last_transition_side = opposite
+                confirmed_transitions.append({
+                    "side": opposite,
+                    "at": phase_started_at,
+                })
                 transition_seen = True
                 phase_origin_known = True
                 status = "CONFIRMED_AFTER_BREAK"
@@ -155,6 +158,8 @@ def analyze_level_phase(
         "current_phase_side": phase_side,
         "current_phase_started_at": phase_started_at,
         "last_confirmed_transition_at": last_transition_at,
+        "last_confirmed_transition_side": last_transition_side,
+        "confirmed_transitions": confirmed_transitions,
         "current_phase_touch_count": phase_touches,
         "phase_origin_known": phase_origin_known,
         "break_confirm_bps": float(break_confirm_bps),
@@ -164,6 +169,91 @@ def analyze_level_phase(
             "touch_reset_bps": float(touch_reset_bps),
             "min_separation_candles": int(touch_min_separation_candles),
         },
+    }
+
+
+def classify_level_trading_status(
+    level: dict,
+    last_price: float | None,
+    tick_size: float | None,
+    *,
+    price_fresh: bool,
+    snapshot_fresh: bool,
+) -> dict:
+    """Classify an existing Trendln level without changing its historical type.
+
+    One tick or less is explicitly treated as AT_LEVEL. The initial side of a
+    candle window is never assumed to be the start of a structure.
+    """
+    try:
+        level_price = float(level["price"])
+        price = float(last_price) if last_price is not None else 0.0
+        tick = float(tick_size) if tick_size is not None else 0.0
+    except (KeyError, TypeError, ValueError):
+        level_price = price = tick = 0.0
+    if not snapshot_fresh:
+        return _trading_status("UNCONFIRMED", "Исторический снимок отсутствует, устарел или завершился ошибкой.", "NO_DATA")
+    if not price_fresh or price <= 0:
+        return _trading_status("UNCONFIRMED", "Нет свежей Last Price.", "NO_DATA")
+    if level_price <= 0 or tick <= 0 or not isfinite(level_price + price + tick):
+        return _trading_status("UNCONFIRMED", "Нет корректной цены уровня или tickSize Bybit.", "NO_DATA")
+
+    delta = price - level_price
+    if abs(delta) <= tick:
+        position = "AT_LEVEL"
+    else:
+        # Position describes the level relative to Last Price, not the price
+        # relative to the level.
+        position = "BELOW" if delta > 0 else "ABOVE"
+    historical_type = str(level.get("type", "")).upper()
+    expected_phase = {"SUPPORT": "above", "RESISTANCE": "below"}.get(historical_type)
+    if expected_phase is None:
+        return _trading_status("UNCONFIRMED", "Неизвестен исторический тип Trendln.", position)
+    transitions = level.get("confirmed_transitions") or ()
+    if not isinstance(transitions, (tuple, list)):
+        transitions = ()
+    last_break_at = next((
+        item.get("at") for item in reversed(transitions)
+        if isinstance(item, dict) and item.get("side") != expected_phase
+    ), None)
+    if level.get("phase_origin_known") is not True:
+        return _trading_status("UNCONFIRMED", "Начало текущей структуры не подтверждено внутри доступной истории.", position, last_break_at)
+
+    phase_side = level.get("current_phase_side")
+    if phase_side not in {"above", "below"}:
+        return _trading_status("UNCONFIRMED", "Не удалось определить текущую фазу по закрытым свечам.", position, last_break_at)
+    if phase_side != expected_phase:
+        return _trading_status(
+            "BROKEN",
+            f"Подтверждённая текущая фаза {phase_side} против исторического типа {historical_type}.",
+            position, last_break_at,
+        )
+    touches = level.get("current_phase_touch_count")
+    if touches is None:
+        return _trading_status("UNCONFIRMED", "Число касаний текущей структуры неизвестно.", position, last_break_at)
+    if isinstance(touches, bool):
+        return _trading_status("UNCONFIRMED", "Число касаний текущей структуры некорректно.", position, last_break_at)
+    try:
+        touch_count = int(touches)
+    except (TypeError, ValueError, OverflowError):
+        return _trading_status("UNCONFIRMED", "Число касаний текущей структуры некорректно.", position, last_break_at)
+    if touch_count < 1:
+        return _trading_status("UNCONFIRMED", "После начала подтверждённой фазы ещё нет самостоятельного касания.", position, last_break_at)
+    if position == "AT_LEVEL":
+        return _trading_status("INACTIVE", "Last Price находится в пределах одного tickSize от уровня.", position, last_break_at)
+    expected_position = "BELOW" if historical_type == "SUPPORT" else "ABOVE"
+    if position != expected_position:
+        return _trading_status("INACTIVE", f"Исторический {historical_type} находится на неподходящей стороне Last Price.", position, last_break_at)
+    return _trading_status("ACTIVE", "Структура подтверждена переходом, имеет касание и не пробита.", position, last_break_at)
+
+
+def _trading_status(status: str, reason: str, position: str, last_break_at: str | None = None) -> dict:
+    return {
+        "trading_status": status,
+        "trading_status_reason": reason,
+        "price_position": position,
+        "trading_filter_eligible": status == "ACTIVE",
+        "last_confirmed_break_at": last_break_at,
     }
 
 

@@ -9,7 +9,6 @@ from math import isfinite
 from time import monotonic, time
 
 import aiohttp
-import websockets
 
 from .engine import EngineMode, MARKET_PRICE_SOURCE, TradingEngine
 from .historical_levels import fetch_historical_level_snapshot
@@ -725,6 +724,10 @@ async def _run_connection(
     last_alignment_wait_log_at = 0.0
     buffered_deltas = OrderbookDeltaBuffer(next(_connection_generations))
     engine.mark_orderbook_unsynchronized(symbol, generation=buffered_deltas.generation)
+
+    # Load the runtime transport only when a market worker is actually opened.
+    # Keeping pure parser/analysis imports usable also helps isolated tests.
+    import websockets
 
     async with websockets.connect(
         BYBIT_WS_URL,

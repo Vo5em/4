@@ -194,7 +194,9 @@ async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
     } for level in levels)
     return {
         "levels": enriched_levels,
-        "strategy_levels": tuple(dict(level) for level in levels),
+        # Trendln output remains intact; phase facts are attached for the
+        # opt-in trading filter and diagnostics.
+        "strategy_levels": tuple(dict(level) for level in enriched_levels),
         "candles_analyzed": len(candles),
         "settings": applied_settings,
         "calculated_at": calculated_at,

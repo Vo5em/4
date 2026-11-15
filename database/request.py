@@ -190,6 +190,9 @@ async def initialize_database(
                     historical_level_break_confirm_candles=getattr(
                         row, "historical_level_break_confirm_candles", 2
                     ) or 2,
+                    historical_level_active_filter_enabled=bool(getattr(
+                        row, "historical_level_active_filter_enabled", False
+                    )),
                     max_wall_level_distance_bps=getattr(row, "max_wall_level_distance_bps", 13.0) or 13.0,
                     false_breakout_point_1_offset_bps=getattr(row, "false_breakout_point_1_offset_bps", None),
                     false_breakout_point_2_distance_bps=getattr(row, "false_breakout_point_2_distance_bps", None),
@@ -304,6 +307,7 @@ def _pair_row(settings: PairSettings) -> TradingPairSetting:
         historical_level_touch_min_separation_candles=settings.historical_level_touch_min_separation_candles,
         historical_level_break_confirm_bps=settings.historical_level_break_confirm_bps,
         historical_level_break_confirm_candles=settings.historical_level_break_confirm_candles,
+        historical_level_active_filter_enabled=settings.historical_level_active_filter_enabled,
         max_wall_level_distance_bps=settings.max_wall_level_distance_bps,
         false_breakout_point_1_offset_bps=settings.false_breakout_point_1_offset_bps,
         false_breakout_point_2_distance_bps=settings.false_breakout_point_2_distance_bps,
@@ -604,6 +608,7 @@ async def save_pair_settings(settings: PairSettings) -> None:
                 "historical_level_touch_zone_bps", "historical_level_touch_reset_bps",
                 "historical_level_touch_min_separation_candles",
                 "historical_level_break_confirm_bps", "historical_level_break_confirm_candles",
+                "historical_level_active_filter_enabled",
                 "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
                 "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
                 "false_breakout_stop_loss_bps",
@@ -744,6 +749,7 @@ async def save_pair_settings_with_trades(
                 "historical_level_touch_zone_bps", "historical_level_touch_reset_bps",
                 "historical_level_touch_min_separation_candles",
                 "historical_level_break_confirm_bps", "historical_level_break_confirm_candles",
+                "historical_level_active_filter_enabled",
                 "false_breakout_point_1_offset_bps", "false_breakout_point_2_distance_bps",
                 "false_breakout_observation_timeout_seconds", "false_breakout_take_profit_bps",
                 "false_breakout_stop_loss_bps",

@@ -140,6 +140,7 @@ class SettingsPairScalingTests(unittest.TestCase):
     def test_individual_cards_show_current_values_and_all_new_settings(self):
         settings = PairSettings(
             "ETHUSDT", historical_level_timeframe="15m",
+            historical_level_active_filter_enabled=True,
             historical_level_candle_count=333,
             historical_level_refresh_seconds=120,
             max_wall_level_distance_bps=13,
@@ -166,6 +167,7 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertIn("historical_level_touch_min_separation_candles</code>: 3", levels)
         self.assertIn("historical_level_break_confirm_bps</code>: 20.0", levels)
         self.assertIn("historical_level_break_confirm_candles</code>: 2", levels)
+        self.assertIn("historical_level_active_filter_enabled</code>: включена", levels)
         self.assertIn("max_wall_level_distance_bps</code>: 13", levels)
         self.assertIn("bounce_take_profit_bps</code>: 7", strategies)
         self.assertIn("breakout_stop_loss_bps</code>: 10", strategies)
@@ -206,6 +208,7 @@ class SettingsPairScalingTests(unittest.TestCase):
             ("historical_level_touch_min_separation_candles", "5"),
             ("historical_level_break_confirm_bps", "25"),
             ("historical_level_break_confirm_candles", "3"),
+            ("historical_level_active_filter_enabled", "true"),
         ):
             state = FakeState()
             state.data = {"pair_symbol": "ETHUSDT", "pair_section": "levels"}
@@ -227,6 +230,7 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertEqual(settings.historical_level_touch_min_separation_candles, 5)
         self.assertEqual(settings.historical_level_break_confirm_bps, 25.0)
         self.assertEqual(settings.historical_level_break_confirm_candles, 3)
+        self.assertTrue(settings.historical_level_active_filter_enabled)
 
     def test_trendln_current_role_does_not_replace_historical_type(self):
         self.assertEqual(_trendln_role(101.0, 100.0, 0.01), ("RESISTANCE", "выше цены", 100.0))
@@ -263,16 +267,17 @@ class SettingsPairScalingTests(unittest.TestCase):
         runtime = RuntimeController(engine)
         rows = _trendln_level_rows(_trendln_snapshot_state(runtime, "ETHUSDT"))
         self.assertEqual(rows[0][0]["type"], "SUPPORT")
-        self.assertEqual(rows[0][0]["current_role"], "RESISTANCE")
+        self.assertEqual(rows[0][0]["position"], "выше цены")
         self.assertEqual(rows[1][0]["type"], "RESISTANCE")
-        self.assertEqual(rows[1][0]["current_role"], "SUPPORT")
-        self.assertEqual(rows[2][0]["current_role"], "AT_LEVEL")
+        self.assertEqual(rows[1][0]["position"], "ниже цены")
+        self.assertEqual(rows[2][0]["position"], "AT_LEVEL")
         text = trendln_levels_text(runtime, "ETHUSDT")
         self.assertIn("В расчёте: pctbound 0.05 (500 bps)", text)
         self.assertIn("сейчас настроено: 0.01", text)
         self.assertIn("проанализировано 480 / запрошено 500", text)
-        self.assertIn("исторически SUPPORT · сейчас RESISTANCE", text)
-        self.assertIn("исторически RESISTANCE · сейчас SUPPORT", text)
+        self.assertIn("исторически SUPPORT · позиция выше цены", text)
+        self.assertIn("исторически RESISTANCE · позиция ниже цены", text)
+        self.assertIn("UNCONFIRMED", text)
         self.assertIn("Pivots Trendln 3", text)
         self.assertIn("самостоятельные касания 0", text)
         self.assertIn("только диагностическая метрика", text)
@@ -321,8 +326,8 @@ class SettingsPairScalingTests(unittest.TestCase):
         page1 = trendln_levels_text(runtime, "ETHUSDT", page=1)
         self.assertLessEqual(len(page0), 4096)
         self.assertLessEqual(len(page1), 4096)
-        self.assertIn("стр. 1/6", page0)
-        self.assertIn("стр. 2/6", page1)
+        self.assertIn("стр. 1/7", page0)
+        self.assertIn("стр. 2/7", page1)
         keyboard = trendln_levels_keyboard(runtime, "ETHUSDT", "levels", 0)
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         self.assertIn("trendln_view:ETHUSDT:levels:1", callbacks)
@@ -363,7 +368,7 @@ class SettingsPairScalingTests(unittest.TestCase):
             matches = _trendln_wall_matches(runtime, "ETHUSDT", snapshot)
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["historical_type"], "SUPPORT")
-        self.assertEqual(matches[0]["current_role"], "RESISTANCE")
+        self.assertEqual(matches[0]["price_position"], "ABOVE")
         self.assertEqual(matches[0]["touch_count"], 3)
         self.assertAlmostEqual(matches[0]["distance_bps"], 9.99000999)
         self.assertTrue(matches[0]["passes"])
@@ -385,8 +390,8 @@ class SettingsPairScalingTests(unittest.TestCase):
         text = trendln_levels_text(RuntimeController(engine), "ETHUSDT")
         self.assertIn("Pivots Trendln 14", text)
         self.assertIn("самостоятельные касания 3", text)
-        self.assertIn("фаза 1", text)
-        self.assertIn("CONFIRMED_AFTER_BREAK", text)
+        self.assertIn("касания структуры 1", text)
+        self.assertIn("UNCONFIRMED", text)
         self.assertIn("2026-01-01T00:10:00+00:00", text)
         self.assertIn("2 закрытия подряд", text)
 
