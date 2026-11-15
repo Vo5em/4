@@ -6,7 +6,7 @@ from datetime import datetime
 from math import isclose, isfinite
 from typing import Iterable
 
-from .independent_touches import count_independent_touches
+from .independent_touches import analyze_independent_touches
 
 
 def analyze_level_phase(
@@ -49,6 +49,7 @@ def analyze_level_phase(
             "freshness_state": "NO_DATA", "freshness_reason": "Нет закрытых OHLC-свечей.",
             "current_phase_touch_count": None, "current_phase_started_at": None,
             "last_confirmed_transition_at": None, "current_phase_side": None,
+            "current_phase_touch_diagnostics": None,
             "confirmed_transitions": [],
             "current_role": "NO_DATA",
             "structure_state": "UNKNOWN",
@@ -136,13 +137,15 @@ def analyze_level_phase(
     current_role = "AT_LEVEL" if last_side is None else ("SUPPORT" if last_side == "above" else "RESISTANCE")
     if phase_origin_known and boundary_index is not None:
         phase_candles = rows[boundary_index + 1:]
-        phase_touches = count_independent_touches(
+        phase_touch_analysis = analyze_independent_touches(
             level_price, phase_candles, touch_zone_bps=touch_zone_bps,
             reset_bps=touch_reset_bps,
             min_separation_candles=touch_min_separation_candles,
         )
+        phase_touches = None if phase_touch_analysis is None else phase_touch_analysis["count"]
     else:
         phase_touches = None
+        phase_touch_analysis = None
     if status == "UNCONFIRMED" and phase_origin_known:
         status = "CONFIRMED"
         reason = "Текущая сторона уровня наблюдается, подтверждённого перехода в доступном окне нет."
@@ -161,6 +164,9 @@ def analyze_level_phase(
         "last_confirmed_transition_side": last_transition_side,
         "confirmed_transitions": confirmed_transitions,
         "current_phase_touch_count": phase_touches,
+        "current_phase_touch_diagnostics": (
+            None if phase_touch_analysis is None else phase_touch_analysis["touches"]
+        ),
         "phase_origin_known": phase_origin_known,
         "break_confirm_bps": float(break_confirm_bps),
         "break_confirm_candles": int(break_confirm_candles),

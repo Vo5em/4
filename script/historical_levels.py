@@ -10,7 +10,7 @@ import time
 
 import aiohttp
 
-from .independent_touches import count_independent_touches
+from .independent_touches import analyze_independent_touches
 from .level_phase import analyze_level_phase
 
 
@@ -170,28 +170,33 @@ async def fetch_historical_level_snapshot(symbol: str, settings) -> dict:
         "reset_bps": settings.historical_level_touch_reset_bps,
         "min_separation_candles": settings.historical_level_touch_min_separation_candles,
     }
-    enriched_levels = tuple({
-        **level,
-        # Keep the original Trendln field for strategy compatibility.
-        "pivot_count": level["touch_count"],
-        "independent_touch_count": count_independent_touches(
+    enriched = []
+    for level in levels:
+        touch_analysis = analyze_independent_touches(
             level["price"], candles,
             touch_zone_bps=settings.historical_level_touch_zone_bps,
             reset_bps=settings.historical_level_touch_reset_bps,
             min_separation_candles=settings.historical_level_touch_min_separation_candles,
-        ),
-        "independent_touch_parameters": dict(touch_parameters),
-        "independent_touch_calculated_at": calculated_at,
-        **analyze_level_phase(
-            level["price"], candles,
-            break_confirm_bps=settings.historical_level_break_confirm_bps,
-            break_confirm_candles=settings.historical_level_break_confirm_candles,
-            touch_zone_bps=settings.historical_level_touch_zone_bps,
-            touch_reset_bps=settings.historical_level_touch_reset_bps,
-            touch_min_separation_candles=settings.historical_level_touch_min_separation_candles,
-        ),
-        "current_phase_calculated_at": calculated_at,
-    } for level in levels)
+        )
+        enriched.append({
+            **level,
+            # Keep the original Trendln field for strategy compatibility.
+            "pivot_count": level["touch_count"],
+            "independent_touch_count": None if touch_analysis is None else touch_analysis["count"],
+            "independent_touch_diagnostics": None if touch_analysis is None else touch_analysis["touches"],
+            "independent_touch_parameters": dict(touch_parameters),
+            "independent_touch_calculated_at": calculated_at,
+            **analyze_level_phase(
+                level["price"], candles,
+                break_confirm_bps=settings.historical_level_break_confirm_bps,
+                break_confirm_candles=settings.historical_level_break_confirm_candles,
+                touch_zone_bps=settings.historical_level_touch_zone_bps,
+                touch_reset_bps=settings.historical_level_touch_reset_bps,
+                touch_min_separation_candles=settings.historical_level_touch_min_separation_candles,
+            ),
+            "current_phase_calculated_at": calculated_at,
+        })
+    enriched_levels = tuple(enriched)
     return {
         "levels": enriched_levels,
         # Trendln output remains intact; phase facts are attached for the

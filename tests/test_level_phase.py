@@ -31,6 +31,7 @@ class LevelPhaseTests(unittest.TestCase):
             price_fresh=True, snapshot_fresh=True,
         )
         self.assertEqual(result["current_phase_touch_count"], 2)
+        self.assertEqual(len(result["current_phase_touch_diagnostics"]), 2)
         self.assertEqual(status["trading_status"], "ACTIVE")
         self.assertEqual(status["price_position"], "BELOW")
 
@@ -91,6 +92,56 @@ class LevelPhaseTests(unittest.TestCase):
         self.assertEqual(status["trading_status"], "BROKEN")
         self.assertEqual(level["type"], "SUPPORT")
         self.assertIsNotNone(status["last_confirmed_break_at"])
+
+    def test_support_closes_inside_allowance_do_not_break_but_two_closes_beyond_do(self):
+        inside_allowance = analyze_level_phase(100, [
+            c(100.3), c(100.3), c(99.9), c(99.9),
+        ], break_confirm_bps=20, break_confirm_candles=2)
+        self.assertNotEqual(inside_allowance["freshness_state"], "CONFIRMED_AFTER_BREAK")
+        self.assertEqual(inside_allowance["current_phase_side"], "above")
+
+        beyond = analyze_level_phase(100, [
+            c(100.3), c(100.3), c(99.79), c(99.79),
+        ], break_confirm_bps=20, break_confirm_candles=2)
+        self.assertEqual(beyond["freshness_state"], "CONFIRMED_AFTER_BREAK")
+        self.assertEqual(beyond["current_phase_side"], "below")
+
+    def test_second_support_confirmation_candle_can_open_and_close_below_level(self):
+        result = analyze_level_phase(100, [
+            c(100.3), c(100.3),
+            {"open": 99.7, "high": 99.8, "low": 99.6, "close": 99.79, "is_closed": True},
+            {"open": 99.6, "high": 99.75, "low": 99.5, "close": 99.7, "is_closed": True},
+        ], break_confirm_bps=20, break_confirm_candles=2)
+        self.assertEqual(result["freshness_state"], "CONFIRMED_AFTER_BREAK")
+        self.assertEqual(result["current_phase_side"], "below")
+
+    def test_resistance_uses_closes_allowance_and_consecutive_confirmation_only(self):
+        inside_allowance = analyze_level_phase(100, [
+            c(99.7), c(99.7), c(100.1), c(100.1),
+        ], break_confirm_bps=20, break_confirm_candles=2)
+        self.assertNotEqual(inside_allowance["freshness_state"], "CONFIRMED_AFTER_BREAK")
+
+        one_close = analyze_level_phase(100, [
+            c(99.7), c(99.7), c(100.21), c(99.7),
+        ], break_confirm_bps=20, break_confirm_candles=2)
+        self.assertNotEqual(one_close["freshness_state"], "CONFIRMED_AFTER_BREAK")
+
+        two_closes = analyze_level_phase(100, [
+            c(99.7), c(99.7), c(100.21),
+            {"open": 100.3, "high": 100.5, "low": 100.2, "close": 100.25, "is_closed": True},
+        ], break_confirm_bps=20, break_confirm_candles=2)
+        self.assertEqual(two_closes["freshness_state"], "CONFIRMED_AFTER_BREAK")
+        self.assertEqual(two_closes["current_phase_side"], "above")
+
+    def test_price_return_after_confirmed_support_break_does_not_revive_support(self):
+        result = analyze_level_phase(100, [
+            c(100.3), c(100.3), c(99.7), c(99.7),
+        ])
+        status = classify_level_trading_status(
+            {"price": 100, "type": "SUPPORT", **result}, 100.5, 0.01,
+            price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(status["trading_status"], "BROKEN")
 
     def test_resistance_break_does_not_become_support(self):
         result = analyze_level_phase(100, [

@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from script.independent_touches import count_independent_touches
+from script.independent_touches import analyze_independent_touches, count_independent_touches
 from script.settings import PairSettings
 
 
@@ -24,6 +24,35 @@ class IndependentTouchCounterTests(unittest.TestCase):
         ]
         self.assertEqual(count_independent_touches(100, candles), 1)
 
+    def test_long_approach_with_small_oscillations_is_one_touch_with_diagnostics(self):
+        candles = [
+            candle(99.95, 100.05, 100.00, minute=0),
+            candle(100.12, 100.18, 100.15, minute=1),  # outside touch zone, inside reset zone
+            candle(99.96, 100.04, 100.01, minute=2),  # same interaction, no reset close
+            candle(100.30, 100.40, 100.35, minute=3),  # confirmed departure
+            candle(100.32, 100.38, 100.34, minute=4),
+            candle(99.94, 100.06, 100.00, minute=5),  # new test
+        ]
+        analysis = analyze_independent_touches(100, candles)
+        self.assertEqual(analysis["count"], 2)
+        first, second = analysis["touches"]
+        self.assertEqual(first["first_candle_at"], candles[0]["start_time"].isoformat())
+        self.assertEqual(first["last_interaction_candle_at"], candles[2]["start_time"].isoformat())
+        self.assertEqual(first["touch_range_low"], 99.95)
+        self.assertEqual(first["touch_range_high"], 100.05)
+        self.assertEqual(first["confirmation_reason"], "FIRST_ZONE_INTERACTION")
+        self.assertEqual(first["level_price"], 100.0)
+        self.assertEqual(first["max_departure_before_next_touch_price"], 100.4)
+        self.assertEqual(first["candles_to_next_test"], 4)
+        self.assertEqual(second["confirmation_reason"], "ZONE_REENTRY_AFTER_CONFIRMED_RESET_CLOSE")
+        self.assertEqual(second["reset_confirming_close_before_this_touch"], 100.35)
+        self.assertEqual(second["max_departure_before_this_touch_price"], 100.4)
+        self.assertEqual(second["candles_between_previous_tests"], 4)
+        self.assertGreater(second["max_departure_before_this_touch_bps"], 30.0)
+        self.assertEqual(analysis["parameters"]["touch_zone_bps"], 10.0)
+        self.assertEqual(analysis["parameters"]["touch_reset_bps"], 30.0)
+        self.assertEqual(analysis["parameters"]["touch_min_separation_candles"], 3)
+
     def test_confirmed_departure_and_later_return_count_a_new_touch(self):
         candles = [
             candle(99.95, 100.05, 100.00, minute=0),
@@ -33,6 +62,21 @@ class IndependentTouchCounterTests(unittest.TestCase):
             candle(99.96, 100.04, 100.01, minute=4),
         ]
         self.assertEqual(count_independent_touches(100, candles), 2)
+
+    def test_three_confirmed_separate_approaches_count_as_three(self):
+        candles = [candle(99.95, 100.05, 100.0, minute=0)]
+        minute = 1
+        for _ in range(2):
+            candles.extend([
+                candle(100.30, 100.40, 100.35, minute=minute),
+                candle(100.30, 100.40, 100.35, minute=minute + 1),
+                candle(100.30, 100.40, 100.35, minute=minute + 2),
+                candle(99.95, 100.05, 100.0, minute=minute + 3),
+            ])
+            minute += 4
+        analysis = analyze_independent_touches(100, candles)
+        self.assertEqual(analysis["count"], 3)
+        self.assertEqual([row["touch_number"] for row in analysis["touches"]], [1, 2, 3])
 
     def test_adjacent_candles_near_zone_do_not_create_extra_touches(self):
         candles = [

@@ -117,6 +117,9 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
         ):
             snapshot = run(historical_levels.fetch_historical_level_snapshot("ETHUSDT", settings))
         level, = snapshot["levels"]
+        self.assertEqual(levels, ({
+            "price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 12,
+        },))
         self.assertEqual(level["touch_count"], 12)
         self.assertEqual(level["pivot_count"], 12)
         self.assertEqual(level["independent_touch_count"], 1)
@@ -124,6 +127,9 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
             "touch_zone_bps": 10.0, "reset_bps": 30.0,
             "min_separation_candles": 3,
         })
+        self.assertEqual(len(level["independent_touch_diagnostics"]), 1)
+        self.assertEqual(level["independent_touch_diagnostics"][0]["level_price"], 100.0)
+        self.assertEqual(level["independent_touch_diagnostics"][0]["confirmation_reason"], "FIRST_ZONE_INTERACTION")
         self.assertEqual(level["independent_touch_calculated_at"], snapshot["calculated_at"])
         self.assertIn(level["freshness_state"], {"UNCONFIRMED", "CONFIRMED", "CONFIRMED_AFTER_BREAK"})
         self.assertIsNone(level["current_phase_touch_count"])
@@ -132,10 +138,16 @@ class HistoricalLevelAdapterTests(unittest.TestCase):
         self.assertIn("independent_touch_count", snapshot["strategy_levels"][0])
         self.assertIn("current_phase_touch_count", snapshot["strategy_levels"][0])
         engine = TradingEngine({"ETHUSDT": settings})
+        existing_trades = [
+            {"id": 1, "status": "PENDING", "symbol": "ETHUSDT", "signal_id": "pending-1"},
+            {"id": 2, "status": "OPEN", "symbol": "ETHUSDT", "signal_id": "open-1"},
+        ]
+        engine.trade_manager.trades.extend(dict(trade) for trade in existing_trades)
         engine.set_historical_levels(
             "ETHUSDT", snapshot["strategy_levels"],
             diagnostic_levels=snapshot["levels"],
         )
+        self.assertEqual(engine.trade_manager.trades, existing_trades)
         self.assertIn("independent_touch_count", engine.historical_levels["ETHUSDT"][0])
         self.assertEqual(
             engine.historical_level_diagnostic_levels["ETHUSDT"][0]["independent_touch_count"], 1
