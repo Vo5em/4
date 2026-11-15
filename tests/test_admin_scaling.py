@@ -279,7 +279,7 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertIn("исторически RESISTANCE · позиция ниже цены", text)
         self.assertIn("UNCONFIRMED", text)
         self.assertIn("Pivots Trendln 3", text)
-        self.assertIn("самостоятельные касания 0", text)
+        self.assertIn("самостоятельные 0", text)
         self.assertIn("только диагностическая метрика", text)
         self.assertLessEqual(len(text), 4096)
 
@@ -316,7 +316,7 @@ class SettingsPairScalingTests(unittest.TestCase):
             "historical_level_accuracy": 2,
         })
         support_level = {
-            "price": 100.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2,
+            "price": 99.9, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2,
         }
         engine.historical_levels["ETHUSDT"] += (support_level,)
         engine.historical_level_diagnostic_levels["ETHUSDT"] += (support_level,)
@@ -326,8 +326,10 @@ class SettingsPairScalingTests(unittest.TestCase):
         page1 = trendln_levels_text(runtime, "ETHUSDT", page=1)
         self.assertLessEqual(len(page0), 4096)
         self.assertLessEqual(len(page1), 4096)
-        self.assertIn("стр. 1/7", page0)
-        self.assertIn("стр. 2/7", page1)
+        self.assertIn("стр. 1/6", page0)
+        self.assertIn("стр. 2/6", page1)
+        self.assertIn("99.9 · исторически SUPPORT", page0)
+        self.assertNotIn("Нет уровней снизу.", page0)
         keyboard = trendln_levels_keyboard(runtime, "ETHUSDT", "levels", 0)
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         self.assertIn("trendln_view:ETHUSDT:levels:1", callbacks)
@@ -348,6 +350,92 @@ class SettingsPairScalingTests(unittest.TestCase):
         self.assertIn("стр. 4/4", wall_page3)
         wall_callbacks = [button.callback_data for row in wall_keyboard.inline_keyboard for button in row]
         self.assertIn("trendln_view:ETHUSDT:walls:1", wall_callbacks)
+
+    def test_trendln_pages_each_side_independently_and_keeps_all_levels(self):
+        engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        levels = tuple(
+            [{"price": 100.0 + index / 50, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1}
+             for index in range(1, 13)]
+            + [{"price": 100.0 - index / 50, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1}
+               for index in range(1, 13)]
+        )
+        engine.set_historical_levels("ETHUSDT", levels, candles_analyzed=500, applied_settings={
+            "historical_level_refresh_seconds": 300,
+        })
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        runtime = RuntimeController(engine)
+
+        pages = [trendln_levels_text(runtime, "ETHUSDT", page=index) for index in range(3)]
+        self.assertTrue(all(len(page) <= 4096 for page in pages))
+        self.assertIn("стр. 1/3", pages[0])
+        self.assertIn("100.02 · исторически RESISTANCE", pages[0])
+        self.assertIn("99.98 · исторически SUPPORT", pages[0])
+        self.assertIn("стр. 2/3", pages[1])
+        self.assertIn("100.12 · исторически RESISTANCE", pages[1])
+        self.assertIn("99.88 · исторически SUPPORT", pages[1])
+
+        rendered_prices = set()
+        for page in pages:
+            for line in page.splitlines():
+                if "· исторически " in line:
+                    rendered_prices.add(line.split(" · ", 1)[0])
+        self.assertEqual(len(rendered_prices), len(levels))
+        self.assertIn("100.02", rendered_prices)
+        self.assertIn("99.76", rendered_prices)
+
+        keyboard = trendln_levels_keyboard(runtime, "ETHUSDT", "levels", 0)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("trendln_view:ETHUSDT:levels:1", callbacks)
+        next_keyboard = trendln_levels_keyboard(runtime, "ETHUSDT", "levels", 1)
+        next_callbacks = [button.callback_data for row in next_keyboard.inline_keyboard for button in row]
+        self.assertIn("trendln_view:ETHUSDT:levels:2", next_callbacks)
+
+    def test_trendln_single_lower_level_is_visible_on_first_page_and_empty_side_is_explicit(self):
+        engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT", historical_level_active_filter_enabled=False)})
+        engine.trade_manager.last_prices["ETHUSDT"] = 64571.5
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.1
+        levels = tuple(
+            [{"price": 64571.5 + index, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1}
+             for index in range(1, 9)]
+            + [{"price": 63849.19, "type": "SUPPORT", "timeframe": "5m", "touch_count": 2}]
+        )
+        engine.set_historical_levels("ETHUSDT", levels, candles_analyzed=500, applied_settings={
+            "historical_level_refresh_seconds": 300,
+        })
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        runtime = RuntimeController(engine)
+        text = trendln_levels_text(runtime, "ETHUSDT", page=0)
+        self.assertIn("63849.19 · исторически SUPPORT", text)
+        self.assertNotIn("Нет уровней снизу.", text)
+        self.assertIn("фильтр off", text)
+
+        only_above = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})
+        only_above.trade_manager.last_prices["ETHUSDT"] = 100.0
+        only_above.instrument_tick_sizes["ETHUSDT"] = 0.01
+        only_above.set_historical_levels("ETHUSDT", ({
+            "price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1,
+        },), applied_settings={"historical_level_refresh_seconds": 300})
+        only_above.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        self.assertIn("Нет уровней снизу.", trendln_levels_text(RuntimeController(only_above), "ETHUSDT"))
+
+    def test_trendln_level_groups_sort_by_distance_and_use_tick_size_for_at_level(self):
+        engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})
+        engine.trade_manager.last_prices["ETHUSDT"] = 100.0
+        engine.instrument_tick_sizes["ETHUSDT"] = 0.01
+        engine.set_historical_levels("ETHUSDT", (
+            {"price": 100.03, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1},
+            {"price": 101.0, "type": "RESISTANCE", "timeframe": "5m", "touch_count": 1},
+            {"price": 99.0, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1},
+            {"price": 99.98, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1},
+            {"price": 100.01, "type": "SUPPORT", "timeframe": "5m", "touch_count": 1},
+        ), applied_settings={"historical_level_refresh_seconds": 300})
+        engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
+        above, below, at_level = _trendln_level_rows(_trendln_snapshot_state(RuntimeController(engine), "ETHUSDT"))
+        self.assertEqual([row["price"] for row in above], [100.03, 101.0])
+        self.assertEqual([row["price"] for row in below], [99.98, 99.0])
+        self.assertEqual([row["price"] for row in at_level], [100.01])
 
     def test_trendln_wall_pairing_uses_historical_type_and_existing_distance_threshold(self):
         from unittest.mock import patch
@@ -389,11 +477,12 @@ class SettingsPairScalingTests(unittest.TestCase):
         engine.get_market_data_health = lambda _symbol: {"price_fresh": True, "price_age_seconds": .1}
         text = trendln_levels_text(RuntimeController(engine), "ETHUSDT")
         self.assertIn("Pivots Trendln 14", text)
-        self.assertIn("самостоятельные касания 3", text)
-        self.assertIn("касания структуры 1", text)
+        self.assertIn("самостоятельные 3", text)
+        self.assertIn("касания фазы 1", text)
         self.assertIn("UNCONFIRMED", text)
         self.assertIn("2026-01-01T00:10:00+00:00", text)
-        self.assertIn("2 закрытия подряд", text)
+        self.assertIn("граница фазы вне окна свечей", text)
+        self.assertIn("2026-01-01T00:10:00+00:00", text)
 
     def test_trendln_view_explicitly_reports_missing_side(self):
         engine = TradingEngine({"ETHUSDT": PairSettings("ETHUSDT")})

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from math import isfinite
+from math import isclose, isfinite
 from typing import Iterable
 
 from .independent_touches import count_independent_touches
@@ -199,7 +199,7 @@ def classify_level_trading_status(
         return _trading_status("UNCONFIRMED", "Нет корректной цены уровня или tickSize Bybit.", "NO_DATA")
 
     delta = price - level_price
-    if abs(delta) <= tick:
+    if abs(delta) <= tick or isclose(abs(delta), tick, rel_tol=1e-12, abs_tol=1e-15):
         position = "AT_LEVEL"
     else:
         # Position describes the level relative to Last Price, not the price

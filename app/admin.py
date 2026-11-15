@@ -1,7 +1,8 @@
 import os
 import hashlib
-from math import isfinite
+from math import isclose, isfinite
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from html import escape
 from dataclasses import replace
 import logging
@@ -437,7 +438,7 @@ def _trendln_role(level_price: float, last_price: float, tick_size: float | None
     delta = level_price - last_price
     distance_bps = abs(delta) / last_price * 10000
     tolerance = tick_size if tick_size is not None and tick_size > 0 else 0.0
-    if abs(delta) <= tolerance:
+    if abs(delta) <= tolerance or isclose(abs(delta), tolerance, rel_tol=1e-12, abs_tol=1e-15):
         return "AT_LEVEL", "AT_LEVEL", 0.0
     if delta > 0:
         return "RESISTANCE", "выше цены", distance_bps
@@ -454,6 +455,53 @@ def _trendln_phase_status(level: dict) -> str:
     analyzer_text = f"; анализ свечей {analyzer}" if analyzer else ""
     reason_text = f"; {analyzer_reason}" if analyzer_reason and analyzer_reason != reason else ""
     return f"{status}{analyzer_text}; граница фазы {phase_start}; переход {transition}; {reason}{reason_text}"
+
+
+def _trendln_compact_level_reason(level: dict) -> str:
+    reason = str(level.get("trading_status_reason") or "")
+    if "Начало текущей структуры не подтверждено" in reason:
+        return "граница фазы вне окна свечей"
+    if "самостоятельного касания" in reason:
+        return "нет касания в текущей фазе"
+    if "Подтверждённая текущая фаза" in reason:
+        phase = level.get("current_phase_side") or "?"
+        return f"пробита, фаза {phase}"
+    if "TickSize" in reason or "tickSize" in reason:
+        return "нет tickSize"
+    if "свежей Last Price" in reason:
+        return "нет свежей цены"
+    if "снимок отсутствует" in reason:
+        return "снимок недоступен/устарел"
+    if "неподходящей стороне" in reason:
+        return "уровень на неверной стороне цены"
+    if "в пределах одного tickSize" in reason:
+        return "цена у уровня"
+    return reason or "причина не указана"
+
+
+def _format_level_price(price: float) -> str:
+    try:
+        return format(Decimal(str(price)), "f")
+    except (InvalidOperation, TypeError, ValueError):
+        return f"{float(price):g}"
+
+
+def _trendln_level_line(row: dict, *, distance: str, position: str) -> str:
+    active_filter = (
+        "off" if not row["historical_filter_enabled"] else
+        "pass" if row["historical_filter_passes"] else "deny"
+    )
+    price_label = row.get("formatted_price") or f"{float(row['price']):g}"
+    return (
+        f"{escape(price_label)} · исторически {escape(str(row['type']))} · "
+        f"позиция {position} {distance} · {row['trading_status']} "
+        f"({_trendln_compact_level_reason(row)}) · фаза "
+        f"{row.get('current_phase_started_at') or row.get('last_confirmed_transition_at') or '?'} · "
+        f"касания фазы {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else '?'} · "
+        f"Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
+        f"самостоятельные {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else '?'} · "
+        f"последний пробой {row.get('last_confirmed_break_at') or '-'} · фильтр {active_filter}"
+    )
 
 
 def _trendln_snapshot_state(runtime: RuntimeController, symbol: str) -> dict:
@@ -542,6 +590,7 @@ def _trendln_level_rows(snapshot: dict) -> tuple[list[dict], list[dict], list[di
         filter_passes = phase["trading_status"] == "ACTIVE" and phase["price_position"] == expected_position
         row = {
             **level,
+            "formatted_price": _format_level_price(level_price),
             "position": position,
             "signed_distance_bps": signed_bps,
             **phase,
@@ -561,7 +610,16 @@ def _trendln_level_rows(snapshot: dict) -> tuple[list[dict], list[dict], list[di
         target.append(row)
     above.sort(key=lambda level: abs(level["signed_distance_bps"]))
     below.sort(key=lambda level: abs(level["signed_distance_bps"]))
+    at_level.sort(key=lambda level: abs(level["signed_distance_bps"]))
     return above, below, at_level
+
+
+def _trendln_level_page_count(above: list, below: list, at_level: list) -> int:
+    """Page each price-position group independently, keeping the same page index."""
+    return max(1, *(
+        (len(group) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE
+        for group in (above, below, at_level)
+    ))
 
 
 def _trendln_wall_matches(runtime: RuntimeController, symbol: str, snapshot: dict) -> list[dict]:
@@ -682,62 +740,40 @@ def trendln_levels_text(
     elif section == "levels":
         above, below, at_level = _trendln_level_rows(snapshot)
         if not snapshot["price_fresh"]:
-            page_count = max(1, (len(above) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
+            page_count = _trendln_level_page_count(above, below, at_level)
             page = min(max(0, int(page)), page_count - 1)
             selected = above[page * _TRENDLN_DISPLAY_PAGE_SIZE:(page + 1) * _TRENDLN_DISPLAY_PAGE_SIZE]
             rows_text = "\n".join(
-                f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-                f"позиция не определена · {_trendln_phase_status(row)} · "
-                f"Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-                f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-                f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'}"
+                _trendln_level_line(row, distance="", position="не определена")
                 for row in selected
             ) or "Нет сохранённых уровней."
             body = f"Last Price устарела или недоступна; уровни не считаются ACTIVE. · стр. {page + 1}/{page_count}\n{rows_text}"
         else:
-            entries = (
-                [("above", row) for row in above]
-                + [("at", row) for row in at_level]
-                + [("below", row) for row in below]
-            )
-            page_count = max(1, (len(entries) + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
+            page_count = _trendln_level_page_count(above, below, at_level)
             page = min(max(0, int(page)), page_count - 1)
             first = page * _TRENDLN_DISPLAY_PAGE_SIZE
-            selected = entries[first:first + _TRENDLN_DISPLAY_PAGE_SIZE]
-            upper = [row for group, row in selected if group == "above"]
-            at_price = [row for group, row in selected if group == "at"]
-            lower = [row for group, row in selected if group == "below"]
+            last = first + _TRENDLN_DISPLAY_PAGE_SIZE
+            upper = above[first:last]
+            at_price = at_level[first:last]
+            lower = below[first:last]
             tick_label = (
             f"tickSize {snapshot['tick_size']:g}"
             if snapshot["tick_size"] else "tickSize нет данных; AT_LEVEL только при точном совпадении"
         )
             upper_text = "\n".join(
-            f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-            f"позиция {row['position']} · {_trendln_phase_status(row)} · "
-            f"фильтр {escape(row['historical_filter_reason'])} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-            f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-            f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
-            f"последний подтверждённый пробой {row.get('last_confirmed_break_at') or 'нет'} · "
-            f"+{row['signed_distance_bps']:.2f} bps"
+            _trendln_level_line(
+                row, distance=f"+{row['signed_distance_bps']:.2f} bps", position=row["position"],
+            )
             for row in upper
         ) or "Нет уровней сверху."
             lower_text = "\n".join(
-            f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-            f"позиция {row['position']} · {_trendln_phase_status(row)} · "
-            f"фильтр {escape(row['historical_filter_reason'])} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-            f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-            f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
-            f"последний подтверждённый пробой {row.get('last_confirmed_break_at') or 'нет'} · "
-            f"{row['signed_distance_bps']:.2f} bps"
+            _trendln_level_line(
+                row, distance=f"{row['signed_distance_bps']:.2f} bps", position=row["position"],
+            )
             for row in lower
         ) or "Нет уровней снизу."
             at_text = "\n".join(
-            f"{float(row['price']):g} · исторически {escape(str(row['type']))} · "
-            f"позиция AT_LEVEL · {_trendln_phase_status(row)} · "
-            f"фильтр {escape(row['historical_filter_reason'])} · Pivots Trendln {row.get('pivot_count', row['touch_count'])} · "
-            f"самостоятельные касания {row.get('independent_touch_count') if row.get('independent_touch_count') is not None else 'нет данных'} · "
-            f"касания структуры {row.get('current_phase_touch_count') if row.get('current_phase_touch_count') is not None else 'нет данных'} · "
-            f"последний подтверждённый пробой {row.get('last_confirmed_break_at') or 'нет'}"
+            _trendln_level_line(row, distance="0 bps", position="AT_LEVEL")
             for row in at_price
         ) or "Нет уровней в пределах tickSize."
             body = (
@@ -990,8 +1026,10 @@ def trendln_levels_keyboard(
         total = len(_trendln_wall_matches(runtime, symbol, snapshot))
     else:
         above, below, at_level = _trendln_level_rows(snapshot)
-        total = len(above) + len(below) + len(at_level)
-    pages = max(1, (total + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
+        pages = _trendln_level_page_count(above, below, at_level)
+        total = None
+    if section == "walls":
+        pages = max(1, (total + _TRENDLN_DISPLAY_PAGE_SIZE - 1) // _TRENDLN_DISPLAY_PAGE_SIZE)
     page = max(0, min(int(page), pages - 1))
     return InlineKeyboardMarkup(inline_keyboard=[
         [

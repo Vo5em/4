@@ -141,6 +141,15 @@ class LevelPhaseTests(unittest.TestCase):
             level, 100.5, None, price_fresh=True, snapshot_fresh=True,
         )["trading_status"], "UNCONFIRMED")
 
+    def test_price_exactly_one_tick_away_is_at_level_despite_float_representation(self):
+        status = classify_level_trading_status(
+            {"price": 100.01, "type": "SUPPORT", "phase_origin_known": True,
+             "current_phase_side": "above", "current_phase_touch_count": 1},
+            100.0, 0.01, price_fresh=True, snapshot_fresh=True,
+        )
+        self.assertEqual(status["price_position"], "AT_LEVEL")
+        self.assertEqual(status["trading_status"], "INACTIVE")
+
     def test_old_consolidation_excluded_after_confirmed_break_and_return_touches_count(self):
         candles = [
             c(100.3, 100.0, 100.4), c(100.35, 100.0, 100.4),
